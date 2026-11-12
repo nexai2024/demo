@@ -1,4 +1,4 @@
-import { Loader2, Mic, Redo2, Sparkles, Undo2, Plus, Languages, WandSparkles } from "lucide-react";
+import { Loader2, Mic, Redo2, Sparkles, Undo2, Plus, Languages, WandSparkles, Zap } from "lucide-react";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
@@ -16,7 +16,7 @@ export const newStep = () => ({
   audio_path: null, audio_text: null, audio_duration_ms: null, hotspot: null, status: "pending", error: null, attempts: 0, page_url: null,
 });
 
-export const DraftTab = ({ meta, setMeta, onGenerate, busy, browserless }) => (
+export const DraftTab = ({ meta, setMeta, onGenerate, onAutopilot, busy, autoBusy, browserless, aiModel }) => (
   <div className="space-y-5" data-testid="draft-script-engine">
     <div className="space-y-1.5">
       <p className="font-mono text-[10px] uppercase tracking-wider text-slate-500">Target app URL</p>
@@ -29,12 +29,18 @@ export const DraftTab = ({ meta, setMeta, onGenerate, busy, browserless }) => (
     </div>
     <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 rounded-xl border border-indigo-500/20 bg-indigo-500/5 p-4">
       <p className="text-xs text-slate-400 max-w-md">
-        Claude Sonnet 5.5 turns the draft into browser actions with captions & voiceover. {browserless ? "Browserless first scans the live page so selectors match real elements." : "Connect Browserless in Settings for selectors grounded in the live page."}
+        {aiModel || "AI"} turns the draft into browser actions with captions & voiceover. {browserless ? "Browserless first scans the live page so selectors match real elements." : "Connect Browserless in Settings for selectors grounded in the live page."}
       </p>
-      <button onClick={onGenerate} disabled={busy} data-testid="generate-script-button"
-        className="shrink-0 h-11 px-5 rounded-lg bg-gradient-to-r from-indigo-500 to-cyan-500 hover:from-indigo-400 hover:to-cyan-400 font-semibold shadow-lg shadow-cyan-500/20 flex items-center gap-2 disabled:opacity-60 transition-[filter]">
-        {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Sparkles className="h-4 w-4" />} {busy ? "Scripting…" : "Generate script"}
-      </button>
+      <div className="flex flex-wrap gap-2 shrink-0">
+        <button onClick={onGenerate} disabled={busy || autoBusy} data-testid="generate-script-button"
+          className="h-11 px-4 rounded-lg border border-indigo-500/40 bg-slate-950 hover:bg-indigo-500/10 font-medium flex items-center gap-2 disabled:opacity-60">
+          {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Sparkles className="h-4 w-4" />} {busy ? "Scripting…" : "Script only"}
+        </button>
+        <button onClick={onAutopilot} disabled={busy || autoBusy || !browserless} data-testid="autopilot-button" title={browserless ? "" : "Connect Browserless first"}
+          className="h-11 px-5 rounded-lg bg-gradient-to-r from-indigo-500 to-cyan-500 hover:from-indigo-400 hover:to-cyan-400 font-semibold shadow-lg shadow-cyan-500/20 flex items-center gap-2 disabled:opacity-60 transition-[filter]">
+          {autoBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Zap className="h-4 w-4" />} Generate & record
+        </button>
+      </div>
     </div>
   </div>
 );

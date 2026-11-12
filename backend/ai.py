@@ -5,7 +5,19 @@ import re
 from emergentintegrations.llm.chat import LlmChat, UserMessage, TextDelta, StreamDone
 from emergentintegrations.llm.openai import OpenAITextToSpeech
 
-MODEL = ("anthropic", "claude-sonnet-5-5")
+def provider() -> tuple[str, str, str, str]:
+    """(provider, model, api_key, label) — own keys win over the Emergent key."""
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        return "anthropic", "claude-sonnet-5-5", os.environ["ANTHROPIC_API_KEY"], "Claude Sonnet 5.5 (your key)"
+    if os.environ.get("OPENAI_API_KEY"):
+        return "openai", "gpt-5.6-terra", os.environ["OPENAI_API_KEY"], "GPT-5.6 Terra (your OpenAI key)"
+    return "anthropic", "claude-sonnet-5-5", os.environ["EMERGENT_LLM_KEY"], "Claude Sonnet 5.5 (Emergent key)"
+
+
+def tts_key() -> tuple[str, str]:
+    if os.environ.get("OPENAI_API_KEY"):
+        return os.environ["OPENAI_API_KEY"], "OpenAI TTS HD (your key)"
+    return os.environ["EMERGENT_LLM_KEY"], "OpenAI TTS HD (Emergent key)"
 
 SYSTEM = """You are a senior product-marketing engineer who turns rough product drafts (feature specs, PRDs, release notes, bullet lists) into a precise, chronological browser automation script for recording a product demo.
 
@@ -61,8 +73,8 @@ async def _collect(chat: LlmChat, text: str) -> str:
 
 
 async def ask_json(system: str, prompt: str, session_id: str) -> dict:
-    chat = LlmChat(api_key=os.environ["EMERGENT_LLM_KEY"], session_id=session_id,
-                   system_message=system).with_model(*MODEL)
+    prov, model, key, _ = provider()
+    chat = LlmChat(api_key=key, session_id=session_id, system_message=system).with_model(prov, model)
     raw = await _collect(chat, prompt)
     try:
         return _parse_json(raw)
@@ -92,5 +104,5 @@ async def repair_selector(step: dict, elements: list, session_id: str) -> dict:
 
 
 async def synthesize(text: str, voice: str) -> bytes:
-    tts = OpenAITextToSpeech(api_key=os.environ["EMERGENT_LLM_KEY"])
+    tts = OpenAITextToSpeech(api_key=tts_key()[0])
     return await tts.generate_speech(text=text[:4000], model="tts-1-hd", voice=voice)

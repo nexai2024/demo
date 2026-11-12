@@ -34,5 +34,5 @@ export const stepAsset = (pid, step, kind) =>
     (kind === "audio" ? step.audio_path : step.screenshot_path || "").slice(-14)
   )}`;
 
-export const publicAsset = (shareId, step, kind) =>
-  `${API}/public/${shareId}/steps/${step.id}/${kind}?v=${step.v}`;
+export const publicAsset = (shareId, step, kind, token) =>
+  `${API}/public/${shareId}/steps/${step.id}/${kind}?v=${step.v}${token ? `&t=${encodeURIComponent(token)}` : ""}`;

@@ -52,7 +52,7 @@ def make_thumb(shot: bytes) -> bytes:
     return buf.getvalue()
 
 
-def compose_frame(shot: bytes | None, caption: str, hotspot: dict | None, show_caption: bool, brand: dict) -> Image.Image:
+def compose_base(shot: bytes | None, hotspot: dict | None, brand: dict) -> Image.Image:
     accent = _rgb(brand.get("accent"))
     if shot:
         img = Image.open(io.BytesIO(shot)).convert("RGB").resize((W, H))
@@ -65,6 +65,13 @@ def compose_frame(shot: bytes | None, caption: str, hotspot: dict | None, show_c
         d.rounded_rectangle([hotspot["x"] - 6, hotspot["y"] - 6, hotspot["x"] + hotspot["width"] + 6,
                              hotspot["y"] + hotspot["height"] + 6], radius=10, outline=accent + (255,), width=4)
         d.ellipse([cx - 14, cy - 14, cx + 14, cy + 14], fill=accent + (150,), outline=(255, 255, 255, 255), width=3)
+    return Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
+
+
+def compose_overlay(caption: str, show_caption: bool, brand: dict) -> Image.Image:
+    accent = _rgb(brand.get("accent"))
+    overlay = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    d = ImageDraw.Draw(overlay)
     if show_caption and caption:
         font = _font(30)
         lines = _wrap(d, caption, font, W - 200)
@@ -81,17 +88,35 @@ def compose_frame(shot: bytes | None, caption: str, hotspot: dict | None, show_c
         tw = d.textlength(label, font=wf)
         d.rounded_rectangle([W - tw - 40, 16, W - 16, 46], radius=8, fill=(3, 7, 18, 170))
         d.text((W - tw - 28, 21), label, font=wf, fill=(226, 232, 240, 230))
-    return Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
+    return overlay
+
+
+def compose_frame(shot, caption, hotspot, show_caption, brand) -> Image.Image:
+    base = compose_base(shot, hotspot, brand).convert("RGBA")
+    return Image.alpha_composite(base, compose_overlay(caption, show_caption, brand)).convert("RGB")
+
+
+def zoom_filter(hotspot: dict, frames: int) -> str:
+    cx = (hotspot["x"] + hotspot["width"] / 2) / W
+    cy = (hotspot["y"] + hotspot["height"] / 2) / H
+    zm = max(1.3, min(1.9, min(W / max(hotspot["width"] * 5, 1), H / max(hotspot["height"] * 5, 1))))
+    ramp = max(1, int(frames * 0.35))
+    p = f"min(on/{ramp},1)"
+    z = f"1+{zm - 1:.3f}*{p}*{p}*(3-2*{p})"
+    x = f"max(0,min(iw-iw/zoom,{cx:.4f}*iw-iw/zoom/2))"
+    y = f"max(0,min(ih-ih/zoom,{cy:.4f}*ih-ih/zoom/2))"
+    return f"scale={W * 2}:{H * 2},zoompan=z='{z}':x='{x}':y='{y}':d={frames}:s={W}x{H}:fps=30"
 
 
 async def load_frames(project: dict) -> list:
     show_caption = project.get("narration_mode", "both") in ("captions", "both")
+    brand = project.get("brand") or {}
     frames = []
     for s in project["steps"]:
         shot = (await get_object(s["screenshot_path"]))[0] if s.get("screenshot_path") else None
         audio = (await get_object(s["audio_path"]))[0] if s.get("audio_path") else None
-        frames.append((s, compose_frame(shot, s.get("caption", ""), s.get("hotspot"), show_caption,
-                                        project.get("brand") or {}), audio))
+        frames.append((s, compose_base(shot, s.get("hotspot"), brand),
+                       compose_overlay(s.get("caption", ""), show_caption, brand), audio))
     return frames
 
 
@@ -116,7 +141,8 @@ def _step_ms(step: dict, has_audio: bool) -> int:
 
 def build_gif(frames: list) -> bytes:
     imgs, durs, prev = [], [], None
-    for step, frame, _ in frames:
+    for step, base, over, _ in frames:
+        frame = Image.alpha_composite(base.convert("RGBA"), over).convert("RGB")
         small = frame.resize((960, 600))
         tm = int(step.get("transition_ms") or 0)
         if prev is not None and step.get("transition") == "fade" and tm > 0:
@@ -132,15 +158,23 @@ def build_gif(frames: list) -> bytes:
     return buf.getvalue()
 
 
-def build_mp4(frames: list, with_audio: bool) -> bytes:
+def build_mp4(frames: list, with_audio: bool, zoom: bool = True) -> bytes:
     with tempfile.TemporaryDirectory() as tmp:
         segs = []
-        for i, (step, frame, audio) in enumerate(frames):
-            img_path = os.path.join(tmp, f"f{i}.png")
-            frame.save(img_path)
+        for i, (step, base, over, audio) in enumerate(frames):
             use_audio = with_audio and audio is not None
             secs = _step_ms(step, use_audio) / 1000
-            cmd = [FFMPEG, "-y", "-loop", "1", "-framerate", "30", "-i", img_path]
+            tm = int(step.get("transition_ms") or 0) / 1000
+            fade = f",fade=t=in:st=0:d={tm:.2f}" if step.get("transition") == "fade" and tm > 0 else ""
+            do_zoom = zoom and step.get("hotspot") and step.get("action") in ("click", "hover", "type")
+            base_path, over_path = os.path.join(tmp, f"b{i}.png"), os.path.join(tmp, f"o{i}.png")
+            if do_zoom:
+                base.save(base_path)
+                over.save(over_path)
+                cmd = [FFMPEG, "-y", "-i", base_path, "-loop", "1", "-framerate", "30", "-i", over_path]
+            else:
+                Image.alpha_composite(base.convert("RGBA"), over).convert("RGB").save(base_path)
+                cmd = [FFMPEG, "-y", "-loop", "1", "-framerate", "30", "-i", base_path]
             if use_audio:
                 a_path = os.path.join(tmp, f"a{i}.mp3")
                 with open(a_path, "wb") as f:
@@ -148,13 +182,16 @@ def build_mp4(frames: list, with_audio: bool) -> bytes:
                 cmd += ["-i", a_path]
             else:
                 cmd += ["-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo"]
-            vf = "scale=1280:800,format=yuv420p"
-            tm = int(step.get("transition_ms") or 0) / 1000
-            if step.get("transition") == "fade" and tm > 0:
-                vf += f",fade=t=in:st=0:d={tm:.2f}"
             seg = os.path.join(tmp, f"s{i}.mp4")
-            cmd += ["-t", f"{secs:.2f}", "-vf", vf, "-af", "apad", "-c:v", "libx264", "-preset", "veryfast",
-                    "-tune", "stillimage", "-r", "30", "-c:a", "aac", "-ar", "44100", "-ac", "2", seg]
+            if do_zoom:
+                frames_n = int(secs * 30) + 2
+                graph = f"[0:v]{zoom_filter(step['hotspot'], frames_n)}[z];[z][1:v]overlay=0:0,format=yuv420p{fade}[v]"
+                a_idx = 2
+                cmd += ["-filter_complex", graph, "-map", "[v]", "-map", f"{a_idx}:a"]
+            else:
+                cmd += ["-vf", f"scale=1280:800,format=yuv420p{fade}"]
+            cmd += ["-t", f"{secs:.2f}", "-af", "apad", "-c:v", "libx264", "-preset", "veryfast",
+                    "-r", "30", "-pix_fmt", "yuv420p", "-c:a", "aac", "-ar", "44100", "-ac", "2", seg]
             subprocess.run(cmd, check=True, capture_output=True)
             segs.append(seg)
         list_path = os.path.join(tmp, "list.txt")
@@ -172,4 +209,4 @@ async def render(project: dict, fmt: str) -> bytes:
     if fmt == "gif":
         return await asyncio.to_thread(build_gif, frames)
     with_audio = project.get("narration_mode", "both") in ("voiceover", "both")
-    return await asyncio.to_thread(build_mp4, frames, with_audio)
+    return await asyncio.to_thread(build_mp4, frames, with_audio, (project.get("brand") or {}).get("zoom", True))

@@ -1,0 +1,8 @@
+crons:
+  - name: weekly-demo-refresh
+    description: "Re-records auto-refresh demos every Monday 09:00 UTC and flags steps broken by UI changes"
+    cron: "0 9 * * 1"
+    endpoint: "{{BASE_URL}}/api/cron/refresh-demos"
+    method: POST
+    # Cron endpoints must ack 2xx immediately; enqueue/background the actual work.
+    enabled: true

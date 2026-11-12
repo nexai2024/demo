@@ -56,8 +56,9 @@ export default function Studio() {
 
   const { run, setRun, running } = useRun({
     onUpdate: (r) => {
-      if (["record", "rerecord", "voiceover"].includes(r.kind)) refetch();
-      if (r.kind === "record" && r.current) setSelected(r.current - 1);
+      if (["record", "rerecord", "voiceover", "autopilot", "health"].includes(r.kind)) refetch();
+      if (["record", "autopilot", "health"].includes(r.kind) && r.current) setSelected(r.current - 1);
+      if (r.kind === "autopilot" && r.total > 3) setTab("timeline");
     },
     onDone: (r) => {
       refetch();
@@ -113,8 +114,8 @@ export default function Studio() {
 
   const setMeta = (patch) => setMetaState((m) => ({ ...m, ...patch }));
   const onPatch = async (patch) => {
-    if ("is_public" in patch) {
-      try { const { data } = await api.put(`/projects/${pid}`, { is_public: patch.is_public }); setProject(data); } catch (e) { toast.error(errMsg(e)); }
+    if ("is_public" in patch || "auto_refresh" in patch) {
+      try { const { data } = await api.put(`/projects/${pid}`, patch); setProject(data); } catch (e) { toast.error(errMsg(e)); }
     } else setMeta(patch);
   };
 
@@ -126,6 +127,11 @@ export default function Studio() {
   });
   const startRun = (key, url, body) => act(key, async () => { const { data } = await api.post(url, body || {}); setRun(data); refetch(); });
   const record = () => startRun("record", `/projects/${pid}/record`);
+  const autopilot = () => startRun("autopilot", `/projects/${pid}/autopilot`);
+  const healthCheck = () => startRun("health", `/projects/${pid}/health-check`);
+  const shareSettings = async (body) => {
+    try { const { data } = await api.put(`/projects/${pid}/share-settings`, body); setProject(data); toast.success("Share settings saved"); } catch (e) { toast.error(errMsg(e)); }
+  };
   const voiceover = () => startRun("voiceover", `/projects/${pid}/voiceover`);
   const exportAs = (fmt) => startRun("export", `/projects/${pid}/export`, { format: fmt });
   const rerecord = (sid) => startRun(`rerecord-${sid}`, `/projects/${pid}/steps/${sid}/rerecord`);
@@ -167,6 +173,7 @@ export default function Studio() {
   const paletteActions = [
     { id: "generate", label: "Generate script with AI", icon: Sparkles, run: generate },
     { id: "record", label: "Record demo in Browserless", icon: Clapperboard, run: record },
+    { id: "autopilot", label: "Generate & record in one click", icon: Sparkles, run: autopilot },
     { id: "voiceover", label: "Generate voiceover", icon: Mic, run: voiceover },
     { id: "export-mp4", label: "Export MP4", icon: Film, run: () => exportAs("mp4") },
     { id: "export-gif", label: "Export GIF", icon: ImageIcon, run: () => exportAs("gif") },
@@ -188,6 +195,12 @@ export default function Studio() {
         </div>
       </AppHeader>
 
+      {project.health?.broken?.length > 0 && (
+        <div className="mx-4 sm:mx-6 lg:mx-8 mt-4 rounded-lg border border-red-500/30 bg-red-500/10 px-4 py-3 text-sm text-red-200 flex flex-wrap items-center gap-2" role="alert" data-testid="health-broken-banner">
+          <strong className="font-semibold">{project.health.kind === "scheduled" ? "Weekly check" : "Health check"} · {new Date(project.health.checked_at).toLocaleString()}:</strong>
+          {project.health.broken.length} step(s) broke after a UI change (steps {project.health.broken.map((b) => b.index + 1).join(", ")}). Previous frames were kept. Use "Fix with AI" on the step, then re-record.
+        </div>
+      )}
       <main className="max-w-[1600px] mx-auto px-4 sm:px-6 lg:px-8 py-6 grid grid-cols-1 lg:grid-cols-12 gap-6">
         <section className="lg:col-span-7 min-w-0" data-testid="studio-timeline-editor">
           <Tabs value={tab} onValueChange={setTab}>
@@ -203,7 +216,7 @@ export default function Studio() {
                 <HistorySheet pid={pid} onRestore={restore} open={historyOpen} onOpenChange={setHistoryOpen} />
               </div>
             </div>
-            <TabsContent value="draft"><DraftTab meta={meta} setMeta={setMeta} onGenerate={generate} busy={busy === "generate"} browserless={settings?.browserless_configured} /></TabsContent>
+            <TabsContent value="draft"><DraftTab meta={meta} setMeta={setMeta} onGenerate={generate} onAutopilot={autopilot} busy={busy === "generate"} autoBusy={busy === "autopilot" || (running && run?.kind === "autopilot")} browserless={settings?.browserless_configured} aiModel={settings?.ai_model} /></TabsContent>
             <TabsContent value="timeline">
               <TimelineToolbar meta={meta} setMeta={setMeta} undo={steps.undo} redo={steps.redo} canUndo={steps.canUndo} canRedo={steps.canRedo}
                 onAdd={addStep} onRewrite={rewrite} rewriting={busy === "rewrite"} locked={running} />
@@ -223,7 +236,7 @@ export default function Studio() {
                 </Reorder.Group>
               )}
             </TabsContent>
-            <TabsContent value="export"><ExportPanel project={{ ...project, brand: meta.brand }} onExport={exportAs} busy={running || busy === "export"} onPatch={onPatch} /></TabsContent>
+            <TabsContent value="export"><ExportPanel project={{ ...project, brand: meta.brand }} onExport={exportAs} busy={running || busy === "export"} onPatch={onPatch} onShareSettings={shareSettings} onHealthCheck={healthCheck} /></TabsContent>
             <TabsContent value="analytics"><AnalyticsPanel project={project} /></TabsContent>
           </Tabs>
         </section>

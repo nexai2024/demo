@@ -70,6 +70,7 @@ export const StepCard = ({ s, i, total, thumb, active, locked, busy, onChange, o
             <SelectContent>{ACTIONS.map((a) => <SelectItem key={a} value={a}>{a}</SelectItem>)}</SelectContent>
           </Select>
           <div className="order-last sm:order-none basis-full sm:basis-auto flex-1 min-w-0"><Target s={s} set={set} /></div>
+          {s.regression && <span className="rounded-full border border-red-500/40 bg-red-500/10 px-2 py-0.5 font-mono text-[10px] uppercase text-red-300" data-testid={`step-regression-${s.id}`}>Broke after UI change</span>}
           <StatusBadge status={s.status} testId={`step-status-${s.id}`} />
         </div>
         {s.action === "type" && (

@@ -30,7 +30,10 @@ function ProjectCard({ p, onDuplicate, onDelete, i }) {
           </div>
           <p className="text-xs text-slate-500 truncate mt-1 font-mono">{p.target_url || "no target url"}</p>
           <div className="flex items-center justify-between mt-4">
-            <StatusBadge status={p.status} testId={`project-status-${p.id}`} />
+            <div className="flex items-center gap-2">
+              <StatusBadge status={p.status} testId={`project-status-${p.id}`} />
+              {p.health?.broken?.length > 0 && <span className="rounded-full border border-red-500/40 bg-red-500/10 px-2 py-0.5 font-mono text-[10px] uppercase text-red-300" data-testid={`project-broken-${p.id}`}>{p.health.broken.length} broken</span>}
+            </div>
             <span className="text-xs text-slate-500">{p.step_count || 0} steps · {formatDistanceToNow(new Date(p.updated_at))} ago</span>
           </div>
         </div>

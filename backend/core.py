@@ -51,6 +51,15 @@ def create_refresh_token(user_id: str) -> str:
     return jwt.encode(payload, _secret(), algorithm=JWT_ALG)
 
 
+def create_viewer_token(subject: str) -> str:
+    payload = {"sub": subject, "type": "viewer", "exp": now() + timedelta(hours=12)}
+    return jwt.encode(payload, _secret(), algorithm=JWT_ALG)
+
+
+def decode_viewer_token(token: str) -> str | None:
+    return decode_token(token, "viewer") if token else None
+
+
 def decode_token(token: str, expected: str) -> str | None:
     try:
         payload = jwt.decode(token, _secret(), algorithms=[JWT_ALG])

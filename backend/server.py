@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import hmac
 import json
 import logging
 import os
@@ -10,15 +11,17 @@ from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
 from pymongo import ASCENDING, DESCENDING, IndexModel
+from pymongo.errors import DuplicateKeyError
 from starlette.middleware.cors import CORSMiddleware
 
 import ai
 import engine
 import render
 from auth_routes import router as auth_router, seed_admin
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
-from core import client, db, get_current_user, new_id, now, now_iso
+from core import (client, create_viewer_token, db, decode_viewer_token, get_current_user, hash_password, new_id,
+                  now, now_iso, verify_password)
 from storage import APP_NAME, get_object, init_storage, put_object
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
@@ -35,6 +38,7 @@ INDEXES: dict[str, list[IndexModel]] = {
     "runs": [IndexModel([("id", ASCENDING)], name="id", unique=True),
              IndexModel([("project_id", ASCENDING), ("started_at", DESCENDING)], name="project_started")],
     "history": [IndexModel([("project_id", ASCENDING), ("created_at", DESCENDING)], name="project_created")],
+    "cron_runs": [IndexModel([("run_id", ASCENDING)], name="run_id", unique=True)],
     "analytics_events": [IndexModel([("project_id", ASCENDING), ("created_at", DESCENDING)], name="project_created")],
 }
 
@@ -53,7 +57,7 @@ api = APIRouter(prefix="/api")
 TASKS: set = set()
 CANCELLED: set = set()
 MONTHLY_LIMIT = int(os.environ["MONTHLY_RECORDING_LIMIT"])
-DEFAULT_BRAND = {"accent": "#6366F1", "caption_position": "bottom", "watermark": True}
+DEFAULT_BRAND = {"accent": "#6366F1", "caption_position": "bottom", "watermark": True, "zoom": True}
 
 
 class Cancelled(Exception):
@@ -85,13 +89,14 @@ class Step(BaseModel):
     audio_duration_ms: Optional[int] = None
     hotspot: Optional[dict] = None
     status: str = "pending"
+    regression: bool = False
     error: Optional[str] = None
     attempts: int = 0
     page_url: Optional[str] = None
 
 
 SERVER_FIELDS = ("screenshot_path", "thumb_path", "audio_path", "audio_text", "audio_voice", "audio_duration_ms",
-                 "hotspot", "status", "error", "attempts", "page_url", "resolved_selector")
+                 "hotspot", "status", "error", "attempts", "page_url", "resolved_selector", "regression")
 
 
 class ProjectIn(BaseModel):
@@ -104,6 +109,17 @@ class Brand(BaseModel):
     accent: str = Field("#6366F1", pattern=r"^#[0-9a-fA-F]{6}$")
     caption_position: Literal["top", "bottom"] = "bottom"
     watermark: bool = True
+    zoom: bool = True
+
+
+class ShareSettingsIn(BaseModel):
+    password: Optional[str] = Field(None, min_length=4, max_length=128)
+    remove_password: bool = False
+    expires_at: Optional[datetime] = None
+
+
+class UnlockIn(BaseModel):
+    password: str = Field(min_length=1, max_length=128)
 
 
 class RewriteIn(BaseModel):
@@ -125,6 +141,7 @@ class ProjectUpdate(BaseModel):
     voice: Optional[str] = None
     narration_mode: Optional[Literal["captions", "voiceover", "both"]] = None
     is_public: Optional[bool] = None
+    auto_refresh: Optional[bool] = None
 
 
 class ExportIn(BaseModel):
@@ -141,7 +158,15 @@ async def get_project(pid: str, user: dict) -> dict:
     p = await db.projects.find_one({"id": pid, "user_id": user["user_id"], "is_deleted": False}, {"_id": 0})
     if not p:
         raise HTTPException(404, "Project not found")
+    p["has_share_password"] = bool(p.pop("share_password_hash", None))
     return p
+
+
+def ai_error(exc: Exception) -> str:
+    msg = str(exc)
+    if "Budget has been exceeded" in msg or "budget" in msg.lower():
+        return "Your AI balance is used up. Top up under Profile → Manage plan → Universal Key → Add Balance."
+    return msg[:160]
 
 
 async def log_history(project: dict, event: str, detail: str = "", snapshot: bool = False) -> None:
@@ -203,9 +228,11 @@ def normalize_steps(raw: list, target_url: str) -> list:
 
 
 # ---------- background jobs ----------
-async def job_record(project: dict, run_id: str, only_idx: Optional[int]) -> None:
+async def job_record(project: dict, run_id: str, only_idx: Optional[int], final: bool = True,
+                     health: bool = False) -> str:
     pid, steps = project["id"], project["steps"]
     n = len(steps)
+    prev_done = {s["id"] for s in steps if s.get("status") == "done" and s.get("screenshot_path")}
 
     async def on_progress(i: int, step: dict, state: str, data: dict) -> None:
         if run_id in CANCELLED:
@@ -221,9 +248,12 @@ async def job_record(project: dict, run_id: str, only_idx: Optional[int]) -> Non
             await run_log(run_id, f"Step {i + 1}/{n}: {engine.describe(step)}...", current=i + 1)
             return
         upd = {"steps.$.status": state, "steps.$.error": data.get("error"), "steps.$.attempts": data.get("attempts", 1),
-               "steps.$.hotspot": data.get("hotspot"), "steps.$.page_url": data.get("url"),
-               "steps.$.resolved_selector": data.get("resolved_selector")}
-        if data.get("screenshot"):
+               "steps.$.page_url": data.get("url"), "steps.$.resolved_selector": data.get("resolved_selector"),
+               "steps.$.regression": state == "failed" and step["id"] in prev_done}
+        keep_old = health and state == "failed" and step["id"] in prev_done
+        if not keep_old:
+            upd["steps.$.hotspot"] = data.get("hotspot")
+        if data.get("screenshot") and not keep_old:
             base = f"{APP_NAME}/u/{project['user_id']}/{pid}/{step['id']}_{new_id()}"
             path = await put_object(f"{base}.jpg", data["screenshot"], "image/jpeg")
             thumb = await asyncio.to_thread(render.make_thumb, data["screenshot"])
@@ -243,32 +273,50 @@ async def job_record(project: dict, run_id: str, only_idx: Optional[int]) -> Non
         fresh = await db.projects.find_one({"id": pid}, {"_id": 0})
         failed = [s for s in fresh["steps"] if s["status"] == "failed"]
         status = "partial" if failed else "ready"
-        await touch(pid, {"status": status})
-        await log_history(fresh, "Re-recorded step" if only_idx is not None else "Recorded demo",
-                          f"{len(fresh['steps']) - len(failed)}/{len(fresh['steps'])} steps captured", snapshot=True)
-        msg = f"Recording complete with {len(failed)} failed step(s)" if failed else "Recording complete"
-        await finish_run(run_id, pid, "completed", msg)
+        broken = [{"index": i, "id": s["id"], "caption": s.get("caption", ""), "error": s.get("error")}
+                  for i, s in enumerate(fresh["steps"]) if s.get("regression")]
+        fields = {"status": status}
+        if health or only_idx is None:
+            fields["health"] = {"checked_at": now_iso(), "kind": "scheduled" if health else "manual",
+                                "broken": broken, "ok": len(fresh["steps"]) - len(failed), "total": len(fresh["steps"])}
+        await touch(pid, fields)
+        label = "Weekly health check" if health else ("Re-recorded step" if only_idx is not None else "Recorded demo")
+        await log_history(fresh, label, f"{len(fresh['steps']) - len(failed)}/{len(fresh['steps'])} steps captured"
+                          + (f", {len(broken)} broke after a UI change" if broken else ""), snapshot=True)
+        if broken:
+            msg = f"{len(broken)} step(s) broke after a UI change — previous frames kept" if health else \
+                f"Recording complete — {len(broken)} previously working step(s) now fail"
+        else:
+            msg = f"Recording complete with {len(failed)} failed step(s)" if failed else "Recording complete"
+        if final:
+            await finish_run(run_id, pid, "completed", msg)
+        else:
+            await run_log(run_id, msg, "success")
+        return "completed"
     except Cancelled:
         await db.projects.update_one({"id": pid}, {"$set": {"steps.$[s].status": "pending"}},
                                      array_filters=[{"s.status": "running"}])
         await touch(pid, {"status": "partial"})
         await finish_run(run_id, pid, "cancelled", "Recording cancelled by user")
+        return "cancelled"
     except Exception as exc:
         logger.exception("record job failed")
         await db.projects.update_one({"id": pid}, {"$set": {"steps.$[s].status": "failed"}},
                                      array_filters=[{"s.status": "running"}])
         await touch(pid, {"status": "failed"})
         await finish_run(run_id, pid, "failed", f"Recording failed: {str(exc)[:200]}")
+        return "failed"
 
 
-async def job_voiceover(project: dict, run_id: str) -> None:
+async def job_voiceover(project: dict, run_id: str, final: bool = True) -> str:
     pid, voice = project["id"], project.get("voice", "nova")
     todo = [s for s in project["steps"] if s.get("voiceover", "").strip()
             and (s.get("audio_text") != s["voiceover"] or s.get("audio_voice") != voice or not s.get("audio_path"))]
     try:
         for i, s in enumerate(todo):
             if run_id in CANCELLED:
-                return await finish_run(run_id, pid, "cancelled", f"Voiceover cancelled after {i} clip(s)")
+                await finish_run(run_id, pid, "cancelled", f"Voiceover cancelled after {i} clip(s)")
+                return "cancelled"
             await run_log(run_id, f"Voiceover {i + 1}/{len(todo)}: \"{s['voiceover'][:50]}\"", current=i + 1)
             audio = await ai.synthesize(s["voiceover"], voice)
             path = await put_object(f"{APP_NAME}/u/{project['user_id']}/{pid}/{s['id']}_{new_id()}.mp3", audio, "audio/mpeg")
@@ -276,10 +324,68 @@ async def job_voiceover(project: dict, run_id: str) -> None:
             await db.projects.update_one({"id": pid, "steps.id": s["id"]}, {"$set": {
                 "steps.$.audio_path": path, "steps.$.audio_text": s["voiceover"],
                 "steps.$.audio_voice": voice, "steps.$.audio_duration_ms": dur}})
-        await finish_run(run_id, pid, "completed", f"Voiceover ready ({len(todo)} clip(s) generated)")
+        msg = f"Voiceover ready ({len(todo)} clip(s) generated)"
+        if final:
+            await finish_run(run_id, pid, "completed", msg)
+        else:
+            await run_log(run_id, msg, "success")
+        return "completed"
     except Exception as exc:
         logger.exception("voiceover job failed")
-        await finish_run(run_id, pid, "failed", f"Voiceover failed: {str(exc)[:200]}")
+        await finish_run(run_id, pid, "failed", f"Voiceover failed: {ai_error(exc)}")
+        return "failed"
+
+
+async def job_autopilot(project: dict, run_id: str) -> None:
+    pid = project["id"]
+    try:
+        elements = []
+        await run_log(run_id, "Scanning the live page with Browserless...")
+        try:
+            elements = await engine.inspect_page(project["target_url"])
+        except Exception as exc:
+            await run_log(run_id, f"Page scan skipped: {str(exc)[:120]}", "warn")
+        if run_id in CANCELLED:
+            raise Cancelled()
+        await run_log(run_id, f"Claude Sonnet 5.5 is writing the script ({len(elements)} live elements found)...")
+        result = await ai.generate_script(project["draft"], project["target_url"], elements, f"auto_{pid}_{new_id()}")
+        steps = normalize_steps(result.get("steps") or [], project["target_url"])
+        if not steps:
+            raise ValueError("AI returned no usable steps. Add more detail to your draft.")
+        project.update({"steps": steps, "thumbnail_path": None})
+        await touch(pid, {"steps": steps, "status": "recording", "thumbnail_path": None})
+        await log_history(project, "Generated script with AI", f"{len(steps)} steps (one-click run)", snapshot=True)
+        await db.runs.update_one({"id": run_id}, {"$set": {"total": len(steps)}})
+        await run_log(run_id, f"Script ready: {len(steps)} steps. Launching Browserless...", "success")
+    except Cancelled:
+        return await finish_run(run_id, pid, "cancelled", "Cancelled before recording")
+    except Exception as exc:
+        logger.exception("autopilot scripting failed")
+        await touch(pid, {"status": "draft" if not project.get("steps") else project.get("status", "draft")})
+        return await finish_run(run_id, pid, "failed", f"AI scripting failed: {ai_error(exc)}")
+    if await job_record(project, run_id, None, final=False) != "completed":
+        return
+    if project.get("narration_mode") != "captions":
+        fresh = await db.projects.find_one({"id": pid}, {"_id": 0})
+        if await job_voiceover(fresh, run_id, final=False) != "completed":
+            return
+    await finish_run(run_id, pid, "completed", "Demo ready — scripted, recorded and narrated in one run")
+
+
+async def refresh_all(cron_run_id: str) -> None:
+    if not engine.is_configured():
+        logger.warning("weekly refresh skipped: Browserless not configured")
+        return
+    projects = await db.projects.find({"auto_refresh": True, "is_deleted": False, "steps.0": {"$exists": True}},
+                                      {"_id": 0}).to_list(500)
+    done = 0
+    for p in projects:
+        if p.get("active_run_id") and await db.runs.find_one({"id": p["active_run_id"], "status": "running"}, {"_id": 0}):
+            continue
+        run = await new_run(p, "health", len(p["steps"]), "Weekly health check: re-recording to catch UI changes...")
+        await job_record(p, run["id"], None, health=True)
+        done += 1
+    await db.cron_runs.update_one({"run_id": cron_run_id}, {"$set": {"finished_at": now_iso(), "projects": done}})
 
 
 def fingerprint(project: dict) -> str:
@@ -325,7 +431,8 @@ async def list_projects(user: dict = Depends(get_current_user)):
         {"$sort": {"updated_at": -1}},
         {"$limit": 200},
         {"$project": {"_id": 0, "id": 1, "name": 1, "target_url": 1, "status": 1, "thumbnail_path": 1,
-                      "updated_at": 1, "is_public": 1, "step_count": {"$size": "$steps"}}},
+                      "updated_at": 1, "is_public": 1, "auto_refresh": 1, "health": 1,
+                      "step_count": {"$size": "$steps"}}},
     ]
     return await db.projects.aggregate(pipeline).to_list(200)
 
@@ -337,6 +444,7 @@ async def create_project(body: ProjectIn, user: dict = Depends(get_current_user)
          "target_url": body.target_url.strip(), "steps": [], "status": "draft",
          "voice": prefs.get("voice", "nova"), "narration_mode": prefs.get("narration_mode", "both"),
          "share_id": new_id(), "is_public": False, "thumbnail_path": None, "exports": [], "brand": DEFAULT_BRAND,
+         "auto_refresh": False, "health": None, "share_password_hash": None, "share_expires_at": None,
          "active_run_id": None, "is_deleted": False, "created_at": now_iso(), "updated_at": now_iso()}
     await db.projects.insert_one(dict(p))
     await log_history(p, "Created project")
@@ -387,7 +495,9 @@ async def delete_project(pid: str, user: dict = Depends(get_current_user)):
 @api.post("/projects/{pid}/duplicate")
 async def duplicate_project(pid: str, user: dict = Depends(get_current_user)):
     p = await get_project(pid, user)
+    p.pop("has_share_password", None)
     copy = {**p, "id": new_id("prj_"), "name": f"{p['name']} (copy)", "share_id": new_id(), "is_public": False,
+            "share_password_hash": None, "share_expires_at": None, "auto_refresh": False, "health": None,
             "exports": [], "active_run_id": None, "created_at": now_iso(), "updated_at": now_iso()}
     await db.projects.insert_one(dict(copy))
     await log_history(copy, "Duplicated", f"from {p['name']}", snapshot=True)
@@ -435,7 +545,7 @@ async def generate(pid: str, user: dict = Depends(get_current_user)):
         result = await ai.generate_script(p["draft"], p["target_url"], elements, f"gen_{pid}_{new_id()}")
     except Exception as exc:
         logger.exception("generate failed")
-        raise HTTPException(424, f"AI could not build a script: {str(exc)[:160]}")
+        raise HTTPException(424, f"AI could not build a script: {ai_error(exc)}")
     steps = normalize_steps(result.get("steps") or [], p["target_url"])
     if not steps:
         raise HTTPException(424, "AI returned no usable steps. Try adding more detail to your draft.")
@@ -465,6 +575,70 @@ async def enforce_quota(user: dict) -> None:
 def _require_browserless() -> None:
     if not engine.is_configured():
         raise HTTPException(400, "Browserless is not connected yet. Add your Browserless API key in Settings.")
+
+
+@api.post("/projects/{pid}/autopilot")
+async def autopilot(pid: str, user: dict = Depends(get_current_user)):
+    p = await get_project(pid, user)
+    _require_browserless()
+    if len(p["draft"].strip()) < 10:
+        raise HTTPException(400, "Write a draft of at least a few words first")
+    if not p["target_url"].startswith(("http://", "https://")):
+        raise HTTPException(400, "Add a valid target URL (starting with http:// or https://)")
+    await ensure_idle(p)
+    await enforce_quota(user)
+    await touch(pid, {"status": "recording"})
+    run = await new_run(p, "autopilot", 3, "One-click run: script → record → voiceover")
+    spawn(job_autopilot(p, run["id"]))
+    return run
+
+
+@api.post("/projects/{pid}/health-check")
+async def health_check(pid: str, user: dict = Depends(get_current_user)):
+    p = await get_project(pid, user)
+    _require_browserless()
+    if not p["steps"]:
+        raise HTTPException(400, "Record the demo first")
+    await ensure_idle(p)
+    run = await new_run(p, "health", len(p["steps"]), "Health check: re-recording to catch UI changes...")
+    spawn(job_record(p, run["id"], None, health=True))
+    return run
+
+
+@api.put("/projects/{pid}/share-settings")
+async def share_settings(pid: str, body: ShareSettingsIn, user: dict = Depends(get_current_user)):
+    await get_project(pid, user)
+    fields = {"share_expires_at": body.expires_at.astimezone(timezone.utc).isoformat() if body.expires_at else None}
+    if body.remove_password:
+        fields["share_password_hash"] = None
+    elif body.password:
+        fields["share_password_hash"] = hash_password(body.password)
+    await touch(pid, fields)
+    p = await get_project(pid, user)
+    await log_history(p, "Share settings updated", ("password protected" if p["has_share_password"] else "no password")
+                      + (f", expires {fields['share_expires_at'][:16]}" if fields["share_expires_at"] else ""))
+    return p
+
+
+@api.post("/cron/refresh-demos")
+async def cron_refresh_demos(request: Request):
+    # Cron endpoints must ack 2xx immediately; enqueue/background the actual work.
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer ") or not hmac.compare_digest(auth[7:], os.environ["WEBHOOK_CRON_SECRET"]):
+        raise HTTPException(401, "Unauthorized")
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(400, "Invalid body")
+    run_key = request.headers.get("X-Webhook-Id") or (body or {}).get("run_id")
+    if not run_key:
+        raise HTTPException(400, "Missing run id")
+    try:
+        await db.cron_runs.insert_one({"run_id": run_key, "schedule": "weekly-refresh", "received_at": now_iso()})
+    except DuplicateKeyError:
+        return {"ok": True, "duplicate": True}
+    spawn(refresh_all(run_key))
+    return {"ok": True}
 
 
 @api.post("/projects/{pid}/record")
@@ -569,7 +743,7 @@ async def rewrite(pid: str, body: RewriteIn, user: dict = Depends(get_current_us
     try:
         edits = await ai.rewrite_narration(p["steps"], body.instruction, f"rw_{pid}_{new_id()}")
     except Exception as exc:
-        raise HTTPException(424, f"AI rewrite failed: {str(exc)[:160]}")
+        raise HTTPException(424, f"AI rewrite failed: {ai_error(exc)}")
     by_id = {e.get("id"): e for e in edits if isinstance(e, dict)}
     for s in p["steps"]:
         e = by_id.get(s["id"])
@@ -595,7 +769,7 @@ async def repair_step(pid: str, sid: str, user: dict = Depends(get_current_user)
         elements = await engine.inspect_page(url)
         fix = await ai.repair_selector(step, elements, f"fix_{sid}_{new_id()}")
     except Exception as exc:
-        raise HTTPException(424, f"Repair failed: {str(exc)[:160]}")
+        raise HTTPException(424, f"Repair failed: {ai_error(exc)}")
     if not fix.get("selector"):
         raise HTTPException(424, "AI could not find a better selector")
     step.update({"selector": fix["selector"], "fallback_selectors": (fix.get("fallback_selectors") or [])[:3],
@@ -663,28 +837,54 @@ async def download_export(pid: str, eid: str, user: dict = Depends(get_current_u
 
 
 # ---------- public player ----------
-async def _public_project(share_id: str) -> dict:
+async def _public_project(share_id: str, request: Request, unlock: bool = True) -> dict:
     p = await db.projects.find_one({"share_id": share_id, "is_public": True, "is_deleted": False}, {"_id": 0})
     if not p:
         raise HTTPException(404, "This demo is private or does not exist")
+    if p.get("share_expires_at") and p["share_expires_at"] < now_iso():
+        raise HTTPException(410, "This demo link has expired")
+    pw = p.get("share_password_hash")
+    if unlock and pw:
+        token = request.headers.get("X-Viewer-Token") or request.query_params.get("t") or ""
+        if decode_viewer_token(token) != f"{share_id}:{pw[-10:]}":
+            raise HTTPException(401, "password_required")
     return p
 
 
+@api.post("/public/{share_id}/unlock")
+async def public_unlock(share_id: str, body: UnlockIn, request: Request):
+    p = await _public_project(share_id, request, unlock=False)
+    if not p.get("share_password_hash"):
+        return {"token": None}
+    fwd = request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+    ident = f"share:{share_id}:{fwd or (request.client.host if request.client else 'x')}"
+    attempt = await db.login_attempts.find_one({"identifier": ident}, {"_id": 0})
+    if attempt and attempt.get("count", 0) >= 10 and attempt.get("locked_until", now()) > now():
+        raise HTTPException(429, "Too many attempts. Try again in 15 minutes.")
+    if not verify_password(body.password, p["share_password_hash"]):
+        await db.login_attempts.update_one({"identifier": ident}, {"$inc": {"count": 1},
+                                           "$set": {"locked_until": now() + timedelta(minutes=15)}}, upsert=True)
+        raise HTTPException(403, "Incorrect password")
+    await db.login_attempts.delete_one({"identifier": ident})
+    return {"token": create_viewer_token(f"{share_id}:{p['share_password_hash'][-10:]}")}
+
+
 @api.get("/public/{share_id}")
-async def public_demo(share_id: str):
-    p = await _public_project(share_id)
+async def public_demo(share_id: str, request: Request):
+    p = await _public_project(share_id, request)
     keep = ("id", "action", "caption", "voiceover", "duration_ms", "transition", "transition_ms", "hotspot",
             "audio_duration_ms")
     steps = [{**{k: s.get(k) for k in keep}, "has_screenshot": bool(s.get("screenshot_path")),
               "has_audio": bool(s.get("audio_path")), "v": (s.get("screenshot_path") or "")[-12:]}
              for s in p["steps"]]
     return {"name": p["name"], "narration_mode": p.get("narration_mode", "both"), "steps": steps,
-            "brand": p.get("brand") or DEFAULT_BRAND, "updated_at": p["updated_at"]}
+            "brand": {**DEFAULT_BRAND, **(p.get("brand") or {})}, "updated_at": p["updated_at"],
+            "expires_at": p.get("share_expires_at")}
 
 
 @api.post("/public/{share_id}/events")
-async def public_event(share_id: str, body: EventIn):
-    p = await _public_project(share_id)
+async def public_event(share_id: str, body: EventIn, request: Request):
+    p = await _public_project(share_id, request)
     await db.analytics_events.update_one(
         {"project_id": p["id"], "session": body.session, "type": body.type, "step_index": body.step_index},
         {"$setOnInsert": {"created_at": now_iso()}}, upsert=True)
@@ -692,8 +892,8 @@ async def public_event(share_id: str, body: EventIn):
 
 
 @api.get("/public/{share_id}/steps/{sid}/{kind}")
-async def public_asset(share_id: str, sid: str, kind: Literal["screenshot", "thumb", "audio"]):
-    return await _asset(await _public_project(share_id), sid, kind)
+async def public_asset(share_id: str, sid: str, kind: Literal["screenshot", "thumb", "audio"], request: Request):
+    return await _asset(await _public_project(share_id, request), sid, kind)
 
 
 # ---------- settings ----------
@@ -701,8 +901,7 @@ async def public_asset(share_id: str, sid: str, kind: Literal["screenshot", "thu
 async def get_settings(user: dict = Depends(get_current_user)):
     return {"browserless_configured": engine.is_configured(),
             "browserless_region": os.environ.get("BROWSERLESS_WS_URL", ""),
-            "llm_configured": bool(os.environ.get("EMERGENT_LLM_KEY")),
-            "ai_model": "Claude Sonnet 5.5", "tts_model": "OpenAI TTS HD",
+            "llm_configured": True, "ai_model": ai.provider()[3], "tts_model": ai.tts_key()[1],
             "preferences": user.get("preferences") or {"voice": "nova", "narration_mode": "both"},
             "usage": {"recordings_this_month": await usage_count(user), "limit": MONTHLY_LIMIT, "plan": "Free"}}
 
@@ -728,7 +927,7 @@ async def tts_preview(body: PrefsIn, user: dict = Depends(get_current_user)):
     try:
         audio = await ai.synthesize("Hi! This is how your product demo narration will sound.", body.voice)
     except Exception as exc:
-        raise HTTPException(424, f"Voice preview failed: {str(exc)[:160]}")
+        raise HTTPException(424, f"Voice preview failed: {ai_error(exc)}")
     return Response(content=audio, media_type="audio/mpeg")
 
 
