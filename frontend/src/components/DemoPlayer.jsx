@@ -30,7 +30,7 @@ function Caption({ text, accent, top }) {
   );
 }
 
-export const DemoPlayer = ({ steps, src, narrationMode = "both", brand = {}, initialStep = 0, onStepChange, onEvent, chapters = false, shareUrl }) => {
+export const DemoPlayer = ({ steps, src, narrationMode = "both", brand = {}, initialStep = 0, onStepChange, onEvent, chapters = false, shareUrl, globalKeys = false }) => {
   const [idx, setIdx] = useState(Math.min(initialStep, Math.max(steps.length - 1, 0)));
   const [playing, setPlaying] = useState(false);
   const [muted, setMuted] = useState(false);
@@ -74,12 +74,22 @@ export const DemoPlayer = ({ steps, src, narrationMode = "both", brand = {}, ini
   }, [idx, steps]);
 
   const onKey = (e) => {
-    if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA") return;
+    if (["INPUT", "TEXTAREA", "SELECT"].includes(e.target.tagName) || e.metaKey || e.ctrlKey) return;
+    if (e.key === " " && e.target.tagName === "BUTTON" && !boxRef.current?.contains(e.target)) return;
     if (e.key === " ") { e.preventDefault(); setPlaying((p) => !p); }
     if (e.key === "ArrowRight") go(idx + 1);
     if (e.key === "ArrowLeft") go(idx - 1);
     if (e.key === "m") setMuted((m) => !m);
   };
+
+  const keyRef = useRef(onKey);
+  keyRef.current = onKey;
+  useEffect(() => {
+    if (!globalKeys) return;
+    const h = (e) => { if (!boxRef.current?.contains(e.target)) keyRef.current(e); };
+    window.addEventListener("keydown", h);
+    return () => window.removeEventListener("keydown", h);
+  }, [globalKeys]);
 
   if (!steps.length) {
     return <div className="aspect-[16/10] rounded-xl border border-dashed border-slate-700 grid place-items-center text-sm text-slate-500" data-testid="player-empty">No steps yet</div>;
@@ -97,7 +107,7 @@ export const DemoPlayer = ({ steps, src, narrationMode = "both", brand = {}, ini
               className="absolute inset-0 h-full w-full object-cover object-top" data-testid="player-frame" />
           ) : (
             <motion.div key={step.id} initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="absolute inset-0 grid place-items-center grid-bg">
-              <div className="text-center px-6">
+              <div className="text-center px-6 mt-32">
                 <p className="font-mono text-[10px] uppercase tracking-widest text-cyan-400">{ACTION_LABEL[step.action]} · not recorded yet</p>
                 <p className="mt-2 text-slate-400 text-sm">{step.selector || step.url || ""}</p>
               </div>

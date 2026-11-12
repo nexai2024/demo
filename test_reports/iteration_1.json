@@ -1,0 +1,57 @@
+{
+  "summary": "Iteration 1 full-stack test of Flowcast. Backend: 18 pytest cases (auth, projects CRUD/list step_count, duplicate/delete, cross-user isolation, history+restore, record/export/run guards, public share + events validation + analytics, settings, tts preview) -> 17/18 pass; brute-force lockout fails because the lockout key includes the rotating ingress pod IP. Frontend (Playwright, 1920x1080): register/logout/login, protected redirect, dashboard templates/search/duplicate/delete(confirm+cancel), Draft autosave + persistence, Timeline add/action select/selector/caption/voiceover/move/duplicate/delete/undo/redo + persistence, Advanced sliders/fallbacks/sensitive->password, Ctrl+K palette, Record/Export 400 toasts, Export & share toggle/share URL/embed, brand kit persist, /share (title, chapters, deep link ?step=2, prev/next, play/autoplay, watermark off), /embed (player only), private share error, Analytics views/completion, History restore, Settings usage/status/prefs save, browserless banner - all working. Bugs: fallback-selectors input cannot accept commas when typed; 502 error responses are replaced by Cloudflare HTML so AI-budget errors show a confusing Cloudflare message in toast; player keyboard shortcuts only work when the player frame itself is focused.",
+  "backend_issues": {
+    "critical": [
+      {"endpoint": "POST /api/auth/login", "issue": "Brute-force lockout ineffective: identifier = request.client.host + email, but behind K8s ingress client.host rotates between pod IPs (observed 10.64.128.44 and 10.64.132.140), so 6+ wrong attempts never return 429 (counts split 3/3). Use X-Forwarded-For first IP (or email-only key).", "priority": "HIGH"},
+      {"endpoint": "POST /api/projects/{id}/generate, /rewrite, /steps/{sid}/repair (and any HTTPException 502)", "issue": "Backend returns 502 with JSON detail, but Cloudflare/ingress replaces 502 bodies with its HTML 'Bad gateway' page. Frontend toast shows 'The origin web server returned an invalid or incomplete response to Cloudflare...' instead of 'AI could not build a script: Budget has been exceeded'. Use a non-gateway status (e.g. 424/422/400/503-with-body) for upstream AI/Browserless failures.", "priority": "HIGH"}
+    ],
+    "minor": [
+      {"endpoint": "PUT /api/projects/{id}", "issue": "Client can set arbitrary steps[].screenshot_path/thumb_path/audio_path; /api/projects/{id}/steps/{sid}/screenshot then serves whatever storage path is given (potential cross-user object read if a path is known/guessed). Server should preserve server-owned fields (paths, status, hotspot, audio_*) from the stored step and ignore client values."},
+      {"endpoint": "PUT /api/projects/{id}", "issue": "Every autosave with steps (every 1.2s of editing) writes a full 'Edited timeline' snapshot to history -> history floods quickly (4 entries after a minute of edits; capped at 100 in list). Consider coalescing."},
+      {"endpoint": "POST /api/public/{share}/events", "issue": "No rate limiting; anyone can inflate view/completion analytics."},
+      {"endpoint": "DELETE /api/projects/{id}", "issue": "Soft delete leaves history/analytics_events; fine but no cleanup."},
+      {"endpoint": "POST /api/tts/preview", "issue": "No try/except around ai.synthesize -> would 500 on TTS errors (currently returns 200 audio, so TTS budget is not exhausted)."}
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [
+      {"component": "StepCard Advanced - Fallback selectors", "issue": "Controlled input value is (fallback_selectors).join(', ') and onChange splits on ',' and filters empty -> typing a trailing comma is immediately removed, so typing '#x, #y' yields '#x#y'. Users can never enter more than one fallback by typing. Keep raw string in local state and parse on blur.", "selector": "[data-testid^='step-fallbacks-']", "priority": "HIGH"},
+      {"component": "DemoPlayer keyboard", "issue": "onKeyDown is attached to the player frame div only; after clicking prev/next/play buttons (outside the frame) or on page load, ArrowLeft/ArrowRight/Space do nothing, though the share page tip says 'press Space to play, ← → to move'. Works only when [data-testid=demo-player] is focused. Attach to window on SharePage or to the whole player wrapper.", "selector": "[data-testid='demo-player']", "priority": "MEDIUM"},
+      {"component": "TimelineToolbar AI rewrite menu", "issue": "Duplicate data-testid 'rewrite-more' for 'Make it more concise' and 'Make it more technical...' (t.split(' ')[2]).", "selector": "[data-testid='rewrite-more']", "priority": "LOW"},
+      {"component": "Studio dupStep", "issue": "Duplicate step copies only action/selector/url/caption/voiceover; drops text, sensitive, fallback_selectors, duration/transition, wait_ms, amount.", "selector": "[data-testid^='step-duplicate-']", "priority": "LOW"}
+    ],
+    "integration_issues": [
+      {"flow": "Generate script / AI rewrite error handling", "issue": "Error toast shows Cloudflare 502 HTML-derived message rather than backend detail (see backend critical #2). UI does not crash.", "affected_selectors": ["[data-testid='generate-script-button']", "[data-testid='timeline-ai-rewrite-button']"]}
+    ],
+    "design_issues": [
+      {"screen": "Studio/Share player (no screenshot yet)", "issues": ["Placeholder label 'CLICK · NOT RECORDED YET' is overlapped/hidden by the center play button."]},
+      {"screen": "Studio sidebar", "issues": ["Banner says 'recording is disabled' but Record demo button is fully enabled (click yields 400 toast). Disable it or soften banner copy."]}
+    ]
+  },
+  "test_report_links": ["/app/backend/tests/test_flowcast_api.py", "/app/test_reports/pytest/pytest_results.xml"],
+  "action_items": [
+    "Fix login lockout key to use X-Forwarded-For (first hop) or email-only so lockout triggers after 5 failures",
+    "Stop returning HTTP 502 from app routes (generate/rewrite/repair/test-browserless); use e.g. 424/422/503 so the JSON detail reaches the UI",
+    "Fix fallback selectors input so commas can be typed (local raw string state, parse on blur)",
+    "Make player keyboard shortcuts work page-wide on share/embed pages (or when any player control is focused)",
+    "Server-side: do not trust client-provided screenshot_path/thumb_path/audio_path in PUT /projects/{id}; merge from stored steps",
+    "Minor: unique data-testids for rewrite tones; dupStep should copy all editable fields; disable Record button when Browserless isn't configured; coalesce history snapshots"
+  ],
+  "critical_code_review_comments": [
+    "server.py is 741 lines (>700) - split into routers (projects, runs, public, settings)",
+    "login lockout identifier depends on request.client.host which is the ingress pod IP",
+    "update_project accepts full Step objects incl. server-owned fields (paths/status/hotspot) - IDOR risk on storage objects",
+    "HTTPException(502, ...) is masked by Cloudflare in this deployment",
+    "tts_preview lacks error handling (would 500)",
+    "AnalyticsPanel fetches only on mount (ok because tabs unmount), no refresh button",
+    "CORS_ORIGINS='*' with allow_credentials=True - Starlette echoes origin; acceptable in preview but restrict for prod"
+  ],
+  "updated_files": ["/app/backend/tests/test_flowcast_api.py"],
+  "success_rate": {"backend": "94% (17/18)", "frontend": "~90% (all requested flows work; 2 functional bugs: fallback comma input, keyboard shortcuts focus)"},
+  "test_credentials": "admin@flowcast.app / admin123 (works). Test users created: test_*@example.com / pass1234 (no delete endpoint; left in users collection).",
+  "seed_data_creation": "TEST_ projects created by pytest and UI were deleted (soft delete) by id. Admin preferences were changed during tests and restored (voice nova, narration both). Some TEST_ registered users remain (no user deletion API).",
+  "retest_needed": true,
+  "should_main_agent_self_test": true,
+  "context_for_next_testing_agent": "Studio route is /projects/:id (not /studio). Run backend tests with: cd /app/backend && REACT_APP_BACKEND_URL=<url> pytest tests/ -n 0. LLM budget exhausted (generate/rewrite 502 masked by Cloudflare); TTS preview currently returns 200. Browserless not configured -> record 400. Re-verify: lockout test (TestAuth::test_bruteforce_lockout), fallback comma typing via press_sequentially, keyboard arrows on /share after clicking next button, AI error toast text.",
+  "rca of the issue": "Lockout: auth_routes.login builds ident from request.client.host; ingress forwards from multiple pods so attempts spread across keys (DB showed two docs count=3 each). AI error toast: server raises HTTPException(502); Cloudflare intercepts origin 502 and serves its own HTML, axios errMsg falls back to generic text. Fallback input: StepCard Advanced onChange -> split(',').map(trim).filter(Boolean) then rejoin removes trailing separator on every keystroke."
+}

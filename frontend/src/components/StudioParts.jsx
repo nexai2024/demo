@@ -50,7 +50,7 @@ export const TimelineToolbar = ({ meta, setMeta, undo, redo, canUndo, canRedo, o
       </DropdownMenuTrigger>
       <DropdownMenuContent className="bg-slate-950 border-slate-800 w-64">
         <DropdownMenuLabel className="text-xs text-slate-500">Tone</DropdownMenuLabel>
-        {TONES.map((t) => <DropdownMenuItem key={t} onClick={() => onRewrite(t)} data-testid={`rewrite-${t.split(" ")[2]}`}>{t}</DropdownMenuItem>)}
+        {TONES.map((t, i) => <DropdownMenuItem key={t} onClick={() => onRewrite(t)} data-testid={`rewrite-tone-${i}`}>{t}</DropdownMenuItem>)}
         <DropdownMenuSeparator />
         <DropdownMenuLabel className="text-xs text-slate-500 flex items-center gap-1"><Languages className="h-3 w-3" /> Translate</DropdownMenuLabel>
         {LANGS.map((l) => <DropdownMenuItem key={l} onClick={() => onRewrite(`Translate captions and voiceover to ${l}`)} data-testid={`translate-${l}`}>{l}</DropdownMenuItem>)}

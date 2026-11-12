@@ -16,7 +16,9 @@ import ai
 import engine
 import render
 from auth_routes import router as auth_router, seed_admin
-from core import client, db, get_current_user, new_id, now_iso
+from datetime import timedelta
+
+from core import client, db, get_current_user, new_id, now, now_iso
 from storage import APP_NAME, get_object, init_storage, put_object
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
@@ -86,6 +88,10 @@ class Step(BaseModel):
     error: Optional[str] = None
     attempts: int = 0
     page_url: Optional[str] = None
+
+
+SERVER_FIELDS = ("screenshot_path", "thumb_path", "audio_path", "audio_text", "audio_voice", "audio_duration_ms",
+                 "hotspot", "status", "error", "attempts", "page_url", "resolved_selector")
 
 
 class ProjectIn(BaseModel):
@@ -347,13 +353,25 @@ async def update_project(pid: str, body: ProjectUpdate, user: dict = Depends(get
     p = await get_project(pid, user)
     fields = body.model_dump(exclude_none=True)
     if "steps" in fields:
-        fields["steps"] = [s.model_dump() for s in body.steps]
+        stored = {s["id"]: s for s in p["steps"]}
+        fields["steps"] = []
+        for s in body.steps:
+            d = s.model_dump()
+            prev = stored.get(d["id"], {})
+            for k in SERVER_FIELDS:
+                d[k] = prev.get(k, Step.model_fields[k].default)
+            fields["steps"].append(d)
     if "brand" in fields:
         fields["brand"] = body.brand.model_dump()
     await touch(pid, fields)
     p.update(fields)
     if "steps" in fields:
-        await log_history(p, "Edited timeline", f"{len(fields['steps'])} steps", snapshot=True)
+        last = await db.history.find_one({"project_id": pid}, {"_id": 0}, sort=[("created_at", -1)])
+        if last and last["event"] == "Edited timeline" and last["created_at"] > (now() - timedelta(minutes=2)).isoformat():
+            await db.history.update_one({"id": last["id"]}, {"$set": {"steps": fields["steps"], "created_at": now_iso(),
+                                                                     "detail": f"{len(fields['steps'])} steps"}})
+        else:
+            await log_history(p, "Edited timeline", f"{len(fields['steps'])} steps", snapshot=True)
     elif "is_public" in fields:
         await log_history(p, "Sharing enabled" if body.is_public else "Sharing disabled")
     return await get_project(pid, user)
@@ -417,10 +435,10 @@ async def generate(pid: str, user: dict = Depends(get_current_user)):
         result = await ai.generate_script(p["draft"], p["target_url"], elements, f"gen_{pid}_{new_id()}")
     except Exception as exc:
         logger.exception("generate failed")
-        raise HTTPException(502, f"AI could not build a script: {str(exc)[:160]}")
+        raise HTTPException(424, f"AI could not build a script: {str(exc)[:160]}")
     steps = normalize_steps(result.get("steps") or [], p["target_url"])
     if not steps:
-        raise HTTPException(502, "AI returned no usable steps. Try adding more detail to your draft.")
+        raise HTTPException(424, "AI returned no usable steps. Try adding more detail to your draft.")
     await touch(pid, {"steps": steps, "status": "scripted", "thumbnail_path": None})
     p["steps"] = steps
     await log_history(p, "Generated script with AI", f"{len(steps)} steps", snapshot=True)
@@ -431,7 +449,6 @@ async def generate(pid: str, user: dict = Depends(get_current_user)):
 
 
 def month_start() -> str:
-    from core import now
     return now().replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
 
 
@@ -552,7 +569,7 @@ async def rewrite(pid: str, body: RewriteIn, user: dict = Depends(get_current_us
     try:
         edits = await ai.rewrite_narration(p["steps"], body.instruction, f"rw_{pid}_{new_id()}")
     except Exception as exc:
-        raise HTTPException(502, f"AI rewrite failed: {str(exc)[:160]}")
+        raise HTTPException(424, f"AI rewrite failed: {str(exc)[:160]}")
     by_id = {e.get("id"): e for e in edits if isinstance(e, dict)}
     for s in p["steps"]:
         e = by_id.get(s["id"])
@@ -578,9 +595,9 @@ async def repair_step(pid: str, sid: str, user: dict = Depends(get_current_user)
         elements = await engine.inspect_page(url)
         fix = await ai.repair_selector(step, elements, f"fix_{sid}_{new_id()}")
     except Exception as exc:
-        raise HTTPException(502, f"Repair failed: {str(exc)[:160]}")
+        raise HTTPException(424, f"Repair failed: {str(exc)[:160]}")
     if not fix.get("selector"):
-        raise HTTPException(502, "AI could not find a better selector")
+        raise HTTPException(424, "AI could not find a better selector")
     step.update({"selector": fix["selector"], "fallback_selectors": (fix.get("fallback_selectors") or [])[:3],
                  "status": "pending", "error": None})
     await touch(pid, {"steps": p["steps"]})
@@ -668,7 +685,9 @@ async def public_demo(share_id: str):
 @api.post("/public/{share_id}/events")
 async def public_event(share_id: str, body: EventIn):
     p = await _public_project(share_id)
-    await db.analytics_events.insert_one({"project_id": p["id"], **body.model_dump(), "created_at": now_iso()})
+    await db.analytics_events.update_one(
+        {"project_id": p["id"], "session": body.session, "type": body.type, "step_index": body.step_index},
+        {"$setOnInsert": {"created_at": now_iso()}}, upsert=True)
     return {"ok": True}
 
 
@@ -700,13 +719,16 @@ async def test_browserless(user: dict = Depends(get_current_user)):
     try:
         await engine.test_connection()
     except Exception as exc:
-        raise HTTPException(502, f"Could not connect to Browserless: {str(exc)[:200]}")
+        raise HTTPException(424, f"Could not connect to Browserless: {str(exc)[:200]}")
     return {"ok": True}
 
 
 @api.post("/tts/preview")
 async def tts_preview(body: PrefsIn, user: dict = Depends(get_current_user)):
-    audio = await ai.synthesize("Hi! This is how your product demo narration will sound.", body.voice)
+    try:
+        audio = await ai.synthesize("Hi! This is how your product demo narration will sound.", body.voice)
+    except Exception as exc:
+        raise HTTPException(424, f"Voice preview failed: {str(exc)[:160]}")
     return Response(content=audio, media_type="audio/mpeg")
 
 

@@ -137,7 +137,15 @@ export default function Studio() {
   const editStep = (id, patch) => steps.set((arr) => arr.map((s) => (s.id === id ? { ...s, ...patch } : s)), { coalesce: true });
   const moveStep = (i, d) => steps.set((arr) => { const a = [...arr]; [a[i], a[i + d]] = [a[i + d], a[i]]; return a; });
   const delStep = (id) => steps.set((arr) => arr.filter((s) => s.id !== id));
-  const dupStep = (i) => steps.set((arr) => { const a = [...arr]; a.splice(i + 1, 0, { ...arr[i], ...newStep(), action: arr[i].action, selector: arr[i].selector, url: arr[i].url, caption: arr[i].caption, voiceover: arr[i].voiceover }); return a; });
+  const dupStep = (i) => steps.set((arr) => {
+    const fresh = newStep();
+    const copy = { ...arr[i], id: fresh.id };
+    ["screenshot_path", "thumb_path", "audio_path", "audio_text", "audio_voice", "audio_duration_ms", "hotspot", "error", "page_url", "resolved_selector"].forEach((k) => { copy[k] = fresh[k]; });
+    Object.assign(copy, { status: "pending", attempts: 0 });
+    const a = [...arr];
+    a.splice(i + 1, 0, copy);
+    return a;
+  });
   const addStep = () => { steps.set((arr) => [...arr, newStep()]); setSelected(steps.value.length); };
 
   useEffect(() => {
@@ -232,7 +240,7 @@ export default function Studio() {
             {running && run?.kind !== "export" ? (
               <button onClick={cancel} className="h-11 rounded-lg border border-red-500/40 text-red-300 hover:bg-red-500/10 font-medium flex items-center justify-center gap-2" data-testid="cancel-run-button"><Square className="h-4 w-4" /> Stop</button>
             ) : (
-              <button onClick={record} disabled={!list.length || running || !!busy} data-testid="record-demo-button"
+              <button onClick={record} disabled={!list.length || running || !!busy || settings?.browserless_configured === false} data-testid="record-demo-button"
                 className="h-11 rounded-lg bg-indigo-600 hover:bg-indigo-500 font-medium shadow-lg shadow-indigo-600/20 flex items-center justify-center gap-2 disabled:opacity-50 transition-[background-color,transform] active:scale-[0.98]">
                 {busy === "record" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Clapperboard className="h-4 w-4" />} {captured.length ? "Re-record all" : "Record demo"}
               </button>

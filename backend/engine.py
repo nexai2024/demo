@@ -31,7 +31,7 @@ def _ws_url() -> str:
     if not key:
         raise RuntimeError("Browserless API key is not configured")
     base = os.environ["BROWSERLESS_WS_URL"].rstrip("/")
-    return f"{base}?token={key}&timeout=300000"
+    return f"{base}?token={key}&timeout=120000"
 
 
 def describe(step: dict) -> str:
@@ -58,7 +58,7 @@ async def _locate(page, step: dict):
     for i, sel in enumerate(candidates):
         try:
             loc = page.locator(sel).first
-            await loc.wait_for(state="visible", timeout=8000 if i == 0 else 3000)
+            await loc.wait_for(state="visible", timeout=6000 if i == 0 else 2500)
             await loc.scroll_into_view_if_needed(timeout=5000)
             step["resolved_selector"] = sel
             return loc, await loc.bounding_box()
@@ -102,7 +102,7 @@ async def _perform(page, step: dict, capture: bool):
 ProgressFn = Callable[[int, dict, str, dict], Awaitable[None]]
 
 
-async def run_steps(steps: list, on_progress: ProgressFn, capture_only: set | None = None, retries: int = 2):
+async def run_steps(steps: list, on_progress: ProgressFn, capture_only: set | None = None, retries: int = 1):
     async with async_playwright() as p:
         browser = await p.chromium.connect_over_cdp(_ws_url(), timeout=45000)
         try:
@@ -119,6 +119,8 @@ async def run_steps(steps: list, on_progress: ProgressFn, capture_only: set | No
                         break
                     except Exception as exc:
                         err = _short(exc)
+                        if "Timeout" in err and step.get("selector"):
+                            err = f"Couldn't find '{step['selector']}' (or its fallbacks) on {page.url} — try Fix with AI"
                         await page.wait_for_timeout(700)
                 shot = pre_shot
                 if capture and shot is None:

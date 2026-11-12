@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Reorder, useDragControls } from "framer-motion";
 import { AlertTriangle, ArrowDown, ArrowUp, ChevronDown, Copy, GripVertical, Loader2, RotateCcw, Trash2, Wand2 } from "lucide-react";
 import { Input } from "@/components/ui/input";
@@ -19,6 +19,13 @@ function Target({ s, set }) {
   return <Input value={s.selector || ""} onChange={(e) => set({ selector: e.target.value })} placeholder='text="Sign in"' className="bg-slate-950 font-mono text-xs h-9" data-testid={`step-selector-${s.id}`} />;
 }
 
+function FallbackInput({ s, set }) {
+  const [raw, setRaw] = useState((s.fallback_selectors || []).join(", "));
+  useEffect(() => { setRaw((s.fallback_selectors || []).join(", ")); }, [s.fallback_selectors]);
+  const commit = () => set({ fallback_selectors: raw.split(",").map((x) => x.trim()).filter(Boolean) });
+  return <Input value={raw} onChange={(e) => setRaw(e.target.value)} onBlur={commit} onKeyDown={(e) => e.key === "Enter" && commit()} className="bg-slate-950 font-mono text-xs h-9" data-testid={`step-fallbacks-${s.id}`} />;
+}
+
 function Advanced({ s, set }) {
   return (
     <div className="grid sm:grid-cols-2 gap-4 pt-4 border-t border-slate-800">
@@ -33,7 +40,7 @@ function Advanced({ s, set }) {
         <Input type="number" value={s.wait_ms} onChange={(e) => set({ wait_ms: Number(e.target.value) })} className="bg-slate-950 font-mono text-xs h-9" data-testid={`step-settle-${s.id}`} /></div>
       {["click", "type", "hover"].includes(s.action) && (
         <div className="space-y-2"><p className={lbl}>Fallback selectors (comma separated)</p>
-          <Input value={(s.fallback_selectors || []).join(", ")} onChange={(e) => set({ fallback_selectors: e.target.value.split(",").map((x) => x.trim()).filter(Boolean) })} className="bg-slate-950 font-mono text-xs h-9" data-testid={`step-fallbacks-${s.id}`} /></div>
+          <FallbackInput s={s} set={set} /></div>
       )}
       {s.action === "type" && (
         <label className="flex items-center gap-2 text-sm text-slate-300"><Switch checked={!!s.sensitive} onCheckedChange={(c) => set({ sensitive: c })} data-testid={`step-sensitive-${s.id}`} /> Sensitive input (mask value)</label>

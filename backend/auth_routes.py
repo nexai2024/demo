@@ -53,7 +53,8 @@ async def register(body: RegisterIn, response: Response):
 @router.post("/login")
 async def login(body: LoginIn, request: Request, response: Response):
     email = body.email.lower()
-    ident = f"{request.client.host if request.client else 'x'}:{email}"
+    fwd = request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+    ident = f"{fwd or (request.client.host if request.client else 'x')}:{email}"
     attempt = await db.login_attempts.find_one({"identifier": ident}, NO_ID)
     if attempt and attempt.get("count", 0) >= 5 and attempt.get("locked_until", now()) > now():
         raise HTTPException(429, "Too many failed attempts. Try again in 15 minutes.")

@@ -40,7 +40,7 @@ export default function SharePage({ embed = false }) {
 
   const player = (
     <DemoPlayer steps={demo.steps} src={(s, k) => publicAsset(shareId, s, k)} narrationMode={demo.narration_mode} brand={demo.brand}
-      initialStep={initial} chapters={!embed} shareUrl={`${window.location.origin}/share/${shareId}`} onEvent={(t, i) => track(t, i)} />
+      initialStep={initial} chapters={!embed} globalKeys shareUrl={`${window.location.origin}/share/${shareId}`} onEvent={(t, i) => track(t, i)} />
   );
   if (embed) return <div className="p-3 bg-slate-950 min-h-screen relative z-10" data-testid="public-demo-player">{player}</div>;
   return (
