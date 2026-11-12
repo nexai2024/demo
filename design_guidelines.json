@@ -1,0 +1,131 @@
+{
+  "project_name": "AI Product Demo Builder",
+  "app_type": "saas_app",
+  "archetype": "Performance Pro / Tech Studio (Tactical Studio Minimalism)",
+  "theme": "Dark obsidian & slate studio theme with electric indigo/cyan kinetic highlights",
+  "typography": {
+    "font_family_headings": "Plus Jakarta Sans, Outfit, sans-serif",
+    "font_family_body": "Inter, system-ui, sans-serif",
+    "font_family_mono": "JetBrains Mono, Fira Code, monospace",
+    "heading_h1": "text-4xl sm:text-5xl lg:text-6xl font-extrabold tracking-tight leading-none text-slate-100",
+    "heading_h2": "text-2xl sm:text-3xl lg:text-4xl font-bold tracking-tight text-slate-100",
+    "heading_h3": "text-xl sm:text-2xl font-semibold tracking-tight text-slate-200",
+    "heading_h4": "text-lg sm:text-xl font-semibold text-slate-200",
+    "body_text": "text-sm sm:text-base text-slate-400 leading-relaxed",
+    "caption_text": "text-xs font-mono uppercase tracking-wider text-slate-400",
+    "font_rules": "DO NOT use Inter for main hero or studio titles. Use Plus Jakarta Sans or Outfit for headers and JetBrains Mono for action logs and timestamp badges."
+  },
+  "colors": {
+    "background_main": "#030712",
+    "background_surface": "#0F172A",
+    "background_card": "#1E293B",
+    "background_glass": "rgba(15, 23, 42, 0.75)",
+    "border_subtle": "rgba(255, 255, 255, 0.08)",
+    "border_active": "rgba(99, 102, 241, 0.5)",
+    "text_primary": "#F8FAFC",
+    "text_secondary": "#94A3B8",
+    "text_muted": "#64748B",
+    "primary_indigo": "#6366F1",
+    "primary_cyan": "#06B6D4",
+    "accent_violet": "#8B5CF6",
+    "status_success": "#10B981",
+    "status_warning": "#F59E0B",
+    "status_error": "#EF4444",
+    "gradient_hero": "bg-gradient-to-r from-indigo-500 via-purple-500 to-cyan-500",
+    "gradient_dark_card": "bg-gradient-to-b from-slate-900/90 to-slate-950/90"
+  },
+  "layout_and_spacing": {
+    "spacing_scale": "p-2, p-4, p-6, p-8, p-12, gap-4, gap-6, gap-8",
+    "container_padding": "px-4 sm:px-6 lg:px-8 py-6",
+    "dashboard_grid": "grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6",
+    "studio_layout": "grid grid-cols-1 lg:grid-cols-12 gap-6 min-h-[calc(100vh-5rem)]",
+    "studio_panes": {
+      "timeline_editor": "lg:col-span-8 space-y-4",
+      "live_preview": "lg:col-span-4 space-y-4"
+    }
+  },
+  "component_styling": {
+    "buttons": {
+      "primary": "bg-indigo-600 hover:bg-indigo-500 text-white font-medium px-4 py-2.5 rounded-lg shadow-lg shadow-indigo-600/20 transition-all duration-200 hover:scale-[1.02] active:scale-[0.98] focus:ring-2 focus:ring-indigo-400",
+      "secondary": "bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 font-medium px-4 py-2.5 rounded-lg transition-all duration-200 hover:text-white",
+      "accent": "bg-gradient-to-r from-indigo-500 to-cyan-500 hover:from-indigo-400 hover:to-cyan-400 text-white font-semibold px-5 py-2.5 rounded-lg shadow-lg shadow-cyan-500/25 transition-all duration-200"
+    },
+    "cards": {
+      "glass": "bg-slate-900/60 backdrop-blur-xl border border-slate-800/80 rounded-xl p-6 shadow-2xl hover:border-slate-700/80 transition-all",
+      "interactive": "bg-slate-900/80 border border-slate-800 rounded-xl p-5 hover:border-indigo-500/40 hover:shadow-indigo-500/10 hover:shadow-xl transition-all duration-200 cursor-pointer"
+    },
+    "forms": {
+      "input": "bg-slate-950 border border-slate-800 focus:border-indigo-500 text-slate-100 placeholder:text-slate-500 rounded-lg px-4 py-2.5 text-sm focus:ring-2 focus:ring-indigo-500/20 outline-none transition-all",
+      "textarea": "bg-slate-950 border border-slate-800 focus:border-indigo-500 text-slate-100 placeholder:text-slate-500 rounded-lg p-4 text-sm focus:ring-2 focus:ring-indigo-500/20 outline-none transition-all font-mono"
+    },
+    "header": "sticky top-0 z-50 bg-slate-950/80 backdrop-blur-md border-b border-slate-800/80 px-6 py-3.5 flex items-center justify-between"
+  },
+  "key_features_and_views": [
+    {
+      "name": "Auth Page",
+      "description": "Split hero visual and glass login form supporting email/password authentication and Google OAuth mock button.",
+      "testid": "auth-form-container"
+    },
+    {
+      "name": "Projects Dashboard",
+      "description": "Grid of created demo projects with status tags (Draft, Executing, Ready, Exported), thumbnail preview, search bar, duplicate/delete actions, and 'Create New Demo' hero CTA.",
+      "testid": "projects-dashboard-grid"
+    },
+    {
+      "name": "Draft Spec & AI Script Engine",
+      "description": "Text area to paste release notes or feature specs, selector for AI persona/voice prompt, and real-time step generator converting specs into structured actions (Click, Type, Scroll, Wait).",
+      "testid": "draft-script-engine"
+    },
+    {
+      "name": "Studio & Timeline Editor",
+      "description": "Timeline sequence editor with visual drag-to-reorder action steps, caption text editor, voiceover synthesizer settings, Browserless live execution progress tracker with live screen simulation.",
+      "testid": "studio-timeline-editor"
+    },
+    {
+      "name": "Export & Share Studio",
+      "description": "Export settings modal offering GIF generation, MP4 video rendering, embeddable iframe snippet generator, public share URL creator, and theme customizations.",
+      "testid": "export-share-panel"
+    },
+    {
+      "name": "Public Player Page",
+      "description": "Embeddable/Shareable interactive demo viewer with hotspot tooltips, audio voiceover toggle, step navigation controls, and full-screen player mode.",
+      "testid": "public-demo-player"
+    },
+    {
+      "name": "Settings Page",
+      "description": "Browserless API connection options, AI Voiceover model preferences, brand assets (logos, custom player colors), and account settings.",
+      "testid": "settings-page"
+    }
+  ],
+  "image_urls": {
+    "dashboard_preview_1": "https://images.unsplash.com/photo-1763718528755-4bca23f82ac3?crop=entropy&cs=srgb&fm=jpg&ixid=M3w3NTY2OTV8MHwxfHNlYXJjaHwxfHxzYWFzJTIwcHJvZHVjdCUyMGFwcCUyMGRhc2hib2FyZCUyMGludGVyZmFjZSUyMG1vZGVybiUyMHNvZnR3YXJlJTIwc2hvd2Nhc2V8ZW58MHx8fHwxNzk0NDQwNjY1fDA&ixlib=rb-4.1.0&q=85",
+    "dashboard_preview_2": "https://images.unsplash.com/photo-1648134859179-ed0c98f54519?crop=entropy&cs=srgb&fm=jpg&ixid=M3w3NTY2OTV8MHwxfHNlYXJjaHwzfHxzYWFzJTIwcHJvZHVjdCUyMGFwcCUyMGRhc2hib2FyZCUyMGludGVyZmFjZSUyMG1vZGVybiUyMHNvZnR3YXJlJTIwc2hvd2Nhc2V8ZW58MHx8fHwxNzk0NDQwNjY1fDA&ixlib=rb-4.1.0&q=85",
+    "code_preview": "https://images.unsplash.com/photo-1614741118887-7a4ee193a5fa?crop=entropy&cs=srgb&fm=jpg&ixid=M3w3NDQ2MzR8MHwxfHNlYXJjaHw0fHxzb2Z0d2FyZSUyMGRldmVsb3BlciUyMGNvZGluZyUyMHdlYiUyMGFwcCUyMHNjcmVlbiUyMHByZXNlbnRhdGlvbnxlbnwwfHx8fDE3OTQ0NDA2NjV8MA&ixlib=rb-4.1.0&q=85",
+    "screen_mockup": "https://images.unsplash.com/photo-1547658719-da2b51169166?crop=entropy&cs=srgb&fm=jpg&ixid=M3w3NDQ2MzR8MHwxfHNlYXJjaHwyfHxzb2Z0d2FyZSUyMGRldmVsb3BlciUyMGNvZGluZyUyMHdlYiUyMGFwcCUyMHNjcmVlbiUyMHByZXNlbnRhdGlvbnxlbnwwfHx8fDE3OTQ0NDA2NjV8MA&ixlib=rb-4.1.0&q=85"
+  },
+  "motion_and_microinteractions": {
+    "framework": "Framer Motion",
+    "transitions": "Use spring transitions for timeline cards (type: 'spring', stiffness: 300, damping: 25). Fade-in for step execution console.",
+    "hover_states": "Hover scale 1.02 on project cards, slight glow outline on focus, active button press scale 0.97.",
+    "reduced_motion": "Respect prefers-reduced-motion media query by fallback to standard opacity fade without transforms."
+  },
+  "accessibility": {
+    "contrast_ratio": "Ensure minimum 4.5:1 text contrast. White/Slate-100 text over slate-900 background passes APCA/WCAG AA.",
+    "focus_states": "Visible focus ring (focus:ring-2 focus:ring-indigo-500 focus:outline-none) on all inputs, buttons, and timeline items.",
+    "aria_labels": "All interactive timeline controls, step player buttons, export actions must have aria-label and data-testid."
+  },
+  "instructions_to_main_agent": [
+    "Build a complete, polished AI Product Demo Builder SaaS app in React JS using Tailwind CSS and Lucide React icons.",
+    "Ensure standard components in src/components/ui/ are imported and customized with dark obsidian theme colors.",
+    "Implement real working mock data for draft-to-script AI breakdown, live step execution runner, timeline editing, voiceover selection, and multi-format export options.",
+    "Every key view (Auth, Projects Dashboard, New Script Creator, Studio Timeline Editor, Player Export Modal, Public Embed View, Settings) must be fully navigable and state-persistent.",
+    "Add explicit data-testid attributes to all interactive elements, input fields, and action controls."
+  ],
+  "UNIVERSAL GUIDELINES FOR MAIN AGENT": [
+    "Never create standard white/light grey boring dashboards. Use the dark studio obsidian palette with glowing borders.",
+    "Never use universal CSS transitions like 'transition: all'. Explicitly state transition properties.",
+    "Header must have backdrop-blur and border-b border-slate-800, never completely flat or missing.",
+    "All forms must use customized Shadcn/Tailwind components with explicit dark input styles and hover states.",
+    "Provide toast feedback using Sonner for user actions (project saved, script generated, step added, export copied)."
+  ]
+}
