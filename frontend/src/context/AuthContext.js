@@ -22,8 +22,6 @@ export function AuthProvider({ children }) {
   }, []);
 
   useEffect(() => {
-    // Returning from Google OAuth: AuthCallback establishes the session first.
-    if (window.location.hash?.includes("session_id=")) return;
     checkAuth();
   }, [checkAuth]);
 

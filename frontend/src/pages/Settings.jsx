@@ -6,9 +6,10 @@ import { VOICES } from "@/components/StudioParts";
 import { Progress } from "@/components/ui/progress";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { api, errMsg } from "@/lib/api";
+import { HelpLink } from "@/components/HelpLink";
 import { useAuth } from "@/context/AuthContext";
 
-const card = "rounded-xl border border-slate-800 bg-slate-900/60 p-6";
+const card = "surface p-6";
 const Status = ({ ok, testId }) => ok
   ? <span className="flex items-center gap-1.5 text-emerald-400 text-sm" data-testid={testId}><CheckCircle2 className="h-4 w-4" /> Connected</span>
   : <span className="flex items-center gap-1.5 text-amber-400 text-sm" data-testid={testId}><XCircle className="h-4 w-4" /> Not configured</span>;
@@ -48,13 +49,13 @@ export default function Settings() {
       <AppHeader />
       <main className="max-w-4xl mx-auto px-4 sm:px-6 py-10 space-y-6" data-testid="settings-page">
         <div>
-          <p className="font-mono text-xs uppercase tracking-[0.2em] text-cyan-400 mb-3">Workspace</p>
+          <p className="eyebrow mb-3">Workspace</p>
           <h1 className="text-4xl font-extrabold tracking-tight">Settings</h1>
         </div>
         <section className={card}>
           <div className="flex items-center justify-between mb-3"><h3 className="font-semibold">Plan & usage</h3><span className="font-mono text-xs rounded-full border border-slate-700 px-2.5 py-0.5" data-testid="plan-badge">{s.usage.plan}</span></div>
           <Progress value={pct} className="h-2 bg-slate-800" data-testid="usage-progress" />
-          <p className="text-sm text-slate-400 mt-2" data-testid="usage-text">{s.usage.recordings_this_month} of {s.usage.limit} recordings used this month</p>
+          <p className="text-sm text-slate-400 mt-2" data-testid="usage-text">{s.usage.recordings_this_month} of {s.usage.limit} recordings used this month{s.usage.seconds_limit ? ` · ${s.usage.seconds_this_month || 0} of ${s.usage.seconds_limit}s browser time` : ""}. A single browser session ends at {s.usage.session_cap || 120}s; longer demos continue in parts.</p>
         </section>
         <section className={`${card} space-y-5`}>
           <h3 className="font-semibold">Integrations</h3>
@@ -66,6 +67,7 @@ export default function Settings() {
           </div>
           <div className="flex items-center justify-between"><div><p className="font-medium">AI script engine</p><p className="text-xs text-slate-400">{s.ai_model}</p></div><Status ok={s.llm_configured} testId="llm-status" /></div>
           <div className="flex items-center justify-between"><div><p className="font-medium">AI voiceover</p><p className="text-xs text-slate-400">{s.tts_model}</p></div><Status ok={s.llm_configured} testId="tts-status" /></div>
+          <div className="flex items-center justify-between"><div><p className="font-medium flex items-center gap-1">File storage <HelpLink topic="settings" label="File storage" /></p><p className="text-xs text-slate-400">{s.storage?.detail}</p></div><Status ok={s.storage?.mode === "remote"} testId="storage-status" /></div>
           <p className="text-xs text-slate-500">API keys are stored server-side only and never reach the browser.</p>
         </section>
         <section className={`${card} space-y-4`}>

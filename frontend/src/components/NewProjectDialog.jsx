@@ -68,7 +68,7 @@ export const NewProjectDialog = ({ trigger }) => {
   return (
     <Dialog open={open} onOpenChange={setOpen}>
       <DialogTrigger asChild>{trigger}</DialogTrigger>
-      <DialogContent className="sm:max-w-xl bg-slate-950 border-slate-800" data-testid="new-project-dialog">
+      <DialogContent className="sm:max-w-xl border-slate-700/80 bg-slate-950/95 shadow-2xl" data-testid="new-project-dialog">
         <DialogHeader><DialogTitle className="font-display text-xl">New demo project</DialogTitle></DialogHeader>
         <form onSubmit={submit} className="space-y-4">
           <div className="space-y-1.5"><Label>Project name</Label>

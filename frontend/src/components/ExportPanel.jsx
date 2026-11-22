@@ -5,9 +5,10 @@ import { Switch } from "@/components/ui/switch";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { API, api } from "@/lib/api";
+import { HelpLink } from "@/components/HelpLink";
 
 const copy = (text, label) => { navigator.clipboard.writeText(text); toast.success(`${label} copied`); };
-const card = "rounded-xl border border-slate-800 bg-slate-900/60 p-5 space-y-4";
+const card = "surface p-5 space-y-4";
 const EXPIRY = [["never", "Never"], ["1", "24 hours"], ["7", "7 days"], ["30", "30 days"], ["custom", "Custom date"]];
 const toLocal = (iso) => (iso ? new Date(new Date(iso).getTime() - new Date().getTimezoneOffset() * 60000).toISOString().slice(0, 16) : "");
 
@@ -64,9 +65,12 @@ function HealthSection({ project, onPatch, onHealthCheck, busy }) {
   );
 }
 
-export const ExportPanel = ({ project, onExport, busy, onPatch, onShareSettings, onHealthCheck }) => {
+export const ExportPanel = ({ project, onExport, busy, onPatch, onShareSettings, onHealthCheck, onPublish, usage }) => {
   const shareUrl = `${window.location.origin}/share/${project.share_id}`;
   const embed = `<iframe src="${window.location.origin}/embed/${project.share_id}" width="960" height="680" style="border:0;border-radius:12px" allow="fullscreen; autoplay"></iframe>`;
+  const docs = `[${project.name}](${shareUrl})`;
+  const email = `${project.name}\n${shareUrl}`;
+  const productUrl = project.product_slug ? `${window.location.origin}/p/${project.product_slug}` : "";
   const brand = project.brand || {};
   const setBrand = (patch) => onPatch({ brand: { ...brand, ...patch } });
   return (
@@ -74,8 +78,8 @@ export const ExportPanel = ({ project, onExport, busy, onPatch, onShareSettings,
       <section className={card}>
         <h3 className="font-semibold">Export</h3>
         <div className="grid sm:grid-cols-2 gap-3">
-          {[["gif", ImageIcon, "Animated GIF", "Silent, loops. Great for docs & changelogs."], ["mp4", FileVideo, "MP4 video", "1280×800 with voiceover & captions."]].map(([fmt, Icon, title, desc]) => (
-            <button key={fmt} disabled={busy} onClick={() => onExport(fmt)} data-testid={`export-${fmt}-button`}
+          {[["gif", ImageIcon, "Animated GIF", "Silent, loops. Great for docs & changelogs.", "docs"], ["mp4", FileVideo, "MP4 video", "1280×800 with voiceover & captions.", "standard"], ["gif", ImageIcon, "Square GIF", "800×800 for a changelog card.", "square"], ["mp4", FileVideo, "Caption-off master", "Video without burned-in captions.", "master"], ["mp4", FileVideo, "Vertical video", "720×1280 for a short social post.", "vertical"], ["mp4", FileVideo, "15-second hook", "The opening scenes, about 15 seconds.", "hook"]].map(([fmt, Icon, title, desc, preset]) => (
+            <button key={`${fmt}-${preset}`} disabled={busy} onClick={() => onExport(fmt, preset)} data-testid={`export-${fmt}-${preset}-button`}
               className="text-left rounded-lg border border-slate-800 bg-slate-950 p-4 hover:border-indigo-500/50 transition-colors disabled:opacity-50">
               <div className="flex items-center gap-2 font-medium">{busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Icon className="h-4 w-4 text-cyan-400" />}{title}</div>
               <p className="text-xs text-slate-400 mt-1">{desc}</p>
@@ -105,9 +109,49 @@ export const ExportPanel = ({ project, onExport, busy, onPatch, onShareSettings,
             <div className="flex gap-2"><Input readOnly value={embed} className="bg-slate-950 font-mono text-xs" data-testid="embed-code-input" />
               <button onClick={() => copy(embed, "Embed code")} className="px-3 rounded-lg bg-slate-800 hover:bg-slate-700" aria-label="Copy embed code" data-testid="embed-copy-button"><Copy className="h-4 w-4" /></button></div>
             <a href={shareUrl} target="_blank" rel="noreferrer" className="text-sm text-cyan-400 hover:text-cyan-300" data-testid="share-open-link">Open interactive player ↗</a>
+            <div className="flex flex-wrap gap-2">
+              <button onClick={() => copy(docs, "Docs snippet")} className="h-8 px-2 rounded-md border border-slate-700 text-xs" data-testid="copy-docs-snippet">Docs link</button>
+              <button onClick={() => copy(email, "Email blurb")} className="h-8 px-2 rounded-md border border-slate-700 text-xs" data-testid="copy-email-blurb">Email blurb</button>
+              <button onClick={() => copy(`${API}/public/${project.share_id}/transcript?fmt=vtt`, "Caption file URL")} className="h-8 px-2 rounded-md border border-slate-700 text-xs" data-testid="copy-vtt">Caption file</button>
+              <span className="inline-flex items-center">
+                <button onClick={onPublish} className="h-8 px-2 rounded-md bg-indigo-600 text-xs" data-testid="publish-button" data-help="publish">{project.published_at ? "Republish" : "Publish freeze"}</button>
+                <HelpLink topic="publish" label="Publish freeze" />
+              </span>
+            </div>
+            {project.published_at && <p className="text-xs text-slate-500">Share serves the version published {new Date(project.published_at).toLocaleString()}.</p>}
+            {project.publish_diff && (project.publish_diff.added || project.publish_diff.removed || project.publish_diff.changed?.length) ? (
+              <p className="text-xs text-amber-200" data-testid="publish-diff">Since publish: {project.publish_diff.added} added, {project.publish_diff.removed} removed, {project.publish_diff.changed.length} edited.</p>
+            ) : null}
+            <div className="flex flex-wrap gap-2">
+              <button className="h-8 px-2 rounded-md border border-slate-700 text-xs" data-testid="review-link-button" onClick={async () => {
+                const { data } = await api.post(`/projects/${project.id}/review-link`);
+                copy(`${window.location.origin}${data.path}`, "Review link");
+              }}>Review link</button>
+              <button className="h-8 px-2 rounded-md border border-slate-700 text-xs" data-testid="embed-autoplay-button" onClick={() => copy(`<iframe src="${window.location.origin}/embed/${project.share_id}?autoplay=1&muted=1&hideChapters=1" width="960" height="680" style="border:0;border-radius:12px" allow="fullscreen; autoplay"></iframe>`, "Muted autoplay embed")}>Embed, start muted</button>
+            </div>
+            {(project.webhook_log || []).length > 0 && (
+              <ul className="text-xs text-slate-400 space-y-1" data-testid="webhook-log">
+                {project.webhook_log.slice().reverse().map((entry, i) => <li key={i}>{entry.ok ? "Delivered" : "Failed"} {entry.event} · {entry.status || entry.error}</li>)}
+              </ul>
+            )}
             <ShareProtection key={`${project.has_share_password}-${project.share_expires_at}`} project={project} onShareSettings={onShareSettings} />
           </div>
         ) : <p className="text-sm text-slate-400">Turn on the public link to get a shareable URL and an embeddable interactive player.</p>}
+      </section>
+      <section className={card} data-testid="share-extras">
+        <h3 className="font-semibold">Call to action, approval, and delivery</h3>
+        <div className="grid sm:grid-cols-2 gap-3">
+          <Input value={project.cta_label || ""} onChange={(e) => onPatch({ cta_label: e.target.value })} placeholder="Book a demo" className="bg-slate-950 h-9" data-testid="cta-label-input" />
+          <Input value={project.cta_url || ""} onChange={(e) => onPatch({ cta_url: e.target.value })} placeholder="https://example.com/demo" className="bg-slate-950 h-9" data-testid="cta-url-input" />
+          <Input value={project.webhook_url || ""} onChange={(e) => onPatch({ webhook_url: e.target.value })} placeholder="https://hooks.example.com/viewers" className="bg-slate-950 h-9" data-testid="webhook-url-input" />
+          <Input value={project.product_slug || ""} onChange={(e) => onPatch({ product_slug: e.target.value })} placeholder="product-slug" className="bg-slate-950 h-9" data-testid="product-slug-input" />
+        </div>
+        <div className="flex flex-wrap items-center gap-3 text-sm">
+          <span>Review</span>
+          <button onClick={() => onPatch({ review_status: project.review_status === "approved" ? "draft" : "approved" })} className="h-8 px-3 rounded-md border border-slate-700" data-testid="review-status-button">{project.review_status === "approved" ? "Approved" : "Mark approved"}</button>
+          {productUrl && <a href={productUrl} className="text-cyan-400 text-sm" data-testid="product-page-link">Product page</a>}
+          {usage && <span className="text-xs text-slate-500">{usage.recordings_this_month}/{usage.limit} recordings this month</span>}
+        </div>
       </section>
       <HealthSection project={project} onPatch={onPatch} onHealthCheck={onHealthCheck} busy={busy} />
       <section className={card}>
@@ -124,6 +168,14 @@ export const ExportPanel = ({ project, onExport, busy, onPatch, onShareSettings,
             <div className="h-9 flex items-center"><Switch checked={brand.watermark !== false} onCheckedChange={(c) => setBrand({ watermark: c })} data-testid="brand-watermark-toggle" /></div></label>
           <label className="space-y-1.5 text-sm"><span className="font-mono text-[10px] uppercase text-slate-500">Zoom on clicks (MP4)</span>
             <div className="h-9 flex items-center"><Switch checked={brand.zoom !== false} onCheckedChange={(c) => setBrand({ zoom: c })} data-testid="brand-zoom-toggle" /></div></label>
+          <label className="space-y-1.5 text-sm sm:col-span-2"><span className="font-mono text-[10px] uppercase text-slate-500">Music bed</span>
+            <input type="file" accept="audio/*" data-testid="music-bed-input" onChange={async (e) => {
+              const file = e.target.files?.[0];
+              if (!file) return;
+              const data_b64 = await new Promise((resolve) => { const reader = new FileReader(); reader.onload = () => resolve(String(reader.result).split(",")[1]); reader.readAsDataURL(file); });
+              await api.post(`/projects/${project.id}/music`, { filename: file.name, data_b64 });
+              toast.success("Music bed saved. The next MP4 mixes it under the voice.");
+            }} /></label>
         </div>
       </section>
     </div>
@@ -138,8 +190,8 @@ export const AnalyticsPanel = ({ project }) => {
   const max = Math.max(1, ...data.per_step);
   return (
     <div className="space-y-6" data-testid="analytics-panel">
-      <div className="grid grid-cols-3 gap-3">
-        {[["Views", data.views], ["Completed", data.completions], ["Completion", `${data.completion_rate}%`]].map(([k, v]) => (
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+        {[["Views", data.views], ["Completed", data.completions], ["Completion", `${data.completion_rate}%`], ["CTA", data.cta_clicks || 0]].map(([k, v]) => (
           <div key={k} className="rounded-xl border border-slate-800 bg-slate-900/60 p-4"><p className="font-mono text-[10px] uppercase text-slate-500">{k}</p><p className="text-2xl font-display font-bold mt-1" data-testid={`analytics-${k.toLowerCase()}`}>{v}</p></div>
         ))}
       </div>
@@ -150,11 +202,25 @@ export const AnalyticsPanel = ({ project }) => {
             {data.per_step.map((n, i) => (
               <div key={i} className="flex items-center gap-3 text-xs"><span className="font-mono w-6 text-slate-500">{i + 1}</span>
                 <div className="flex-1 h-2 rounded-full bg-slate-800 overflow-hidden"><div className="h-full bg-cyan-500 transition-[width] duration-700" style={{ width: `${(n / max) * 100}%` }} /></div>
-                <span className="font-mono w-8 text-right">{n}</span></div>
+                <span className="font-mono w-16 text-right">{n}{data.avg_dwell_ms?.[i] ? ` · ${Math.round(data.avg_dwell_ms[i] / 1000)}s` : ""}</span></div>
             ))}
           </div>
         )}
       </div>
+      {(data.series || []).length > 0 && (
+        <div className="rounded-xl border border-slate-800 bg-slate-900/60 p-5" data-testid="analytics-series">
+          <h3 className="font-semibold mb-3">Views by day</h3>
+          <ul className="text-xs space-y-1">{data.series.map((row) => <li key={row.day} className="flex justify-between"><span>{row.day}</span><span>{row.views}</span></li>)}</ul>
+          {data.referrers?.length > 0 && <p className="text-xs text-slate-400 mt-3">Sources: {data.referrers.map((r) => `${r.host} ${r.views}`).join(" · ")}</p>}
+          {data.devices && <p className="text-xs text-slate-400">Desktop {data.devices.desktop || 0} · Phone {data.devices.phone || 0}</p>}
+        </div>
+      )}
+      {data.leads?.length > 0 && (
+        <div className="rounded-xl border border-slate-800 bg-slate-900/60 p-5" data-testid="analytics-leads">
+          <h3 className="font-semibold mb-3">Leads</h3>
+          <ul className="text-sm space-y-1">{data.leads.map((l, i) => <li key={i}>{l.email} · step {l.step_index + 1}</li>)}</ul>
+        </div>
+      )}
     </div>
   );
 };

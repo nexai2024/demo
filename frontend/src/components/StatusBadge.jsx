@@ -11,7 +11,7 @@ const STYLES = {
 };
 
 export const StatusBadge = ({ status, testId }) => (
-  <span data-testid={testId} className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-0.5 font-mono text-[10px] uppercase tracking-wider ${STYLES[status] || STYLES.draft}`}>
+  <span data-testid={testId} className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-0.5 font-mono text-[10px] uppercase tracking-wider shadow-[inset_0_1px_0_rgba(255,255,255,0.06)] ${STYLES[status] || STYLES.draft}`}>
     {status === "running" || status === "recording" ? <span className="h-1.5 w-1.5 rounded-full bg-current animate-pulse" /> : null}
     {status}
   </span>

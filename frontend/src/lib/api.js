@@ -1,6 +1,8 @@
 import axios from "axios";
+import { recordActivity } from "@/lib/activity";
 
-export const API = `${process.env.REACT_APP_BACKEND_URL}/api`;
+const configured = (process.env.REACT_APP_BACKEND_URL || "").replace(/\/$/, "");
+export const API = configured ? `${configured}/api` : "/api";
 
 export const api = axios.create({ baseURL: API, withCredentials: true });
 
@@ -17,6 +19,10 @@ api.interceptors.response.use(
         /* fall through */
       }
     }
+    const url = String(cfg.url || "");
+    if (!url.includes("/live/frame") && err.response?.status !== 401) {
+      recordActivity({ level: "error", source: `${(cfg.method || "get").toUpperCase()} ${url}`, message: errMsg(err) });
+    }
     throw err;
   }
 );
@@ -29,10 +35,20 @@ export function errMsg(e) {
   return detail.msg || String(detail);
 }
 
-export const stepAsset = (pid, step, kind) =>
-  `${API}/projects/${pid}/steps/${step.id}/${kind}?v=${encodeURIComponent(
+export const stepAsset = (pid, step, kind, index) => {
+  if (kind === "motion") {
+    const stamp = (step.motion_paths?.[index] || step.screenshot_path || "").slice(-14);
+    return `${API}/projects/${pid}/steps/${step.id}/motion/${index}?v=${encodeURIComponent(stamp)}`;
+  }
+  const track = kind === "audio" && step.audio_track === "alt" ? "&track=alt" : "";
+  return `${API}/projects/${pid}/steps/${step.id}/${kind}?v=${encodeURIComponent(
     (kind === "audio" ? step.audio_path : step.screenshot_path || "").slice(-14)
-  )}`;
+  )}${track}`;
+};
 
-export const publicAsset = (shareId, step, kind, token) =>
-  `${API}/public/${shareId}/steps/${step.id}/${kind}?v=${step.v}${token ? `&t=${encodeURIComponent(token)}` : ""}`;
+export const publicAsset = (shareId, step, kind, token, index) => {
+  const auth = token ? `&t=${encodeURIComponent(token)}` : "";
+  if (kind === "motion") return `${API}/public/${shareId}/steps/${step.id}/motion/${index}?v=${step.v}${auth}`;
+  const track = kind === "audio" && step.audio_track === "alt" ? "&track=alt" : "";
+  return `${API}/public/${shareId}/steps/${step.id}/${kind}?v=${step.v}${auth}${track}`;
+};

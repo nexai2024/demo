@@ -10,59 +10,67 @@ from typing import Literal, Optional
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
-from pymongo import ASCENDING, DESCENDING, IndexModel
-from pymongo.errors import DuplicateKeyError
 from starlette.middleware.cors import CORSMiddleware
 
-import ai
-import engine
-import render
+try:
+    import ai
+except ImportError:
+    ai = None
+try:
+    import engine
+except ImportError:
+    engine = None
+try:
+    import live as live_browser
+except ImportError:
+    live_browser = None
+try:
+    import render
+except ImportError:
+    render = None
 from auth_routes import router as auth_router, seed_admin
 from datetime import datetime, timedelta, timezone
 
-from core import (client, create_viewer_token, db, decode_viewer_token, get_current_user, hash_password, new_id,
+from core import (DB_BACKEND, DuplicateKeyError, cors_origins, create_viewer_token, db, validate_config, decode_viewer_token, get_current_user, hash_password, new_id,
                   now, now_iso, verify_password)
-from storage import APP_NAME, get_object, init_storage, put_object
+import cinematic
+from product import (VIEWPORTS, apply_track, environment_base, estimate_seconds, parse_playwright, prepare_step,
+                     public_view, publish_diff, speak, substitute, transcript)
+from storage import APP_NAME, get_object, init_storage, put_object, status as storage_status
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-INDEXES: dict[str, list[IndexModel]] = {
-    "users": [IndexModel([("email", ASCENDING)], name="email", unique=True),
-              IndexModel([("user_id", ASCENDING)], name="user_id", unique=True)],
-    "user_sessions": [IndexModel([("session_token", ASCENDING)], name="session_token")],
-    "login_attempts": [IndexModel([("identifier", ASCENDING)], name="identifier")],
-    "projects": [IndexModel([("id", ASCENDING)], name="id", unique=True),
-                 IndexModel([("user_id", ASCENDING), ("updated_at", DESCENDING)], name="user_updated"),
-                 IndexModel([("share_id", ASCENDING)], name="share_id")],
-    "runs": [IndexModel([("id", ASCENDING)], name="id", unique=True),
-             IndexModel([("project_id", ASCENDING), ("started_at", DESCENDING)], name="project_started")],
-    "history": [IndexModel([("project_id", ASCENDING), ("created_at", DESCENDING)], name="project_created")],
-    "cron_runs": [IndexModel([("run_id", ASCENDING)], name="run_id", unique=True)],
-    "analytics_events": [IndexModel([("project_id", ASCENDING), ("created_at", DESCENDING)], name="project_created")],
-}
-
-
 async def ensure_indexes() -> None:
-    for collection, models in INDEXES.items():
-        for model in models:
-            try:
-                await db[collection].create_indexes([model])
-            except Exception as exc:
-                logger.error("ensure_indexes(%s.%s): %s", collection, model.document["name"], exc)
+    if DB_BACKEND != "mongodb":
+        return
+    await db.projects.create_index("id", unique=True)
+    await db.projects.create_index([("user_id", 1), ("updated_at", -1)])
+    await db.runs.create_index("id", unique=True)
+    await db.runs.create_index([("project_id", 1), ("started_at", -1)])
+    await db.cron_runs.create_index("run_id", unique=True)
+    await db.analytics_events.create_index([("project_id", 1), ("created_at", -1)])
+    await db.login_attempts.create_index("identifier", unique=True)
 
 
 app = FastAPI()
+
+
+@app.exception_handler(ai.AIUnavailable if ai else Exception)
+async def ai_unavailable_handler(request: Request, exc):
+    from fastapi.responses import JSONResponse
+    return JSONResponse(status_code=503, content={"detail": str(exc), "code": getattr(exc, "code", "ai_error")})
 api = APIRouter(prefix="/api")
 TASKS: set = set()
+ACTIVE_RUNS: set = set()
 CANCELLED: set = set()
-MONTHLY_LIMIT = int(os.environ["MONTHLY_RECORDING_LIMIT"])
+MONTHLY_LIMIT = int(os.environ.get("MONTHLY_RECORDING_LIMIT", "20"))
 DEFAULT_BRAND = {"accent": "#6366F1", "caption_position": "bottom", "watermark": True, "zoom": True}
 
 
 class Cancelled(Exception):
     pass
-Action = Literal["goto", "click", "type", "hover", "scroll", "press", "wait"]
+Action = Literal["goto", "click", "type", "hover", "scroll", "press", "wait", "assert"]
 
 
 class Step(BaseModel):
@@ -78,9 +86,9 @@ class Step(BaseModel):
     wait_ms: int = Field(800, ge=0, le=30000)
     caption: str = ""
     voiceover: str = ""
-    duration_ms: int = Field(3000, ge=500, le=30000)
+    duration_ms: int = Field(6000, ge=500, le=30000)
     transition: Literal["none", "fade"] = "fade"
-    transition_ms: int = Field(400, ge=0, le=3000)
+    transition_ms: int = Field(800, ge=0, le=3000)
     screenshot_path: Optional[str] = None
     thumb_path: Optional[str] = None
     audio_voice: Optional[str] = None
@@ -93,10 +101,25 @@ class Step(BaseModel):
     error: Optional[str] = None
     attempts: int = 0
     page_url: Optional[str] = None
+    voice: Optional[str] = None
+    chapter: str = ""
+    callout: str = ""
+    treatment: str = ""
+    annotations: list[dict] = []
+    comments: list[dict] = []
+    health_failed_path: Optional[str] = None
+    screenshot_mobile_path: Optional[str] = None
+    motion_paths: list[str] = []
+    branch: str = ""
+    choices: list[dict] = []
+    caption_alt: str = ""
+    voiceover_alt: str = ""
 
 
 SERVER_FIELDS = ("screenshot_path", "thumb_path", "audio_path", "audio_text", "audio_voice", "audio_duration_ms",
-                 "hotspot", "status", "error", "attempts", "page_url", "resolved_selector", "regression")
+                 "hotspot", "status", "error", "attempts", "page_url", "resolved_selector", "regression",
+                 "health_failed_path", "screenshot_mobile_path", "motion_paths", "visual_delta", "visual_change",
+                 "audio_spoken", "audio_path_alt", "audio_text_alt", "audio_spoken_alt", "audio_duration_alt")
 
 
 class ProjectIn(BaseModel):
@@ -110,6 +133,19 @@ class Brand(BaseModel):
     caption_position: Literal["top", "bottom"] = "bottom"
     watermark: bool = True
     zoom: bool = True
+    music_path: Optional[str] = None
+
+
+class RecipeStep(BaseModel):
+    action: Literal["goto", "click", "type", "press", "wait"] = "click"
+    selector: Optional[str] = None
+    text: Optional[str] = None
+    url: Optional[str] = None
+
+
+class GlossaryItem(BaseModel):
+    word: str = Field(min_length=1, max_length=80)
+    spoken: str = Field(min_length=1, max_length=120)
 
 
 class ShareSettingsIn(BaseModel):
@@ -127,9 +163,14 @@ class RewriteIn(BaseModel):
 
 
 class EventIn(BaseModel):
-    type: Literal["view", "step", "complete"]
+    type: Literal["view", "step", "complete", "dwell", "lead", "cta"]
     session: str = Field(min_length=4, max_length=64)
     step_index: int = Field(0, ge=0, le=200)
+    dwell_ms: Optional[int] = Field(None, ge=0, le=600000)
+    email: Optional[str] = Field(None, max_length=200)
+    referrer: Optional[str] = Field(None, max_length=300)
+    device: Optional[Literal["desktop", "phone"]] = None
+    branch: Optional[str] = Field(None, max_length=40)
 
 
 class ProjectUpdate(BaseModel):
@@ -142,10 +183,65 @@ class ProjectUpdate(BaseModel):
     narration_mode: Optional[Literal["captions", "voiceover", "both"]] = None
     is_public: Optional[bool] = None
     auto_refresh: Optional[bool] = None
+    variables: Optional[dict] = None
+    environments: Optional[dict] = None
+    active_environment: Optional[Literal["production", "staging", "local"]] = None
+    viewport: Optional[Literal["desktop", "mobile", "both"]] = None
+    cta_label: Optional[str] = None
+    cta_url: Optional[str] = None
+    webhook_url: Optional[str] = None
+    product_slug: Optional[str] = None
+    review_status: Optional[Literal["draft", "approved"]] = None
+    login_url: Optional[str] = None
+    login_username: Optional[str] = None
+    login_password: Optional[str] = None
+    clear_login: bool = False
+    login_recipe: Optional[list[RecipeStep]] = None
+    glossary: Optional[list[GlossaryItem]] = None
+    guided: Optional[bool] = None
+    notify_url: Optional[str] = Field(None, max_length=500)
+    active_track: Optional[Literal["primary", "alt"]] = None
+    tour_order: Optional[int] = Field(None, ge=0, le=99)
+    archived: Optional[bool] = None
 
 
 class ExportIn(BaseModel):
     format: Literal["gif", "mp4"]
+    preset: Literal["standard", "docs", "square", "master", "vertical", "hook"] = "standard"
+
+
+class SourceIn(BaseModel):
+    source: str = Field(min_length=1, max_length=20000)
+
+
+class CaptureIn(BaseModel):
+    after: int = Field(0, ge=0, le=200)
+    scroll: int = Field(0, ge=0, le=8000)
+
+
+class LiveStartIn(BaseModel):
+    after: int = Field(0, ge=0, le=200)
+
+
+class LiveClickIn(BaseModel):
+    x: float = Field(ge=0, le=1280)
+    y: float = Field(ge=0, le=800)
+
+
+class LiveTypeIn(BaseModel):
+    text: str = Field(min_length=1, max_length=200)
+
+
+class LiveKeyIn(BaseModel):
+    key: str = Field(min_length=1, max_length=20)
+
+
+class LiveScrollIn(BaseModel):
+    amount: int = Field(ge=-2400, le=2400)
+
+
+class CommentIn(BaseModel):
+    text: str = Field(min_length=1, max_length=500)
 
 
 class PrefsIn(BaseModel):
@@ -159,6 +255,20 @@ async def get_project(pid: str, user: dict) -> dict:
     if not p:
         raise HTTPException(404, "Project not found")
     p["has_share_password"] = bool(p.pop("share_password_hash", None))
+    login = dict(p.get("login") or {})
+    p["has_login"] = bool(login.get("password") or login.get("username") or login.get("recipe"))
+    p["has_storage"] = bool(login.pop("storage_state", None))
+    login.pop("password", None)
+    p["login"] = login
+    published = p.pop("published", None) or {}
+    p["published_at"] = published.get("published_at")
+    p["publish_diff"] = publish_diff(p.get("steps") or [], published.get("steps") or [])
+    p["estimate_seconds"] = estimate_seconds(p)
+    p["session_cap"] = 120
+    p["over_cap"] = p["estimate_seconds"] > 120
+    p["guided"] = bool(p.get("guided"))
+    p["active_track"] = p.get("active_track") or "primary"
+    p["webhook_log"] = (p.get("webhook_log") or [])[-8:]
     return p
 
 
@@ -189,16 +299,61 @@ async def new_run(project: dict, kind: str, total: int, message: str) -> dict:
     run = {"id": new_id("run_"), "project_id": project["id"], "user_id": project["user_id"], "kind": kind,
            "status": "running", "total": total, "current": 0, "message": message,
            "logs": [{"t": now_iso(), "level": "info", "msg": message}], "result": None,
-           "started_at": now_iso(), "finished_at": None}
+           "started_at": now_iso(), "finished_at": None, "heartbeat_at": now_iso(), "owner": INSTANCE_ID}
     await db.runs.insert_one(dict(run))
+    ACTIVE_RUNS.add(run["id"])
     await touch(project["id"], {"active_run_id": run["id"]})
     run.pop("_id", None)
     return run
 
 
+INSTANCE_ID = new_id("srv_")
+RUN_STALE_SECONDS = int(os.environ.get("RUN_STALE_SECONDS", "150"))
+
+
+async def reap_stale_runs() -> int:
+    """Fail only runs whose owner stopped heartbeating, so a restart or another healthy
+    instance never kills each other's in-flight jobs."""
+    reaped = 0
+    for run in await db.runs.find({"status": "running"}, {"_id": 0}).to_list(500):
+        beat = run.get("heartbeat_at") or run.get("started_at")
+        try:
+            age = (now() - datetime.fromisoformat(beat)).total_seconds()
+        except (TypeError, ValueError):
+            age = RUN_STALE_SECONDS + 1
+        if run.get("owner") == INSTANCE_ID or age <= RUN_STALE_SECONDS:
+            continue
+        await db.runs.update_one({"id": run["id"], "status": "running"}, {"$set": {
+            "status": "failed", "message": "Interrupted: the worker stopped responding", "finished_at": now_iso()}})
+        await db.projects.update_one({"id": run["project_id"], "active_run_id": run["id"]}, {"$set": {"active_run_id": None}})
+        reaped += 1
+    return reaped
+
+
+async def reaper_loop() -> None:
+    while True:
+        await asyncio.sleep(max(15, RUN_STALE_SECONDS // 3))
+        try:
+            for run_id in list(ACTIVE_RUNS):  # heartbeat for jobs this instance owns
+                await db.runs.update_one({"id": run_id}, {"$set": {"heartbeat_at": now_iso(), "owner": INSTANCE_ID}})
+            await reap_stale_runs()
+        except Exception as exc:  # never let the loop die
+            logger.warning("reaper: %s", exc)
+
+
 async def run_log(run_id: str, msg: str, level: str = "info", **fields) -> None:
-    await db.runs.update_one({"id": run_id}, {"$set": {"message": msg, **fields},
+    await db.runs.update_one({"id": run_id}, {"$set": {"message": msg, "heartbeat_at": now_iso(), "owner": INSTANCE_ID, **fields},
                                              "$push": {"logs": {"t": now_iso(), "level": level, "msg": msg}}})
+
+
+async def _post_json(url: str, payload: dict) -> tuple[bool, int, str]:
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=8) as client:
+            response = await client.post(url, json=payload)
+        return response.status_code < 400, response.status_code, ""
+    except Exception as exc:
+        return False, 0, str(exc)[:160]
 
 
 async def finish_run(run_id: str, pid: str, status: str, msg: str, result=None) -> None:
@@ -206,6 +361,22 @@ async def finish_run(run_id: str, pid: str, status: str, msg: str, result=None) 
                   status=status, finished_at=now_iso(), result=result)
     await touch(pid, {"active_run_id": None})
     CANCELLED.discard(run_id)
+    ACTIVE_RUNS.discard(run_id)
+    try:
+        project = await db.projects.find_one({"id": pid}, {"_id": 0})
+        if not project:
+            return
+        await db["notifications"].insert_one({
+            "id": new_id("nt_"), "user_id": project.get("user_id"), "project_id": pid,
+            "project_name": project.get("name") or "Demo", "status": status, "message": msg,
+            "created_at": now_iso(), "read": False,
+        })
+        url = (project.get("notify_url") or "").strip()
+        if url.startswith(("http://", "https://")):
+            spawn(_post_json(url, {"event": "run", "status": status, "message": msg,
+                                   "demo": project.get("name"), "project_id": pid}))
+    except Exception:
+        logger.warning("run notification failed for %s", pid)
 
 
 async def ensure_idle(project: dict) -> None:
@@ -224,20 +395,46 @@ def normalize_steps(raw: list, target_url: str) -> list:
         if s.action == "goto" and not s.url:
             s.url = target_url
         steps.append(s.model_dump())
-    return steps
+    return cinematic.direct(steps)
+
+
+async def narrated_script(draft: str, target_url: str, elements: list, session_id: str, brief: dict | None = None, changelog: bool = False) -> tuple[dict, list]:
+    if changelog:
+        result = await ai.changelog_script(draft, target_url, session_id)
+    else:
+        result = await ai.generate_script(draft, target_url, elements, session_id, brief)
+    steps = normalize_steps(result.get("steps") or [], target_url)
+    if steps and cinematic.needs_story_pass(steps):
+        edits = await ai.rewrite_narration(steps, cinematic.STORY_INSTRUCTION, f"{session_id}_story")
+        by_id = {e.get("id"): e for e in edits if e.get("id")}
+        for step in steps:
+            edit = by_id.get(step["id"])
+            if not edit:
+                continue
+            step["caption"] = str(edit.get("caption") or step["caption"])[:90]
+            step["voiceover"] = str(edit.get("voiceover") or step["voiceover"])[:1000]
+            step["callout"] = ""
+        steps = cinematic.direct(steps)
+    return result, steps
 
 
 # ---------- background jobs ----------
 async def job_record(project: dict, run_id: str, only_idx: Optional[int], final: bool = True,
-                     health: bool = False) -> str:
+                     health: bool = False, only: Optional[set] = None) -> str:
     pid, steps = project["id"], project["steps"]
+    capture = only if only is not None else (None if only_idx is None else {only_idx})
+    stored = await db.projects.find_one({"id": pid}, {"_id": 0}) or {}
+    project = {**stored, **project, "steps": steps, "login": stored.get("login") or {}}
+    prepared = [prepare_step(s, project) for s in steps]
+    viewport_name = project.get("viewport") or "desktop"
+    viewport = VIEWPORTS["mobile" if viewport_name == "mobile" else "desktop"]
     n = len(steps)
     prev_done = {s["id"] for s in steps if s.get("status") == "done" and s.get("screenshot_path")}
 
     async def on_progress(i: int, step: dict, state: str, data: dict) -> None:
         if run_id in CANCELLED:
             raise Cancelled()
-        if only_idx is not None and i != only_idx:
+        if capture is not None and i not in capture:
             if state == "running":
                 await run_log(run_id, f"Replaying step {i + 1}/{n} to reach target: {engine.describe(step)}", current=i + 1)
             elif state == "failed":
@@ -251,14 +448,41 @@ async def job_record(project: dict, run_id: str, only_idx: Optional[int], final:
                "steps.$.page_url": data.get("url"), "steps.$.resolved_selector": data.get("resolved_selector"),
                "steps.$.regression": state == "failed" and step["id"] in prev_done}
         keep_old = health and state == "failed" and step["id"] in prev_done
-        if not keep_old:
+        visual_shift = False
+        if health and state == "done" and data.get("screenshot") and step.get("screenshot_path"):
+            try:
+                old, _ = await get_object(step["screenshot_path"])
+                delta = await asyncio.to_thread(render.frame_delta, old, data["screenshot"])
+            except Exception:
+                delta = 0
+            upd["steps.$.visual_delta"] = round(delta, 3)
+            if delta >= 0.18:
+                visual_shift = True
+                upd["steps.$.visual_change"] = True
+                changed_path = await put_object(
+                    f"{APP_NAME}/u/{project['user_id']}/{pid}/{step['id']}_shift_{new_id()}.jpg",
+                    data["screenshot"], "image/jpeg")
+                upd["steps.$.health_failed_path"] = changed_path
+        if not keep_old and not visual_shift:
             upd["steps.$.hotspot"] = data.get("hotspot")
-        if data.get("screenshot") and not keep_old:
+            if data.get("hotspot"):
+                upd["steps.$.annotations"] = cinematic.stage_marks(step, data.get("hotspot"))
+        if data.get("screenshot") and (keep_old or visual_shift):
+            if keep_old:
+                failed_path = await put_object(f"{APP_NAME}/u/{project['user_id']}/{pid}/{step['id']}_health_{new_id()}.jpg", data["screenshot"], "image/jpeg")
+                upd["steps.$.health_failed_path"] = failed_path
+        elif data.get("screenshot") and not keep_old:
             base = f"{APP_NAME}/u/{project['user_id']}/{pid}/{step['id']}_{new_id()}"
             path = await put_object(f"{base}.jpg", data["screenshot"], "image/jpeg")
             thumb = await asyncio.to_thread(render.make_thumb, data["screenshot"])
             upd["steps.$.thumb_path"] = await put_object(f"{base}_t.webp", thumb, "image/webp")
             upd["steps.$.screenshot_path"] = path
+            upd["steps.$.visual_change"] = False
+            upd["steps.$.visual_delta"] = None
+            motion_paths = []
+            for frame_i, blob in enumerate((data.get("motion") or [])[:8]):
+                motion_paths.append(await put_object(f"{base}_scroll_{frame_i}.jpg", blob, "image/jpeg"))
+            upd["steps.$.motion_paths"] = motion_paths
             if i == 0 or not project.get("thumbnail_path"):
                 await touch(pid, {"thumbnail_path": path})
                 project["thumbnail_path"] = path
@@ -269,23 +493,53 @@ async def job_record(project: dict, run_id: str, only_idx: Optional[int], final:
             await run_log(run_id, f"Step {i + 1}/{n} captured", "success")
 
     try:
-        await engine.run_steps(steps, on_progress, capture_only=None if only_idx is None else {only_idx})
+        login = dict(project.get("login") or {})
+        storage = login.get("storage_state") or None
+
+        async def remember(state: dict) -> None:
+            fresh_login = dict((await db.projects.find_one({"id": pid}, {"_id": 0}) or {}).get("login") or {})
+            fresh_login["storage_state"] = state
+            fresh_login["storage_saved_at"] = now_iso()
+            await touch(pid, {"login": fresh_login})
+
+        await engine.run_steps(prepared, on_progress, capture_only=capture, viewport=viewport,
+                               login=None if storage else login, storage_state=storage,
+                               on_storage=None if storage else remember)
+        if viewport_name == "both" and capture is None:
+            mobile: list = []
+
+            async def collect(i: int, step: dict, state: str, data: dict) -> None:
+                if state == "done" and data.get("screenshot"):
+                    mobile.append((step["id"], data["screenshot"]))
+
+            await engine.run_steps(prepared, collect, viewport=VIEWPORTS["mobile"],
+                                   login=None if storage else login, storage_state=storage)
+            for sid, blob in mobile:
+                path = await put_object(f"{APP_NAME}/u/{project['user_id']}/{pid}/{sid}_m_{new_id()}.jpg", blob, "image/jpeg")
+                await db.projects.update_one({"id": pid, "steps.id": sid}, {"$set": {"steps.$.screenshot_mobile_path": path}})
         fresh = await db.projects.find_one({"id": pid}, {"_id": 0})
         failed = [s for s in fresh["steps"] if s["status"] == "failed"]
         status = "partial" if failed else "ready"
         broken = [{"index": i, "id": s["id"], "caption": s.get("caption", ""), "error": s.get("error")}
                   for i, s in enumerate(fresh["steps"]) if s.get("regression")]
+        shifted = [{"index": i, "id": s["id"], "caption": s.get("caption", ""), "delta": s.get("visual_delta")}
+                   for i, s in enumerate(fresh["steps"]) if s.get("visual_change")]
         fields = {"status": status}
         if health or only_idx is None:
             fields["health"] = {"checked_at": now_iso(), "kind": "scheduled" if health else "manual",
-                                "broken": broken, "ok": len(fresh["steps"]) - len(failed), "total": len(fresh["steps"])}
+                                "broken": broken, "changed": shifted, "ok": len(fresh["steps"]) - len(failed),
+                                "total": len(fresh["steps"])}
         await touch(pid, fields)
         label = "Weekly health check" if health else ("Re-recorded step" if only_idx is not None else "Recorded demo")
         await log_history(fresh, label, f"{len(fresh['steps']) - len(failed)}/{len(fresh['steps'])} steps captured"
                           + (f", {len(broken)} broke after a UI change" if broken else ""), snapshot=True)
-        if broken:
-            msg = f"{len(broken)} step(s) broke after a UI change — previous frames kept" if health else \
-                f"Recording complete — {len(broken)} previously working step(s) now fail"
+        if broken or shifted:
+            parts = []
+            if broken:
+                parts.append(f"{len(broken)} step(s) broke")
+            if shifted:
+                parts.append(f"{len(shifted)} step(s) look different")
+            msg = ("Health check kept the previous frames — " if health else "Recording complete — ") + " and ".join(parts)
         else:
             msg = f"Recording complete with {len(failed)} failed step(s)" if failed else "Recording complete"
         if final:
@@ -308,22 +562,42 @@ async def job_record(project: dict, run_id: str, only_idx: Optional[int], final:
         return "failed"
 
 
+def _clip_stale(step: dict, source: str, voice: str, spoken: str, path_key: str, text_key: str, spoken_key: str) -> bool:
+    previous = step.get(spoken_key)
+    spoken_changed = bool(previous) and previous != spoken
+    return bool(source.strip()) and (step.get(text_key) != source or spoken_changed
+                                     or step.get("audio_voice") != voice or not step.get(path_key))
+
+
 async def job_voiceover(project: dict, run_id: str, final: bool = True) -> str:
     pid, voice = project["id"], project.get("voice", "nova")
-    todo = [s for s in project["steps"] if s.get("voiceover", "").strip()
-            and (s.get("audio_text") != s["voiceover"] or s.get("audio_voice") != voice or not s.get("audio_path"))]
+    glossary = project.get("glossary") or []
+    todo = []
+    for s in project["steps"]:
+        clip_voice = s.get("voice") or voice
+        spoken = speak(s.get("voiceover") or "", glossary)
+        alt = speak(s.get("voiceover_alt") or "", glossary)
+        if _clip_stale(s, s.get("voiceover") or "", clip_voice, spoken, "audio_path", "audio_text", "audio_spoken"):
+            todo.append((s, "primary", spoken, clip_voice))
+        if _clip_stale(s, s.get("voiceover_alt") or "", clip_voice, alt, "audio_path_alt", "audio_text_alt", "audio_spoken_alt"):
+            todo.append((s, "alt", alt, clip_voice))
     try:
-        for i, s in enumerate(todo):
+        for i, (s, track, spoken, clip_voice) in enumerate(todo):
             if run_id in CANCELLED:
                 await finish_run(run_id, pid, "cancelled", f"Voiceover cancelled after {i} clip(s)")
                 return "cancelled"
-            await run_log(run_id, f"Voiceover {i + 1}/{len(todo)}: \"{s['voiceover'][:50]}\"", current=i + 1)
-            audio = await ai.synthesize(s["voiceover"], voice)
-            path = await put_object(f"{APP_NAME}/u/{project['user_id']}/{pid}/{s['id']}_{new_id()}.mp3", audio, "audio/mpeg")
+            label = s.get("voiceover_alt") if track == "alt" else s.get("voiceover")
+            await run_log(run_id, f"Voiceover {i + 1}/{len(todo)}: \"{(label or '')[:50]}\"", current=i + 1)
+            audio = await ai.synthesize(spoken, clip_voice)
+            path = await put_object(f"{APP_NAME}/u/{project['user_id']}/{pid}/{s['id']}_{track}_{new_id()}.mp3", audio, "audio/mpeg")
             dur = await asyncio.to_thread(render.audio_duration_ms, audio)
-            await db.projects.update_one({"id": pid, "steps.id": s["id"]}, {"$set": {
-                "steps.$.audio_path": path, "steps.$.audio_text": s["voiceover"],
-                "steps.$.audio_voice": voice, "steps.$.audio_duration_ms": dur}})
+            if track == "alt":
+                fields = {"steps.$.audio_path_alt": path, "steps.$.audio_text_alt": s.get("voiceover_alt") or "",
+                          "steps.$.audio_spoken_alt": spoken, "steps.$.audio_duration_alt": dur}
+            else:
+                fields = {"steps.$.audio_path": path, "steps.$.audio_text": s.get("voiceover") or "",
+                          "steps.$.audio_voice": clip_voice, "steps.$.audio_duration_ms": dur, "steps.$.audio_spoken": spoken}
+            await db.projects.update_one({"id": pid, "steps.id": s["id"]}, {"$set": fields})
         msg = f"Voiceover ready ({len(todo)} clip(s) generated)"
         if final:
             await finish_run(run_id, pid, "completed", msg)
@@ -341,15 +615,17 @@ async def job_autopilot(project: dict, run_id: str) -> None:
     try:
         elements = []
         await run_log(run_id, "Scanning the live page with Browserless...")
+        brief = {}
         try:
-            elements = await engine.inspect_page(project["target_url"])
+            reading = await engine.read_page(project["target_url"])
+            elements = reading.get("elements") or []
+            brief = reading.get("brief") or {}
         except Exception as exc:
             await run_log(run_id, f"Page scan skipped: {str(exc)[:120]}", "warn")
         if run_id in CANCELLED:
             raise Cancelled()
-        await run_log(run_id, f"Claude Sonnet 5.5 is writing the script ({len(elements)} live elements found)...")
-        result = await ai.generate_script(project["draft"], project["target_url"], elements, f"auto_{pid}_{new_id()}")
-        steps = normalize_steps(result.get("steps") or [], project["target_url"])
+        await run_log(run_id, f"Reading the page and writing the narration ({len(elements)} live elements found)...")
+        result, steps = await narrated_script(project["draft"], project["target_url"], elements, f"auto_{pid}_{new_id()}", brief)
         if not steps:
             raise ValueError("AI returned no usable steps. Add more detail to your draft.")
         project.update({"steps": steps, "thumbnail_path": None})
@@ -373,7 +649,7 @@ async def job_autopilot(project: dict, run_id: str) -> None:
 
 
 async def refresh_all(cron_run_id: str) -> None:
-    if not engine.is_configured():
+    if engine is None or not engine.is_configured():
         logger.warning("weekly refresh skipped: Browserless not configured")
         return
     projects = await db.projects.find({"auto_refresh": True, "is_deleted": False, "steps.0": {"$exists": True}},
@@ -390,14 +666,18 @@ async def refresh_all(cron_run_id: str) -> None:
 
 def fingerprint(project: dict) -> str:
     keys = ("screenshot_path", "audio_path", "caption", "hotspot", "duration_ms", "transition", "transition_ms",
-            "audio_duration_ms")
+            "audio_duration_ms", "annotations", "motion_paths")
     payload = [[s.get(k) for k in keys] for s in project["steps"]]
-    raw = json.dumps([payload, project.get("narration_mode"), project.get("brand")], sort_keys=True, default=str)
+    raw = json.dumps([payload, project.get("narration_mode"), project.get("brand"), project.get("export_preset"),
+                      project.get("active_track")], sort_keys=True, default=str)
     return hashlib.sha1(raw.encode()).hexdigest()
 
 
-async def job_export(project: dict, run_id: str, fmt: str) -> None:
+async def job_export(project: dict, run_id: str, fmt: str, preset: str = "standard") -> None:
     pid = project["id"]
+    project = {**project, "export_preset": preset}
+    if project.get("active_track") == "alt":
+        project = {**project, "steps": apply_track(project["steps"], "alt")}
     fp = fingerprint(project)
     cached = next((e for e in project.get("exports", []) if e.get("fingerprint") == fp and e["format"] == fmt), None)
     if cached:
@@ -421,18 +701,24 @@ async def job_export(project: dict, run_id: str, fmt: str) -> None:
 # ---------- project routes ----------
 @api.get("/")
 async def root():
-    return {"app": "Flowcast", "ok": True}
+    return {"app": "AppShowcase", "ok": True}
 
 
 @api.get("/projects")
-async def list_projects(user: dict = Depends(get_current_user)):
+async def list_projects(view: Literal["active", "archived", "trash"] = "active", user: dict = Depends(get_current_user)):
+    if view == "trash":
+        match = {"user_id": user["user_id"], "is_deleted": True}
+    elif view == "archived":
+        match = {"user_id": user["user_id"], "is_deleted": False, "archived": True}
+    else:
+        match = {"user_id": user["user_id"], "is_deleted": False, "archived": {"$ne": True}}
     pipeline = [
-        {"$match": {"user_id": user["user_id"], "is_deleted": False}},
+        {"$match": match},
         {"$sort": {"updated_at": -1}},
         {"$limit": 200},
         {"$project": {"_id": 0, "id": 1, "name": 1, "target_url": 1, "status": 1, "thumbnail_path": 1,
-                      "updated_at": 1, "is_public": 1, "auto_refresh": 1, "health": 1,
-                      "step_count": {"$size": "$steps"}}},
+                      "updated_at": 1, "is_public": 1, "auto_refresh": 1, "health": 1, "search_text": 1,
+                      "archived": 1, "step_count": {"$size": "$steps"}}},
     ]
     return await db.projects.aggregate(pipeline).to_list(200)
 
@@ -459,7 +745,34 @@ async def read_project(pid: str, user: dict = Depends(get_current_user)):
 @api.put("/projects/{pid}")
 async def update_project(pid: str, body: ProjectUpdate, user: dict = Depends(get_current_user)):
     p = await get_project(pid, user)
-    fields = body.model_dump(exclude_none=True)
+    fields = body.model_dump(exclude_none=True, exclude={"clear_login", "login_url", "login_username", "login_password", "cta_label", "cta_url", "login_recipe"})
+    if body.cta_label is not None or body.cta_url is not None:
+        cta = dict(p.get("cta") or {})
+        if body.cta_label is not None:
+            cta["label"] = body.cta_label
+        if body.cta_url is not None:
+            cta["url"] = body.cta_url
+        fields["cta"] = cta
+    if body.clear_login or body.login_url is not None or body.login_username is not None or body.login_password:
+        raw = await db.projects.find_one({"id": pid}, {"_id": 0})
+        login = {} if body.clear_login else dict((raw or {}).get("login") or {})
+        if not body.clear_login:
+            if body.login_url is not None:
+                login["url"] = body.login_url
+            if body.login_username is not None:
+                login["username"] = body.login_username
+            if body.login_password:
+                login["password"] = body.login_password
+        fields["login"] = login
+    if body.login_recipe is not None:
+        raw = await db.projects.find_one({"id": pid}, {"_id": 0})
+        login = fields.get("login")
+        if login is None:
+            login = {} if body.clear_login else dict((raw or {}).get("login") or {})
+        login["recipe"] = [step.model_dump() for step in body.login_recipe]
+        fields["login"] = login
+    if body.glossary is not None:
+        fields["glossary"] = [item.model_dump() for item in body.glossary]
     if "steps" in fields:
         stored = {s["id"]: s for s in p["steps"]}
         fields["steps"] = []
@@ -467,10 +780,16 @@ async def update_project(pid: str, body: ProjectUpdate, user: dict = Depends(get
             d = s.model_dump()
             prev = stored.get(d["id"], {})
             for k in SERVER_FIELDS:
-                d[k] = prev.get(k, Step.model_fields[k].default)
+                d[k] = prev.get(k, Step.model_fields[k].default if k in Step.model_fields else None)
             fields["steps"].append(d)
+        fields["search_text"] = " ".join(
+            " ".join(str(s.get(k) or "") for k in ("caption", "voiceover", "caption_alt", "voiceover_alt", "selector", "url", "error"))
+            for s in fields["steps"])[:4000]
     if "brand" in fields:
-        fields["brand"] = body.brand.model_dump()
+        brand = body.brand.model_dump(exclude_none=True)
+        if not brand.get("music_path") and (p.get("brand") or {}).get("music_path"):
+            brand["music_path"] = p["brand"]["music_path"]
+        fields["brand"] = brand
     await touch(pid, fields)
     p.update(fields)
     if "steps" in fields:
@@ -534,19 +853,20 @@ async def generate(pid: str, user: dict = Depends(get_current_user)):
         raise HTTPException(400, "Write a draft of at least a few words first")
     if not p["target_url"].startswith(("http://", "https://")):
         raise HTTPException(400, "Add a valid target URL (starting with http:// or https://)")
-    elements, inspected = [], False
-    if engine.is_configured():
+    elements, inspected, brief = [], False, {}
+    if engine is not None and engine.is_configured():
         try:
-            elements = await engine.inspect_page(p["target_url"])
+            reading = await engine.read_page(p["target_url"])
+            elements = reading.get("elements") or []
+            brief = reading.get("brief") or {}
             inspected = True
         except Exception as exc:
             logger.warning("inspect failed: %s", exc)
     try:
-        result = await ai.generate_script(p["draft"], p["target_url"], elements, f"gen_{pid}_{new_id()}")
+        result, steps = await narrated_script(p["draft"], p["target_url"], elements, f"gen_{pid}_{new_id()}", brief)
     except Exception as exc:
         logger.exception("generate failed")
         raise HTTPException(424, f"AI could not build a script: {ai_error(exc)}")
-    steps = normalize_steps(result.get("steps") or [], p["target_url"])
     if not steps:
         raise HTTPException(424, "AI returned no usable steps. Try adding more detail to your draft.")
     await touch(pid, {"steps": steps, "status": "scripted", "thumbnail_path": None})
@@ -555,7 +875,17 @@ async def generate(pid: str, user: dict = Depends(get_current_user)):
     out = await get_project(pid, user)
     out["inspected_elements"] = len(elements) if inspected else None
     out["ai_title"] = result.get("title")
+    first = (steps[0].get("url") or p["target_url"] or "")
+    out["review"] = {"first_url": first, "seconds": estimate_seconds({**p, "steps": steps}),
+                     "host_mismatch": url_host(first) != url_host(p["target_url"])}
     return out
+
+
+def url_host(url: str) -> str:
+    try:
+        return url.split("/")[2].lower()
+    except Exception:
+        return ""
 
 
 def month_start() -> str:
@@ -563,17 +893,29 @@ def month_start() -> str:
 
 
 async def usage_count(user: dict) -> int:
-    return await db.runs.count_documents({"user_id": user["user_id"], "kind": {"$in": ["record", "rerecord"]},
+    return await db.runs.count_documents({"user_id": user["user_id"], "kind": {"$in": ["record", "rerecord", "autopilot"]},
                                           "started_at": {"$gte": month_start()}})
 
 
-async def enforce_quota(user: dict) -> None:
+async def usage_seconds(user: dict) -> int:
+    runs = await db.runs.find({"user_id": user["user_id"], "kind": {"$in": ["record", "rerecord", "autopilot"]},
+                               "started_at": {"$gte": month_start()}}, {"_id": 0}).to_list(500)
+    return sum(int(run.get("seconds") or 0) for run in runs)
+
+
+async def enforce_quota(user: dict, project: dict | None = None) -> int:
     if await usage_count(user) >= MONTHLY_LIMIT:
         raise HTTPException(402, f"Monthly limit of {MONTHLY_LIMIT} recordings reached. Upgrade to keep recording.")
+    seconds = estimate_seconds(project) if project else 0
+    cap = MONTHLY_LIMIT * 120
+    used = await usage_seconds(user)
+    if project and used + seconds > cap:
+        raise HTTPException(402, f"This run is about {seconds}s. The monthly browser budget is {cap}s and {used}s is already used.")
+    return seconds
 
 
 def _require_browserless() -> None:
-    if not engine.is_configured():
+    if engine is None or not engine.is_configured():
         raise HTTPException(400, "Browserless is not connected yet. Add your Browserless API key in Settings.")
 
 
@@ -586,9 +928,13 @@ async def autopilot(pid: str, user: dict = Depends(get_current_user)):
     if not p["target_url"].startswith(("http://", "https://")):
         raise HTTPException(400, "Add a valid target URL (starting with http:// or https://)")
     await ensure_idle(p)
-    await enforce_quota(user)
+    seconds = await enforce_quota(user, p)
     await touch(pid, {"status": "recording"})
-    run = await new_run(p, "autopilot", 3, "One-click run: script → record → voiceover")
+    note = "One-click run: script → record → voiceover"
+    if seconds > 120:
+        note = "One-click run continues in parts because it is longer than a 120s browser session"
+    run = await new_run(p, "autopilot", 3, note)
+    await db.runs.update_one({"id": run["id"]}, {"$set": {"seconds": seconds}})
     spawn(job_autopilot(p, run["id"]))
     return run
 
@@ -624,7 +970,10 @@ async def share_settings(pid: str, body: ShareSettingsIn, user: dict = Depends(g
 async def cron_refresh_demos(request: Request):
     # Cron endpoints must ack 2xx immediately; enqueue/background the actual work.
     auth = request.headers.get("Authorization", "")
-    if not auth.startswith("Bearer ") or not hmac.compare_digest(auth[7:], os.environ["WEBHOOK_CRON_SECRET"]):
+    cron_secret = os.environ.get("WEBHOOK_CRON_SECRET", "")
+    if not cron_secret:
+        raise HTTPException(503, "Scheduled refresh is not configured")
+    if not auth.startswith("Bearer ") or not hmac.compare_digest(auth[7:], cron_secret):
         raise HTTPException(401, "Unauthorized")
     try:
         body = await request.json()
@@ -648,11 +997,15 @@ async def record(pid: str, user: dict = Depends(get_current_user)):
     if not p["steps"]:
         raise HTTPException(400, "Generate or add steps before recording")
     await ensure_idle(p)
-    await enforce_quota(user)
+    seconds = await enforce_quota(user, p)
     await db.projects.update_one({"id": pid}, {"$set": {"steps.$[].status": "pending", "steps.$[].error": None,
                                                        "status": "recording"}})
     p = await get_project(pid, user)
-    run = await new_run(p, "record", len(p["steps"]), "Launching secure Browserless Chromium session...")
+    note = "Launching secure Browserless Chromium session..."
+    if seconds > 120:
+        note = "This run is longer than one 120s browser session, so it will continue in parts."
+    run = await new_run(p, "record", len(p["steps"]), note)
+    await db.runs.update_one({"id": run["id"]}, {"$set": {"seconds": seconds}})
     spawn(job_record(p, run["id"], None))
     return run
 
@@ -665,9 +1018,10 @@ async def rerecord(pid: str, sid: str, user: dict = Depends(get_current_user)):
     if idx is None:
         raise HTTPException(404, "Step not found")
     await ensure_idle(p)
-    await enforce_quota(user)
+    seconds = await enforce_quota(user, p)
     p["steps"] = p["steps"][: idx + 1]
     run = await new_run(p, "rerecord", idx + 1, f"Re-recording step {idx + 1} (replaying previous steps first)...")
+    await db.runs.update_one({"id": run["id"]}, {"$set": {"seconds": seconds}})
     spawn(job_record(p, run["id"], idx))
     return run
 
@@ -675,7 +1029,7 @@ async def rerecord(pid: str, sid: str, user: dict = Depends(get_current_user)):
 @api.post("/projects/{pid}/voiceover")
 async def voiceover(pid: str, user: dict = Depends(get_current_user)):
     p = await get_project(pid, user)
-    if not any(s.get("voiceover", "").strip() for s in p["steps"]):
+    if not any((s.get("voiceover") or s.get("voiceover_alt") or "").strip() for s in p["steps"]):
         raise HTTPException(400, "Add voiceover text to at least one step first")
     await ensure_idle(p)
     run = await new_run(p, "voiceover", len(p["steps"]), f"Synthesizing voiceover with voice '{p.get('voice')}'...")
@@ -690,7 +1044,7 @@ async def export(pid: str, body: ExportIn, user: dict = Depends(get_current_user
         raise HTTPException(400, "Record the demo before exporting")
     await ensure_idle(p)
     run = await new_run(p, "export", 3, f"Rendering {body.format.upper()}...")
-    spawn(job_export(p, run["id"], body.format))
+    spawn(job_export(p, run["id"], body.format, body.preset))
     return run
 
 
@@ -765,6 +1119,9 @@ async def repair_step(pid: str, sid: str, user: dict = Depends(get_current_user)
     step = p["steps"][idx]
     prev_url = next((s.get("page_url") for s in reversed(p["steps"][:idx]) if s.get("page_url")), None)
     url = step.get("page_url") or prev_url or p["target_url"]
+    blocked = engine.blocked_page(url)
+    if blocked:
+        raise HTTPException(400, blocked)
     try:
         elements = await engine.inspect_page(url)
         fix = await ai.repair_selector(step, elements, f"fix_{sid}_{new_id()}")
@@ -781,26 +1138,282 @@ async def repair_step(pid: str, sid: str, user: dict = Depends(get_current_user)
     return out
 
 
+@api.post("/projects/{pid}/rerecord-failed")
+async def rerecord_failed(pid: str, user: dict = Depends(get_current_user)):
+    p = await get_project(pid, user)
+    _require_browserless()
+    failed = {i for i, s in enumerate(p["steps"]) if s.get("status") == "failed"}
+    if not failed:
+        raise HTTPException(400, "No failed steps to re-record")
+    await ensure_idle(p)
+    seconds = await enforce_quota(user, p)
+    run = await new_run(p, "rerecord", max(failed) + 1, f"Re-recording {len(failed)} failed step(s)...")
+    await db.runs.update_one({"id": run["id"]}, {"$set": {"seconds": seconds}})
+    spawn(job_record(p, run["id"], None, only=failed))
+    return run
+
+
+@api.post("/projects/{pid}/publish")
+async def publish(pid: str, user: dict = Depends(get_current_user)):
+    p = await get_project(pid, user)
+    raw = await db.projects.find_one({"id": pid}, {"_id": 0})
+    snap = {"steps": (raw or p)["steps"], "name": p["name"], "brand": p.get("brand"),
+            "narration_mode": p.get("narration_mode"), "cta": p.get("cta"), "published_at": now_iso()}
+    await touch(pid, {"published": snap, "is_public": True})
+    await log_history(p, "Published share", f"{len(snap['steps'])} steps")
+    return await get_project(pid, user)
+
+
+@api.get("/projects/{pid}/transcript")
+async def project_transcript(pid: str, fmt: Literal["txt", "vtt"] = "txt", user: dict = Depends(get_current_user)):
+    p = await get_project(pid, user)
+    body = transcript(p, fmt)
+    media = "text/vtt" if fmt == "vtt" else "text/plain"
+    return Response(content=body, media_type=f"{media}; charset=utf-8")
+
+
+@api.post("/projects/{pid}/changelog")
+async def changelog(pid: str, body: SourceIn, user: dict = Depends(get_current_user)):
+    p = await get_project(pid, user)
+    if not p["target_url"].startswith(("http://", "https://")):
+        raise HTTPException(400, "Add a valid target URL first")
+    elements, brief = [], {}
+    if engine is not None and engine.is_configured():
+        try:
+            reading = await engine.read_page(p["target_url"])
+            elements, brief = reading.get("elements") or [], reading.get("brief") or {}
+        except Exception:
+            logger.warning("changelog inspect failed", exc_info=True)
+    try:
+        result, steps = await narrated_script(body.source, p["target_url"], elements, f"log_{pid}_{new_id()}", brief, changelog=True)
+    except Exception as exc:
+        raise HTTPException(424, f"Could not script the changelog: {ai_error(exc)}")
+    if not steps:
+        raise HTTPException(424, "The changelog did not produce any steps")
+    await touch(pid, {"steps": steps, "status": "scripted", "draft": body.source})
+    p["steps"] = steps
+    await log_history(p, "Scripted from changelog", f"{len(steps)} steps", snapshot=True)
+    return await get_project(pid, user)
+
+
+@api.post("/projects/{pid}/import-playwright")
+async def import_playwright(pid: str, body: SourceIn, user: dict = Depends(get_current_user)):
+    p = await get_project(pid, user)
+    parsed = parse_playwright(body.source)
+    steps = normalize_steps(parsed, p["target_url"])
+    if not steps:
+        raise HTTPException(400, "No page.goto, click, or fill calls were found in that file")
+    if ai is not None:
+        try:
+            edits = await ai.rewrite_narration(steps, cinematic.STORY_INSTRUCTION, f"imp_{pid}")
+            by_id = {e.get("id"): e for e in edits}
+            for step in steps:
+                edit = by_id.get(step["id"])
+                if edit:
+                    step["caption"] = edit.get("caption") or step["caption"]
+                    step["voiceover"] = edit.get("voiceover") or ""
+        except Exception:
+            logger.warning("playwright import narration skipped", exc_info=True)
+    await touch(pid, {"steps": steps, "status": "scripted"})
+    p["steps"] = steps
+    await log_history(p, "Imported Playwright test", f"{len(steps)} steps", snapshot=True)
+    return await get_project(pid, user)
+
+
+@api.post("/projects/{pid}/capture")
+async def capture(pid: str, body: CaptureIn, user: dict = Depends(get_current_user)):
+    p = await get_project(pid, user)
+    _require_browserless()
+    raw = await db.projects.find_one({"id": pid}, {"_id": 0}) or {}
+    project = {**raw, "steps": p["steps"], "login": raw.get("login") or {}}
+    start = environment_base(project) or p["target_url"]
+    if not str(start).startswith(("http://", "https://")):
+        raise HTTPException(400, "Add a target URL first")
+    if body.after > len(p["steps"]):
+        raise HTTPException(400, "There are not that many steps to replay")
+    prepared = [prepare_step(step, project) for step in p["steps"][:body.after]]
+    try:
+        found = await engine.inspect_after(start, prepared, login=project.get("login"), scroll=body.scroll,
+                                           storage_state=(project.get("login") or {}).get("storage_state"))
+    except Exception as exc:
+        raise HTTPException(424, f"Could not open the page: {str(exc)[:180]}")
+    return {"url": found["url"], "elements": found["elements"][:40], "after": body.after}
+
+
+def _live_ready() -> None:
+    if live_browser is None or engine is None or not engine.is_configured():
+        raise HTTPException(400, "Browserless is not connected yet. Add your Browserless API key in Settings.")
+
+
+async def _live_project(pid: str, user: dict) -> tuple[dict, str]:
+    p = await get_project(pid, user)
+    raw = await db.projects.find_one({"id": pid}, {"_id": 0}) or {}
+    project = {**raw, "steps": p["steps"], "login": raw.get("login") or {}}
+    start = environment_base(project) or p["target_url"]
+    if not str(start).startswith(("http://", "https://")):
+        raise HTTPException(400, "Add a target URL first")
+    return project, start
+
+
+@api.post("/projects/{pid}/live/start")
+async def live_start(pid: str, body: LiveStartIn, user: dict = Depends(get_current_user)):
+    project, start = await _live_project(pid, user)
+    _live_ready()
+    if body.after > len(project["steps"]):
+        raise HTTPException(400, "There are not that many steps to replay")
+    prepared = [prepare_step(step, project) for step in project["steps"][:body.after]]
+    try:
+        found = await live_browser.open_session(pid, start, prepared, project.get("login"), user["user_id"])
+    except Exception as exc:
+        raise HTTPException(424, f"Could not open the live browser: {str(exc)[:180]}")
+    return {"url": found["url"], "after": body.after}
+
+
+def _own_live(pid: str, user: dict) -> None:
+    if not live_browser or not live_browser.owns(pid, user["user_id"]):
+        raise HTTPException(404, "Live browser is not open")
+
+
+@api.get("/projects/{pid}/live")
+async def live_status(pid: str, user: dict = Depends(get_current_user)):
+    if not live_browser or not live_browser.owns(pid, user["user_id"]):
+        return {"open": False, "url": "", "error": ""}
+    return live_browser.status(pid)
+
+
+@api.get("/projects/{pid}/live/frame")
+async def live_frame(pid: str, user: dict = Depends(get_current_user)):
+    _own_live(pid, user)
+    data = live_browser.frame(pid)
+    if not data:
+        raise HTTPException(404, "Live browser is not open")
+    return Response(content=data, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
+
+
+@api.post("/projects/{pid}/live/click")
+async def live_click(pid: str, body: LiveClickIn, user: dict = Depends(get_current_user)):
+    _own_live(pid, user)
+    try:
+        return await live_browser.click(pid, body.x, body.y)
+    except Exception as exc:
+        raise HTTPException(424, str(exc)[:180])
+
+
+@api.post("/projects/{pid}/live/type")
+async def live_type(pid: str, body: LiveTypeIn, user: dict = Depends(get_current_user)):
+    _own_live(pid, user)
+    try:
+        return await live_browser.type_text(pid, body.text)
+    except Exception as exc:
+        raise HTTPException(424, str(exc)[:180])
+
+
+@api.post("/projects/{pid}/live/scroll")
+async def live_scroll(pid: str, body: LiveScrollIn, user: dict = Depends(get_current_user)):
+    _own_live(pid, user)
+    try:
+        return await live_browser.scroll(pid, body.amount)
+    except Exception as exc:
+        raise HTTPException(424, str(exc)[:180])
+
+
+@api.post("/projects/{pid}/live/key")
+async def live_key(pid: str, body: LiveKeyIn, user: dict = Depends(get_current_user)):
+    _own_live(pid, user)
+    try:
+        return await live_browser.press_key(pid, body.key)
+    except Exception as exc:
+        raise HTTPException(424, str(exc)[:180])
+
+
+@api.post("/projects/{pid}/live/stop")
+async def live_stop(pid: str, user: dict = Depends(get_current_user)):
+    await get_project(pid, user)
+    if live_browser:
+        await live_browser.close_session(pid)
+    return {"ok": True}
+
+
+@api.post("/projects/{pid}/steps/{sid}/comments")
+async def add_comment(pid: str, sid: str, body: CommentIn, user: dict = Depends(get_current_user)):
+    p = await get_project(pid, user)
+    step = next((s for s in p["steps"] if s["id"] == sid), None)
+    if not step:
+        raise HTTPException(404, "Step not found")
+    comment = {"id": new_id("c_"), "text": body.text.strip(), "author": user.get("name") or user.get("email") or "You", "at": now_iso()}
+    comments = list(step.get("comments") or []) + [comment]
+    await db.projects.update_one({"id": pid, "steps.id": sid}, {"$set": {"steps.$.comments": comments, "updated_at": now_iso()}})
+    return await get_project(pid, user)
+
+
 @api.get("/projects/{pid}/analytics")
 async def analytics(pid: str, user: dict = Depends(get_current_user)):
     p = await get_project(pid, user)
     events = await db.analytics_events.find({"project_id": pid}, {"_id": 0}).sort("created_at", -1).to_list(5000)
     views, completes, reach = set(), set(), {}
+    cta_clicks, referrers, devices, series = 0, {}, {"desktop": 0, "phone": 0}, {}
     for e in events:
         if e["type"] == "view":
             views.add(e["session"])
+            device = e.get("device") if e.get("device") in devices else "desktop"
+            devices[device] += 1
+            host = url_host(e.get("referrer") or "") or "direct"
+            referrers[host] = referrers.get(host, 0) + 1
+            day = (e.get("created_at") or "")[:10]
+            if day:
+                series[day] = series.get(day, 0) + 1
         elif e["type"] == "complete":
             completes.add(e["session"])
+        elif e["type"] == "cta":
+            cta_clicks += 1
         reach[e["session"]] = max(reach.get(e["session"], 0), e.get("step_index", 0))
     n = len(p["steps"])
     per_step = [sum(1 for v in reach.values() if v >= i) for i in range(n)]
+    dwells: dict[int, list] = {}
+    leads = []
+    for e in events:
+        if e.get("dwell_ms"):
+            dwells.setdefault(int(e.get("step_index") or 0), []).append(e["dwell_ms"])
+        if e["type"] == "lead" and e.get("email"):
+            leads.append({"email": e["email"], "step_index": e.get("step_index"), "at": e.get("created_at")})
+    avg_dwell = [round(sum(dwells.get(i, [])) / len(dwells[i])) if dwells.get(i) else 0 for i in range(n)]
     return {"views": len(views), "completions": len(completes),
-            "completion_rate": round(len(completes) / len(views) * 100) if views else 0, "per_step": per_step}
+            "completion_rate": round(len(completes) / len(views) * 100) if views else 0, "per_step": per_step,
+            "avg_dwell_ms": avg_dwell, "leads": leads[:50], "cta_clicks": cta_clicks,
+            "devices": devices, "referrers": [{"host": k, "views": v} for k, v in sorted(referrers.items(), key=lambda item: -item[1])[:8]],
+            "series": [{"day": day, "views": series[day]} for day in sorted(series)[-14:]]}
+
+
+def fire_webhook(project: dict, payload: dict) -> None:
+    url = (project.get("webhook_url") or "").strip()
+    if not url.startswith(("http://", "https://")):
+        return
+
+    async def send() -> None:
+        ok, code, error = False, 0, ""
+        for attempt in range(3):
+            ok, code, error = await _post_json(url, payload)
+            if ok:
+                break
+            await asyncio.sleep(0.4 * (attempt + 1))
+        entry = {"at": now_iso(), "event": payload.get("event"), "ok": ok, "status": code, "error": error}
+        current = await db.projects.find_one({"id": project["id"]}, {"_id": 0})
+        log = ((current or {}).get("webhook_log") or [])[-19:] + [entry]
+        await touch(project["id"], {"webhook_log": log})
+
+    spawn(send())
+
+
+def _motion_response(step: dict | None, index: int) -> Response:
+    paths = (step or {}).get("motion_paths") or []
+    if index < 0 or index >= len(paths):
+        raise HTTPException(404, "Asset not found")
+    return paths[index]
 
 
 async def _asset(p: dict, sid: str, kind: str) -> Response:
     step = next((s for s in p["steps"] if s["id"] == sid), None)
-    field = {"screenshot": "screenshot_path", "thumb": "thumb_path", "audio": "audio_path"}[kind]
+    field = {"screenshot": "screenshot_path", "thumb": "thumb_path", "audio": "audio_path", "mobile": "screenshot_mobile_path"}[kind]
     path = step and (step.get(field) or (step.get("screenshot_path") if kind == "thumb" else None))
     if not path:
         raise HTTPException(404, "Asset not found")
@@ -809,9 +1422,22 @@ async def _asset(p: dict, sid: str, kind: str) -> Response:
     return Response(content=data, media_type=media, headers={"Cache-Control": "private, max-age=86400"})
 
 
+@api.get("/projects/{pid}/steps/{sid}/motion/{index}")
+async def step_motion(pid: str, sid: str, index: int, user: dict = Depends(get_current_user)):
+    project = await get_project(pid, user)
+    step = next((s for s in project["steps"] if s["id"] == sid), None)
+    path = _motion_response(step, index)
+    data, _ = await get_object(path)
+    return Response(content=data, media_type="image/jpeg", headers={"Cache-Control": "private, max-age=86400"})
+
+
 @api.get("/projects/{pid}/steps/{sid}/{kind}")
-async def step_asset(pid: str, sid: str, kind: Literal["screenshot", "thumb", "audio"], user: dict = Depends(get_current_user)):
-    return await _asset(await get_project(pid, user), sid, kind)
+async def step_asset(pid: str, sid: str, kind: Literal["screenshot", "thumb", "audio", "mobile"], user: dict = Depends(get_current_user),
+                     track: Optional[Literal["primary", "alt"]] = None):
+    project = await get_project(pid, user)
+    if kind == "audio" and track == "alt":
+        project = {**project, "steps": apply_track(project["steps"], "alt")}
+    return await _asset(project, sid, kind)
 
 
 @api.get("/projects/{pid}/thumbnail")
@@ -840,6 +1466,16 @@ async def download_export(pid: str, eid: str, user: dict = Depends(get_current_u
 async def _public_project(share_id: str, request: Request, unlock: bool = True) -> dict:
     p = await db.projects.find_one({"share_id": share_id, "is_public": True, "is_deleted": False}, {"_id": 0})
     if not p:
+        link = await db["variant_shares"].find_one({"share_id": share_id}, {"_id": 0})
+        if link:
+            parent = await db.projects.find_one({"id": link.get("project_id"), "is_public": True, "is_deleted": False}, {"_id": 0})
+            variant = next((v for v in (parent or {}).get("variants") or [] if v.get("id") == link.get("variant_id")), None)
+            if parent and variant:
+                p = dict(parent)
+                p["variables"] = {**(parent.get("variables") or {}), **(variant.get("variables") or {})}
+                p["name"] = f"{parent.get('name')} · {variant.get('name')}"
+                p["share_id"] = share_id
+    if not p:
         raise HTTPException(404, "This demo is private or does not exist")
     if p.get("share_expires_at") and p["share_expires_at"] < now_iso():
         raise HTTPException(410, "This demo link has expired")
@@ -859,7 +1495,10 @@ async def public_unlock(share_id: str, body: UnlockIn, request: Request):
     fwd = request.headers.get("x-forwarded-for", "").split(",")[0].strip()
     ident = f"share:{share_id}:{fwd or (request.client.host if request.client else 'x')}"
     attempt = await db.login_attempts.find_one({"identifier": ident}, {"_id": 0})
-    if attempt and attempt.get("count", 0) >= 10 and attempt.get("locked_until", now()) > now():
+    locked = attempt.get("locked_until") if attempt else None
+    if isinstance(locked, str):
+        locked = datetime.fromisoformat(locked)
+    if attempt and attempt.get("count", 0) >= 10 and locked and locked > now():
         raise HTTPException(429, "Too many attempts. Try again in 15 minutes.")
     if not verify_password(body.password, p["share_password_hash"]):
         await db.login_attempts.update_one({"identifier": ident}, {"$inc": {"count": 1},
@@ -869,41 +1508,148 @@ async def public_unlock(share_id: str, body: UnlockIn, request: Request):
     return {"token": create_viewer_token(f"{share_id}:{p['share_password_hash'][-10:]}")}
 
 
+def _tour_key(row: dict):
+    order = row.get("tour_order")
+    return (order if isinstance(order, int) else 50, row.get("name") or "")
+
+
+@api.get("/public/products/{slug}")
+async def public_product(slug: str):
+    rows = await db.projects.find({"product_slug": slug, "is_public": True, "is_deleted": False}, {"_id": 0}).to_list(50)
+    rows.sort(key=_tour_key)
+    return {"slug": slug, "demos": [{"name": r.get("name"), "share_id": r.get("share_id"),
+                                     "tour_order": r.get("tour_order") or 0,
+                                     "step_count": len((r.get("published") or {}).get("steps") or r.get("steps") or []),
+                                     "updated_at": r.get("updated_at")} for r in rows]}
+
+
+async def _next_demo(project: dict, share_id: str) -> dict | None:
+    slug = project.get("product_slug") or ""
+    if not slug:
+        return None
+    rows = await db.projects.find({"product_slug": slug, "is_public": True, "is_deleted": False}, {"_id": 0}).to_list(50)
+    rows.sort(key=_tour_key)
+    ids = [r.get("share_id") for r in rows]
+    if share_id not in ids:
+        return None
+    nxt = ids.index(share_id) + 1
+    if nxt >= len(rows):
+        return None
+    return {"name": rows[nxt].get("name"), "share_id": rows[nxt].get("share_id")}
+
+
 @api.get("/public/{share_id}")
-async def public_demo(share_id: str, request: Request):
-    p = await _public_project(share_id, request)
+async def public_demo(share_id: str, request: Request, track: Optional[Literal["primary", "alt"]] = None):
+    p = public_view(await _public_project(share_id, request))
+    variables = p.get("variables") or {}
+    source = apply_track(p["steps"], track or p.get("active_track") or "primary")
     keep = ("id", "action", "caption", "voiceover", "duration_ms", "transition", "transition_ms", "hotspot",
-            "audio_duration_ms")
-    steps = [{**{k: s.get(k) for k in keep}, "has_screenshot": bool(s.get("screenshot_path")),
-              "has_audio": bool(s.get("audio_path")), "v": (s.get("screenshot_path") or "")[-12:]}
-             for s in p["steps"]]
+            "audio_duration_ms", "chapter", "annotations")
+    steps = []
+    for s in source:
+        item = {k: s.get(k) for k in keep}
+        item["caption"] = substitute(item.get("caption"), variables)
+        item["voiceover"] = substitute(item.get("voiceover"), variables)
+        item.update({"has_screenshot": bool(s.get("screenshot_path")),
+                     "has_mobile": bool(s.get("screenshot_mobile_path")),
+                     "has_audio": bool(s.get("audio_path")), "motion_count": len(s.get("motion_paths") or []),
+                     "branch": s.get("branch") or "", "choices": s.get("choices") or [],
+                     "v": (s.get("screenshot_path") or "")[-12:]})
+        steps.append(item)
+    has_alt = any((s.get("caption_alt") or s.get("voiceover_alt")) for s in p["steps"])
+    brand = {**DEFAULT_BRAND, **(p.get("brand") or {})}
+    brand.pop("music_path", None)
     return {"name": p["name"], "narration_mode": p.get("narration_mode", "both"), "steps": steps,
-            "brand": {**DEFAULT_BRAND, **(p.get("brand") or {})}, "updated_at": p["updated_at"],
-            "expires_at": p.get("share_expires_at")}
+            "brand": brand, "updated_at": p["updated_at"],
+            "expires_at": p.get("share_expires_at"), "cta": p.get("cta") or {},
+            "published_at": p.get("published_at"), "product_slug": p.get("product_slug") or "",
+            "guided": bool(p.get("guided")), "tracks": ["primary", "alt"] if has_alt else ["primary"],
+            "track": track or p.get("active_track") or "primary",
+            "next": await _next_demo(p, share_id)}
+
+
+@api.get("/public/{share_id}/transcript")
+async def public_transcript(share_id: str, request: Request, fmt: Literal["txt", "vtt"] = "vtt"):
+    p = public_view(await _public_project(share_id, request))
+    media = "text/vtt" if fmt == "vtt" else "text/plain"
+    return Response(content=transcript(p, fmt), media_type=f"{media}; charset=utf-8")
 
 
 @api.post("/public/{share_id}/events")
 async def public_event(share_id: str, body: EventIn, request: Request):
     p = await _public_project(share_id, request)
+    fields = {"created_at": now_iso()}
+    if body.dwell_ms is not None:
+        fields["dwell_ms"] = body.dwell_ms
+    if body.email:
+        fields["email"] = body.email.strip()
+    if body.referrer:
+        fields["referrer"] = body.referrer[:300]
+    if body.device:
+        fields["device"] = body.device
+    if body.branch:
+        fields["branch"] = body.branch[:40]
     await db.analytics_events.update_one(
         {"project_id": p["id"], "session": body.session, "type": body.type, "step_index": body.step_index},
-        {"$setOnInsert": {"created_at": now_iso()}}, upsert=True)
+        {"$set": fields}, upsert=True)
+    if body.type in ("complete", "lead", "cta"):
+        fire_webhook(p, {"event": body.type, "demo": p.get("name"), "share_id": share_id,
+                         "step_index": body.step_index, "email": body.email, "session": body.session})
     return {"ok": True}
 
 
+@api.get("/public/{share_id}/steps/{sid}/motion/{index}")
+async def public_motion(share_id: str, sid: str, index: int, request: Request):
+    project = public_view(await _public_project(share_id, request))
+    step = next((s for s in project["steps"] if s["id"] == sid), None)
+    path = _motion_response(step, index)
+    data, _ = await get_object(path)
+    return Response(content=data, media_type="image/jpeg", headers={"Cache-Control": "public, max-age=3600"})
+
+
 @api.get("/public/{share_id}/steps/{sid}/{kind}")
-async def public_asset(share_id: str, sid: str, kind: Literal["screenshot", "thumb", "audio"], request: Request):
-    return await _asset(await _public_project(share_id, request), sid, kind)
+async def public_asset(share_id: str, sid: str, kind: Literal["screenshot", "thumb", "audio", "mobile"], request: Request,
+                       track: Optional[Literal["primary", "alt"]] = None):
+    project = public_view(await _public_project(share_id, request))
+    if kind == "audio" and track == "alt":
+        project = {**project, "steps": apply_track(project["steps"], "alt")}
+    return await _asset(project, sid, kind)
 
 
 # ---------- settings ----------
+@api.get("/health")
+async def health():
+    """Liveness: the process is up."""
+    return {"ok": True, "instance": INSTANCE_ID}
+
+
+@api.get("/ready")
+async def ready():
+    """Readiness: dependencies this instance needs are configured and reachable."""
+    checks = {"database": DB_BACKEND, "ai": bool(ai and ai.provider()[2]),
+              "browserless": bool(engine and engine.is_configured())}
+    try:
+        await db.runs.find_one({"id": "__ready__"}, {"_id": 0})
+        checks["database_ok"] = True
+    except Exception as exc:
+        checks["database_ok"] = False
+        logger.warning("readiness db check failed: %s", exc)
+    status_code = 200 if checks["database_ok"] else 503
+    from fastapi.responses import JSONResponse
+    return JSONResponse(status_code=status_code, content=checks)
+
+
 @api.get("/settings")
 async def get_settings(user: dict = Depends(get_current_user)):
-    return {"browserless_configured": engine.is_configured(),
-            "browserless_region": os.environ.get("BROWSERLESS_WS_URL", ""),
-            "llm_configured": True, "ai_model": ai.provider()[3], "tts_model": ai.tts_key()[1],
+    return {"browserless_configured": bool(engine and engine.is_configured()),
+            "browserless_region": engine.ws_base() if engine else "",
+            "llm_configured": bool(ai and ai.provider()[2]), "ai_model": ai.provider()[3] if ai else "Not installed",
+            "tts_model": ai.tts_key()[1] if ai else "Not installed",
             "preferences": user.get("preferences") or {"voice": "nova", "narration_mode": "both"},
-            "usage": {"recordings_this_month": await usage_count(user), "limit": MONTHLY_LIMIT, "plan": "Free"}}
+            "storage": storage_status(),
+            "usage": {"recordings_this_month": await usage_count(user), "limit": MONTHLY_LIMIT, "plan": "Free",
+                      "seconds_this_month": await usage_seconds(user), "seconds_limit": MONTHLY_LIMIT * 120,
+                      "session_cap": 120}}
 
 
 @api.put("/settings")
@@ -931,14 +1677,17 @@ async def tts_preview(body: PrefsIn, user: dict = Depends(get_current_user)):
     return Response(content=audio, media_type="audio/mpeg")
 
 
+from studio_plus import router as plus_router
+
 app.include_router(auth_router)
 app.include_router(api)
+app.include_router(plus_router)
 app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,
-    allow_origins=os.environ.get("CORS_ORIGINS", "*").split(","),
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=cors_origins(),
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization", "X-Requested-With", "X-Webhook-Id"],
 )
 
 
@@ -946,8 +1695,9 @@ app.add_middleware(
 async def startup():
     app.state.index_task = asyncio.create_task(ensure_indexes())
     await seed_admin()
-    await db.runs.update_many({"status": "running"}, {"$set": {"status": "failed", "message": "Interrupted by server restart"}})
-    await db.projects.update_many({"active_run_id": {"$ne": None}}, {"$set": {"active_run_id": None}})
+    validate_config()
+    await reap_stale_runs()
+    app.state.reaper_task = asyncio.create_task(reaper_loop())
     try:
         await asyncio.to_thread(init_storage)
     except Exception as exc:
@@ -956,7 +1706,8 @@ async def startup():
 
 @app.on_event("shutdown")
 async def shutdown():
-    app.state.index_task.cancel()
-    with suppress(asyncio.CancelledError):
-        await app.state.index_task
-    client.close()
+    for task in (app.state.index_task, app.state.reaper_task):
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+    return None

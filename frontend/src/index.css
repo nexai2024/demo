@@ -6,26 +6,26 @@
 
 @layer base {
     :root {
-        --background: 224 71% 4%;
+        --background: 232 45% 5%;
         --foreground: 210 40% 98%;
-        --card: 222 47% 11%;
+        --card: 230 32% 9%;
         --card-foreground: 210 40% 98%;
-        --popover: 222 47% 9%;
+        --popover: 232 36% 8%;
         --popover-foreground: 210 40% 98%;
-        --primary: 239 84% 67%;
+        --primary: 250 90% 70%;
         --primary-foreground: 0 0% 100%;
-        --secondary: 217 33% 17%;
+        --secondary: 230 24% 16%;
         --secondary-foreground: 210 40% 98%;
-        --muted: 217 33% 14%;
-        --muted-foreground: 215 20% 65%;
-        --accent: 217 33% 17%;
+        --muted: 230 22% 13%;
+        --muted-foreground: 220 16% 70%;
+        --accent: 186 80% 48%;
         --accent-foreground: 210 40% 98%;
         --destructive: 0 84% 60%;
         --destructive-foreground: 0 0% 98%;
-        --border: 217 33% 17%;
-        --input: 217 33% 17%;
-        --ring: 239 84% 67%;
-        --radius: 0.6rem;
+        --border: 230 18% 20%;
+        --input: 230 20% 16%;
+        --ring: 250 90% 70%;
+        --radius: 0.85rem;
     }
 }
 
@@ -37,6 +37,21 @@
         @apply bg-background text-foreground;
         font-family: "IBM Plex Sans", system-ui, sans-serif;
         -webkit-font-smoothing: antialiased;
+        background-image:
+            radial-gradient(900px 480px at 8% -10%, rgba(129, 140, 248, 0.22), transparent 60%),
+            radial-gradient(700px 420px at 100% 0%, rgba(34, 211, 238, 0.12), transparent 55%),
+            radial-gradient(600px 400px at 80% 100%, rgba(244, 114, 182, 0.08), transparent 50%);
+        background-attachment: fixed;
+    }
+    button, a, input, textarea, select {
+        transition: background-color 180ms ease, border-color 180ms ease, color 180ms ease, box-shadow 180ms ease, transform 180ms ease, opacity 180ms ease;
+    }
+    button:active:not(:disabled), a:active {
+        transform: translateY(1px) scale(0.985);
+    }
+    :focus-visible {
+        outline: 2px solid rgba(165, 180, 252, 0.9);
+        outline-offset: 2px;
     }
     h1, h2, h3, h4, .font-display {
         font-family: "Outfit", sans-serif;
@@ -74,6 +89,13 @@
 .hotspot-dot {
     animation: hotspot-pulse 1.6s infinite;
 }
+@keyframes player-dissolve {
+    from { opacity: 0; }
+    to { opacity: 1; }
+}
+.player-dissolve {
+    animation: player-dissolve 0.28s ease-out both;
+}
 
 @keyframes rise {
     from { opacity: 0; transform: translateY(10px); }
@@ -86,6 +108,163 @@
 .scrollbar-thin::-webkit-scrollbar { width: 6px; }
 .scrollbar-thin::-webkit-scrollbar-thumb { background: rgba(148, 163, 184, 0.2); border-radius: 6px; }
 
+.studio-root { position: relative; }
+.eyebrow {
+    font-family: "JetBrains Mono", monospace;
+    font-size: 11px;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: rgb(103, 232, 249);
+}
+.surface {
+    border-radius: 1rem;
+    border: 1px solid rgba(148, 163, 184, 0.16);
+    background: linear-gradient(180deg, rgba(255, 255, 255, 0.045), rgba(15, 23, 42, 0.55));
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06), 0 24px 50px -36px rgba(0, 0, 0, 0.85);
+    backdrop-filter: blur(16px);
+}
+.btn-primary {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.5rem;
+    height: 2.75rem;
+    padding: 0 1.15rem;
+    border-radius: 0.8rem;
+    color: white;
+    font-weight: 600;
+    background-image: linear-gradient(180deg, #a5b4fc, #6366f1 45%, #4f46e5);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.35), 0 12px 30px -16px rgba(99, 102, 241, 0.95);
+}
+.btn-primary:hover { filter: brightness(1.08); }
+.btn-primary:disabled { opacity: 0.55; }
+button.bg-indigo-600, a.bg-indigo-600 {
+    background-image: linear-gradient(180deg, #a5b4fc, #4f46e5);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.28), 0 12px 28px -16px rgba(99, 102, 241, 0.9);
+}
+.rounded-xl.border.border-slate-800,
+.rounded-xl.border.bg-slate-900\/70,
+.rounded-lg.border.border-slate-800 {
+    border-color: rgba(148, 163, 184, 0.16);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05);
+}
+.app-header {
+    position: sticky;
+    top: 0;
+    z-index: 40;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+    margin: 0.75rem 0.75rem 0;
+    padding: 0.7rem 0.9rem;
+    border-radius: 1rem;
+    border: 1px solid rgba(148, 163, 184, 0.16);
+    background: rgba(8, 10, 20, 0.72);
+    backdrop-filter: blur(18px);
+    box-shadow: 0 16px 40px -28px rgba(0, 0, 0, 0.9), inset 0 1px 0 rgba(255, 255, 255, 0.06);
+}
+.nav-pill {
+    display: inline-flex;
+    align-items: center;
+    height: 2rem;
+    padding: 0 0.75rem;
+    border-radius: 999px;
+    font-size: 0.875rem;
+    color: rgb(148, 163, 184);
+}
+.nav-pill.is-active, .nav-pill[aria-current="page"] {
+    color: white;
+    background: rgba(99, 102, 241, 0.22);
+    box-shadow: inset 0 0 0 1px rgba(165, 180, 252, 0.35);
+}
+.workflow {
+    display: grid;
+    grid-template-columns: repeat(5, minmax(0, 1fr));
+    gap: 0.6rem;
+    list-style: none;
+    margin: 0;
+    padding: 0;
+}
+.workflow-step {
+    display: flex;
+    align-items: center;
+    gap: 0.7rem;
+    width: 100%;
+    text-align: left;
+    border-radius: 0.9rem;
+    border: 1px solid rgba(148, 163, 184, 0.14);
+    background: rgba(15, 23, 42, 0.45);
+    padding: 0.7rem 0.75rem;
+}
+.workflow-step strong { display: block; font-size: 0.85rem; font-weight: 600; }
+.workflow-step em { display: block; font-style: normal; font-size: 0.72rem; color: rgb(148, 163, 184); }
+.workflow-index {
+    font-family: "JetBrains Mono", monospace;
+    font-size: 0.7rem;
+    color: rgb(148, 163, 184);
+}
+.workflow-step.is-done { border-color: rgba(52, 211, 153, 0.35); background: rgba(16, 185, 129, 0.08); }
+.workflow-step.is-done .workflow-index { color: rgb(110, 231, 183); }
+.workflow-step.is-current { border-color: rgba(129, 140, 248, 0.55); background: rgba(99, 102, 241, 0.12); box-shadow: 0 0 0 4px rgba(99, 102, 241, 0.08); }
+.workflow-step.is-current .workflow-index { color: rgb(165, 180, 252); }
+.activity-dock { position: fixed; right: 1rem; bottom: 1rem; z-index: 50; }
+.activity-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    height: 2.4rem;
+    padding: 0 0.8rem;
+    border-radius: 999px;
+    border: 1px solid rgba(148, 163, 184, 0.2);
+    background: rgba(8, 10, 20, 0.86);
+    color: rgb(226, 232, 240);
+    font-size: 0.8rem;
+    box-shadow: 0 12px 30px -18px rgba(0, 0, 0, 0.9);
+}
+.activity-toggle em {
+    min-width: 1.1rem;
+    height: 1.1rem;
+    border-radius: 999px;
+    background: rgb(244, 63, 94);
+    color: white;
+    font-style: normal;
+    font-size: 0.65rem;
+    display: grid;
+    place-items: center;
+}
+.activity-panel {
+    position: absolute;
+    right: 0;
+    bottom: 2.8rem;
+    width: min(22rem, calc(100vw - 2rem));
+    max-height: 18rem;
+    overflow: auto;
+    border-radius: 1rem;
+    border: 1px solid rgba(148, 163, 184, 0.18);
+    background: rgba(8, 10, 20, 0.94);
+    box-shadow: 0 24px 60px -30px rgba(0, 0, 0, 0.95);
+    padding: 0.75rem;
+}
+.activity-panel header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 0.5rem; font-size: 0.8rem; }
+.activity-panel ol { display: grid; gap: 0.4rem; }
+.activity-panel li { display: grid; grid-template-columns: 4.2rem 1fr; gap: 0.4rem; font-size: 0.75rem; color: rgb(203, 213, 225); }
+.activity-panel time { font-family: "JetBrains Mono", monospace; color: rgb(100, 116, 139); }
+.activity-panel .is-error span { color: rgb(253, 164, 175); }
+.activity-panel .is-success span { color: rgb(110, 231, 183); }
+.activity-empty { font-size: 0.75rem; color: rgb(148, 163, 184); }
+.player-dock {
+    border-radius: 0.9rem;
+    border: 1px solid rgba(148, 163, 184, 0.14);
+    background: rgba(15, 23, 42, 0.55);
+    padding: 0.35rem 0.4rem;
+}
+.log-line { animation: rise 0.28s ease-out both; }
+@media (max-width: 900px) {
+    .workflow { grid-template-columns: 1fr; }
+}
 @media (prefers-reduced-motion: reduce) {
-    .rise, .hotspot-dot { animation: none; }
+    .rise, .hotspot-dot, .log-line, .player-dissolve { animation: none; }
+    button, a, input, textarea, select { transition: none; }
+    button:active:not(:disabled), a:active { transform: none; }
 }

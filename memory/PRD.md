@@ -5,10 +5,10 @@ Build an AI Product Demo Builder that generates interactive/video product walkth
 Follow-up request: a 30-item modernization plan (15 enhancements + 15 new features), implemented right away. See /app/memory/MODERNIZATION_PLAN.md.
 
 ## User choices
-Claude Sonnet 5.5 (Emergent LLM key) · real Browserless with the user's key · captions + AI voiceover (OpenAI TTS HD) · email/password (JWT) + Emergent Google sign-in.
+OpenAI (GPT-4o, your OPENAI_API_KEY) · real Browserless with the user's key · captions + AI voiceover (OpenAI TTS HD) · email/password (JWT) (NoCodeBackend auth).
 
 ## Architecture
-- Backend FastAPI: core.py (db, JWT/session auth), auth_routes.py, server.py (projects, runs, SSE, public, analytics, settings), engine.py (Playwright `connect_over_cdp` to Browserless WS, retries + fallback selectors), ai.py (Claude script/rewrite/repair + TTS), render.py (Pillow frames, GIF, ffmpeg MP4 via imageio-ffmpeg), storage.py (Emergent object storage).
+- Backend FastAPI: core.py (db, JWT/session auth), auth_routes.py, server.py (projects, runs, SSE, public, analytics, settings), engine.py (Playwright `connect_over_cdp` to Browserless WS, retries + fallback selectors), ai.py (OpenAI script/rewrite/repair + TTS), render.py (Pillow frames, GIF, ffmpeg MP4 via imageio-ffmpeg), storage.py (NoCodeBackend file storage with local fallback).
 - Background jobs run with asyncio tasks; progress is stored in `runs` and streamed over SSE, with polling as fallback.
 - Frontend React: lazy routes, Studio (Draft/Timeline/Export & share/Analytics tabs, player, run console, filmstrip, ⌘K palette, history sheet), Dashboard, Settings, Share/Embed player.
 
@@ -24,7 +24,7 @@ Claude Sonnet 5.5 (Emergent LLM key) · real Browserless with the user's key · 
 
 ## Blockers / notes
 - Browserless key added and verified (plan max session timeout is 120 s). Recording, the backup selectors, re-record, GIF/MP4 export and the export cache are verified end to end.
-- The Emergent LLM key budget is exceeded. AI generation, rewrite, repair and voiceover fail until the balance is topped up.
+- AI generation, rewrite, repair and voiceover need OPENAI_API_KEY with available credit. Failures surface as a clear 503.
 
 ## Backlog
 - P1: scheduled re-recording (cron), Slack/email notifications, password/expiring share links

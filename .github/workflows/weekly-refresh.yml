@@ -1,0 +1,18 @@
+name: Weekly demo refresh
+on:
+  schedule:
+    - cron: "0 9 * * 1"   # Mondays 09:00 UTC
+  workflow_dispatch:
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger refresh
+        env:
+          APP_URL: ${{ secrets.APP_URL }}
+          CRON_SECRET: ${{ secrets.WEBHOOK_CRON_SECRET }}
+        run: |
+          curl --fail --silent --show-error -X POST "$APP_URL/api/cron/refresh-demos" \
+            -H "Authorization: Bearer $CRON_SECRET" \
+            -H "X-Webhook-Id: gha-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            -H "Content-Type: application/json" -d '{}'

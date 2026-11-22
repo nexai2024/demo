@@ -1,10 +1,18 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { AnimatePresence, motion } from "framer-motion";
+import { motion } from "framer-motion";
 import { ChevronLeft, ChevronRight, Link2, Maximize, MousePointerClick, Pause, Play, Volume2, VolumeX } from "lucide-react";
 
-const ACTION_LABEL = { goto: "Navigate", click: "Click", type: "Type", hover: "Hover", scroll: "Scroll", press: "Key press", wait: "Wait" };
+const ACTION_LABEL = { goto: "Navigate", click: "Click", type: "Type", hover: "Hover", scroll: "Scroll", press: "Key press", wait: "Wait", assert: "Check" };
 
-const stepMs = (s, withAudio) => Math.max(s.duration_ms || 3000, withAudio && s.audio_duration_ms ? s.audio_duration_ms + 400 : 0);
+const sceneMs = (s, withAudio) => {
+  const chosen = Number(s?.duration_ms) || 3000;
+  const floor = s?.action === "scroll" ? 7000 : 5500;
+  const base = chosen === 3000 ? floor : chosen;
+  const audio = withAudio && s?.audio_duration_ms ? s.audio_duration_ms + 700 : 0;
+  return Math.max(base, audio);
+};
+const fadeSec = (s) => (s?.transition === "none" ? 0 : (Number(s?.transition_ms) === 400 ? 800 : (s?.transition_ms || 800)) / 1000);
+const motionCount = (s) => s?.motion_count || (s?.motion_paths || []).length;
 const hasShot = (s) => s.has_screenshot ?? !!s.screenshot_path;
 const hasAudio = (s) => s.has_audio ?? !!s.audio_path;
 
@@ -19,10 +27,102 @@ function Hotspot({ box, onClick, accent }) {
   );
 }
 
+function SceneFrame({ step, src, shot, playing }) {
+  const count = step.action === "scroll" ? motionCount(step) : 0;
+  const [frame, setFrame] = useState(count);
+  const [shown, setShown] = useState(shot);
+  const [under, setUnder] = useState("");
+  const shownRef = useRef(shot);
+  useEffect(() => {
+    if (count < 1) return;
+    for (let i = 0; i < count; i += 1) {
+      const pic = new Image();
+      pic.src = src(step, "motion", i);
+    }
+  }, [step, count, src]);
+  useEffect(() => {
+    if (!playing || count < 1) { setFrame(count); return; }
+    setFrame(0);
+    const glide = Math.min(3600, Math.max(2200, count * 280));
+    const each = glide / count;
+    let i = 0;
+    const timer = setInterval(() => {
+      i += 1;
+      if (i >= count) { clearInterval(timer); setFrame(count); return; }
+      setFrame(i);
+    }, each);
+    return () => clearInterval(timer);
+  }, [step.id, playing, count]);
+  const image = count && frame < count ? src(step, "motion", frame) : shot;
+  useEffect(() => {
+    if (!image || image === shownRef.current) return;
+    let cancel = false;
+    const reveal = () => {
+      if (cancel || image === shownRef.current) return;
+      setUnder(shownRef.current);
+      shownRef.current = image;
+      setShown(image);
+    };
+    const pic = new Image();
+    pic.onload = reveal;
+    pic.src = image;
+    if (pic.complete) reveal();
+    return () => { cancel = true; };
+  }, [image]);
+  useEffect(() => {
+    if (!under) return undefined;
+    const timer = setTimeout(() => setUnder(""), 260);
+    return () => clearTimeout(timer);
+  }, [under, shown]);
+  return (
+    <>
+      {under && <img src={under} alt="" className="absolute inset-0 h-full w-full object-cover object-top" />}
+      <img src={shown} alt={step.caption || "Demo step"} data-testid="player-frame"
+        className={`absolute inset-0 h-full w-full object-cover object-top ${under ? "player-dissolve" : ""}`} />
+    </>
+  );
+}
+
+function Stage({ step, mobile, fade, playing, src }) {
+  const [layers, setLayers] = useState([step]);
+  useEffect(() => {
+    setLayers((list) => {
+      const last = list[list.length - 1];
+      if (last === step) return list;
+      return last?.id === step.id ? [...list.slice(0, -1), step] : [...list, step].slice(-3);
+    });
+  }, [step]);
+  useEffect(() => {
+    const timer = setTimeout(() => setLayers((list) => (list.length > 1 ? list.slice(-1) : list)), Math.round((fade || 0) * 1000) + 60);
+    return () => clearTimeout(timer);
+  }, [step.id, fade]);
+  const shotFor = (item) => src(item, mobile && (item.has_mobile || item.screenshot_mobile_path) ? "mobile" : "screenshot");
+  return layers.map((item, index) => {
+    const onTop = index === layers.length - 1;
+    const dissolve = onTop && layers.length > 1 && fade > 0;
+    return (
+      <motion.div key={item.id} className="absolute inset-0" style={{ zIndex: index + 1 }}
+        initial={{ opacity: dissolve ? 0 : 1 }} animate={{ opacity: 1 }}
+        transition={{ duration: dissolve ? Math.min(fade, 0.45) : 0, ease: "easeInOut" }}>
+        {hasShot(item) ? (
+          <SceneFrame step={item} src={src} playing={playing && onTop} shot={shotFor(item)} />
+        ) : (
+          <div className="absolute inset-0 grid place-items-center grid-bg">
+            <div className="text-center px-6 mt-32">
+              <p className="font-mono text-[10px] uppercase tracking-widest text-cyan-400">{ACTION_LABEL[item.action]} · not recorded yet</p>
+              <p className="mt-2 text-slate-400 text-sm">{item.selector || item.url || ""}</p>
+            </div>
+          </div>
+        )}
+      </motion.div>
+    );
+  });
+}
+
 function Caption({ text, accent, top }) {
   if (!text) return null;
   return (
-    <motion.div key={text} initial={{ opacity: 0, y: top ? -8 : 8 }} animate={{ opacity: 1, y: 0 }} data-testid="player-caption"
+    <motion.div key={text} initial={false} animate={{ opacity: 1 }} data-testid="player-caption"
       className={`absolute left-[6%] right-[6%] ${top ? "top-[5%]" : "bottom-[5%]"} rounded-xl bg-slate-950/85 backdrop-blur-md px-4 py-2.5 sm:px-5 sm:py-3 text-xs sm:text-base font-medium border-l-4 shadow-2xl`}
       style={{ borderColor: accent }}>
       {text}
@@ -30,48 +130,70 @@ function Caption({ text, accent, top }) {
   );
 }
 
-export const DemoPlayer = ({ steps, src, narrationMode = "both", brand = {}, initialStep = 0, onStepChange, onEvent, chapters = false, shareUrl, globalKeys = false }) => {
-  const [idx, setIdx] = useState(Math.min(initialStep, Math.max(steps.length - 1, 0)));
+const remembered = (key, fallback) => {
+  try { const v = sessionStorage.getItem(key); return v == null ? fallback : v === "1"; } catch { return fallback; }
+};
+
+export const DemoPlayer = ({ steps, src, narrationMode = "both", brand = {}, initialStep = 0, onStepChange, onEvent, onDwell, chapters = false, shareUrl, globalKeys = false, cta, guided = false, autoplay = false, startMuted = false, onCta }) => {
+  const [branch, setBranch] = useState("");
+  const visible = steps.filter((s) => !s.branch || s.branch === branch);
+  const [idx, setIdx] = useState(Math.min(initialStep, Math.max(visible.length - 1, 0)));
   const [playing, setPlaying] = useState(false);
-  const [muted, setMuted] = useState(false);
+  const [muted, setMuted] = useState(() => startMuted || remembered("fc_muted", false));
+  const [captionsOn, setCaptionsOn] = useState(() => remembered("fc_cc", true));
+  const [rate, setRate] = useState(1);
   const audioRef = useRef(null);
   const boxRef = useRef(null);
   const accent = brand.accent || "#6366F1";
-  const showCaption = narrationMode !== "voiceover";
+  const showCaption = narrationMode !== "voiceover" && captionsOn;
   const withAudio = narrationMode !== "captions";
-  const step = steps[idx];
+  const step = visible[idx];
+  const choices = step?.choices || [];
+  const hold = (guided && step?.hotspot && ["click", "hover", "type"].includes(step?.action)) || choices.length > 0;
+  const [mobile, setMobile] = useState(false);
+  const entered = useRef(Date.now());
 
   const go = useCallback((i) => {
-    if (!steps.length) return;
-    const n = Math.max(0, Math.min(steps.length - 1, i));
+    if (!visible.length) return;
+    const n = Math.max(0, Math.min(visible.length - 1, i));
     setIdx(n);
     onStepChange?.(n);
-  }, [steps.length, onStepChange]);
+  }, [visible.length, onStepChange]);
 
-  useEffect(() => { if (initialStep !== undefined) setIdx(Math.min(initialStep, Math.max(steps.length - 1, 0))); }, [initialStep, steps.length]);
+  useEffect(() => { if (initialStep !== undefined) setIdx(Math.min(initialStep, Math.max(visible.length - 1, 0))); }, [initialStep, visible.length]);
+  useEffect(() => { if (autoplay) setPlaying(true); }, [autoplay]);
+  useEffect(() => { try { sessionStorage.setItem("fc_muted", muted ? "1" : "0"); } catch { /* private mode */ } }, [muted]);
+  useEffect(() => { try { sessionStorage.setItem("fc_cc", captionsOn ? "1" : "0"); } catch { /* private mode */ } }, [captionsOn]);
+
+  useEffect(() => {
+    entered.current = Date.now();
+    return () => onDwell?.(idx, Date.now() - entered.current);
+  }, [idx]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     if (!playing || !step) return;
     const audio = audioRef.current;
     if (withAudio && hasAudio(step) && audio && !muted) {
       audio.src = src(step, "audio");
+      audio.playbackRate = rate;
       audio.play().catch(() => {});
     }
+    if (hold) return () => { audio?.pause(); };
     const t = setTimeout(() => {
-      if (idx < steps.length - 1) go(idx + 1);
+      if (idx < visible.length - 1) go(idx + 1);
       else { setPlaying(false); onEvent?.("complete", idx); }
-    }, stepMs(step, withAudio && hasAudio(step)));
+    }, sceneMs(step, withAudio && hasAudio(step)) / rate);
     return () => { clearTimeout(t); audio?.pause(); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [playing, idx, muted]);
+  }, [playing, idx, muted, rate, hold, visible.length]);
 
   useEffect(() => {
-    const next = steps[idx + 1];
+    const next = visible[idx + 1];
     if (next && hasShot(next)) new Image().src = src(next, "screenshot");
     if (next && withAudio && hasAudio(next)) { const a = new Audio(); a.preload = "auto"; a.src = src(next, "audio"); }
     if (step) onEvent?.("step", idx);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [idx, steps]);
+  }, [idx, visible]);
 
   const onKey = (e) => {
     if (["INPUT", "TEXTAREA", "SELECT"].includes(e.target.tagName) || e.metaKey || e.ctrlKey) return;
@@ -91,7 +213,15 @@ export const DemoPlayer = ({ steps, src, narrationMode = "both", brand = {}, ini
     return () => window.removeEventListener("keydown", h);
   }, [globalKeys]);
 
-  if (!steps.length) {
+  const pickBranch = (option) => {
+    onEvent?.("branch", idx, option.branch);
+    const next = steps.filter((s) => !s.branch || s.branch === option.branch);
+    setBranch(option.branch);
+    setIdx(Math.min(idx + 1, Math.max(next.length - 1, 0)));
+    setPlaying(true);
+  };
+
+  if (!visible.length) {
     return <div className="aspect-[16/10] rounded-xl border border-dashed border-slate-700 grid place-items-center text-sm text-slate-500" data-testid="player-empty">No steps yet</div>;
   }
 
@@ -99,25 +229,26 @@ export const DemoPlayer = ({ steps, src, narrationMode = "both", brand = {}, ini
     <div className="space-y-3">
       <div ref={boxRef} tabIndex={0} onKeyDown={onKey} aria-label="Demo player. Space to play, arrows to navigate"
         className="relative aspect-[16/10] rounded-xl overflow-hidden border border-slate-800 bg-slate-950 focus:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500 group" data-testid="demo-player">
-        <AnimatePresence mode="popLayout" initial={false}>
-          {hasShot(step) ? (
-            <motion.img key={`${step.id}-${src(step, "screenshot")}`} src={src(step, "screenshot")} alt={step.caption || "Demo step"}
-              initial={{ opacity: step.transition === "fade" ? 0 : 1 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
-              transition={{ duration: (step.transition === "fade" ? step.transition_ms || 400 : 0) / 1000 }}
-              className="absolute inset-0 h-full w-full object-cover object-top" data-testid="player-frame" />
-          ) : (
-            <motion.div key={step.id} initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="absolute inset-0 grid place-items-center grid-bg">
-              <div className="text-center px-6 mt-32">
-                <p className="font-mono text-[10px] uppercase tracking-widest text-cyan-400">{ACTION_LABEL[step.action]} · not recorded yet</p>
-                <p className="mt-2 text-slate-400 text-sm">{step.selector || step.url || ""}</p>
-              </div>
-            </motion.div>
-          )}
-        </AnimatePresence>
+        <Stage step={step} mobile={mobile} fade={fadeSec(step)} playing={playing} src={src} />
         {hasShot(step) && ["click", "hover", "type"].includes(step.action) && <Hotspot box={step.hotspot} accent={accent} onClick={() => go(idx + 1)} />}
+        {choices.length > 0 && (
+          <div className="absolute bottom-16 left-1/2 -translate-x-1/2 flex gap-2" data-testid="player-choices">
+            {choices.map((option) => (
+              <button key={option.branch} onClick={() => pickBranch(option)} className="rounded-lg px-3 py-2 text-sm font-semibold text-white" style={{ background: accent }} data-testid={`player-choice-${option.branch}`}>{option.label}</button>
+            ))}
+          </div>
+        )}
+        {(step.annotations || []).map((ann, i) => (
+          <span key={i} className="pointer-events-none absolute" style={{ left: `${(ann.x / 1280) * 100}%`, top: `${(ann.y / 800) * 100}%`, width: ann.w ? `${(ann.w / 1280) * 100}%` : 12, height: ann.h ? `${(ann.h / 800) * 100}%` : 18, background: ann.kind === "blur" ? "rgba(15,23,42,0.72)" : "transparent", borderBottom: ann.kind === "arrow" ? `2px solid ${accent}` : undefined, boxShadow: ann.kind === "hover" ? `0 0 0 8px ${accent}55` : undefined, outline: ["highlight", "callout", "hover"].includes(ann.kind) ? `2px solid ${accent}` : undefined, borderRadius: ["highlight", "callout", "hover"].includes(ann.kind) ? 12 : undefined }} data-testid={ann.kind === "callout" ? "player-callout" : `player-annotation-${i}`}>
+            {ann.kind === "callout" && ann.text && <span className="absolute -top-7 left-0 whitespace-nowrap rounded-md px-2 py-1 text-xs font-semibold text-white" style={{ background: accent }}>{ann.text}</span>}
+          </span>
+        ))}
         {showCaption && <Caption text={step.caption} accent={accent} top={brand.caption_position === "top"} />}
+        {cta?.url && idx === visible.length - 1 && choices.length === 0 && (
+          <a href={cta.url} onClick={() => onCta?.(idx)} className="absolute bottom-16 left-1/2 -translate-x-1/2 rounded-lg px-4 py-2 text-sm font-semibold text-white" style={{ background: accent }} data-testid="player-cta">{cta.label || "Continue"}</a>
+        )}
         {brand.watermark !== false && (
-          <span className="absolute top-3 right-3 rounded-md bg-slate-950/70 backdrop-blur px-2 py-1 text-[10px] font-mono text-slate-300" data-testid="player-watermark">Made with Flowcast</span>
+          <span className="absolute top-3 right-3 rounded-md bg-slate-950/70 backdrop-blur px-2 py-1 text-[10px] font-mono text-slate-300" data-testid="player-watermark">Made with AppShowcase</span>
         )}
         <button onClick={() => setPlaying((p) => !p)} aria-label={playing ? "Pause" : "Play"} data-testid="player-overlay-play"
           className={`absolute inset-0 grid place-items-center transition-opacity ${playing ? "opacity-0" : "opacity-100 bg-slate-950/30"}`}>
@@ -125,21 +256,27 @@ export const DemoPlayer = ({ steps, src, narrationMode = "both", brand = {}, ini
         </button>
       </div>
       <div className="flex gap-1" aria-hidden="true">
-        {steps.map((s, i) => (
+        {visible.map((s, i) => (
           <button key={s.id} onClick={() => go(i)} tabIndex={-1} className="h-1.5 flex-1 rounded-full transition-colors" style={{ background: i <= idx ? accent : "rgb(30 41 59)" }} data-testid={`player-segment-${i}`} />
         ))}
       </div>
-      <div className="flex items-center justify-between gap-2">
+      <div className="player-dock flex items-center justify-between gap-2">
         <div className="flex items-center gap-1">
           <button onClick={() => go(idx - 1)} aria-label="Previous step" className="h-9 w-9 rounded-lg hover:bg-slate-800 grid place-items-center" data-testid="player-prev-button"><ChevronLeft className="h-4 w-4" /></button>
           <button onClick={() => setPlaying((p) => !p)} aria-label={playing ? "Pause" : "Play"} className="h-9 w-9 rounded-lg bg-slate-800 hover:bg-slate-700 grid place-items-center" data-testid="player-play-button">
             {playing ? <Pause className="h-4 w-4" /> : <Play className="h-4 w-4" />}
           </button>
           <button onClick={() => go(idx + 1)} aria-label="Next step" className="h-9 w-9 rounded-lg hover:bg-slate-800 grid place-items-center" data-testid="player-next-button"><ChevronRight className="h-4 w-4" /></button>
-          <span className="font-mono text-xs text-slate-400 ml-2" data-testid="player-step-counter">{idx + 1} / {steps.length}</span>
+          <span className="font-mono text-xs text-slate-400 ml-2" data-testid="player-step-counter">{idx + 1} / {visible.length}</span>
+          {withAudio && !hasAudio(step) && <span className="hidden sm:inline text-[10px] text-slate-500" data-testid="player-no-audio">No voice on this step</span>}
         </div>
         <div className="flex items-center gap-1">
           {step.action && <span className="hidden sm:flex items-center gap-1 font-mono text-[10px] uppercase text-slate-500 mr-2"><MousePointerClick className="h-3 w-3" />{ACTION_LABEL[step.action]}</span>}
+          {visible.some((s) => s.has_mobile || s.screenshot_mobile_path) && (
+            <button onClick={() => setMobile((m) => !m)} className="h-9 px-2 rounded-lg hover:bg-slate-800 text-xs" data-testid="player-viewport-toggle">{mobile ? "Phone" : "Desktop"}</button>
+          )}
+          <button onClick={() => setRate((r) => (r === 1 ? 1.5 : r === 1.5 ? 2 : 1))} className="h-9 px-2 rounded-lg hover:bg-slate-800 text-xs font-mono" data-testid="player-speed-button">{rate}x</button>
+          <button onClick={() => setCaptionsOn((c) => !c)} aria-pressed={captionsOn} className={`h-9 px-2 rounded-lg text-xs font-semibold ${captionsOn ? "bg-slate-800" : "text-slate-500"}`} data-testid="player-captions-button">CC</button>
           <button onClick={() => setMuted((m) => !m)} aria-label={muted ? "Unmute" : "Mute"} className="h-9 w-9 rounded-lg hover:bg-slate-800 grid place-items-center" data-testid="player-mute-button">
             {muted ? <VolumeX className="h-4 w-4" /> : <Volume2 className="h-4 w-4" />}
           </button>
@@ -148,10 +285,10 @@ export const DemoPlayer = ({ steps, src, narrationMode = "both", brand = {}, ini
       </div>
       {chapters && (
         <ol className="grid sm:grid-cols-2 gap-2 pt-2" data-testid="player-chapters">
-          {steps.map((s, i) => (
+          {visible.map((s, i) => (
             <li key={s.id} className={`flex items-center gap-2 rounded-lg border px-3 py-2 text-sm cursor-pointer transition-colors ${i === idx ? "border-indigo-500/50 bg-indigo-500/10" : "border-slate-800 hover:border-slate-700"}`} onClick={() => go(i)} data-testid={`chapter-${i}`}>
               <span className="font-mono text-xs text-slate-500 w-5">{String(i + 1).padStart(2, "0")}</span>
-              <span className="flex-1 truncate">{s.caption || ACTION_LABEL[s.action]}</span>
+              <span className="flex-1 truncate">{s.chapter ? `${s.chapter} · ` : ""}{s.caption || ACTION_LABEL[s.action]}</span>
               {shareUrl && (
                 <button aria-label={`Copy link to step ${i + 1}`} onClick={(e) => { e.stopPropagation(); navigator.clipboard.writeText(`${shareUrl}?step=${i + 1}`); }} className="text-slate-500 hover:text-white" data-testid={`chapter-copy-${i}`}>
                   <Link2 className="h-3.5 w-3.5" />

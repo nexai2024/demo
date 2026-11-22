@@ -1,16 +1,20 @@
 import "@/App.css";
-import { BrowserRouter, Navigate, Route, Routes, useLocation } from "react-router-dom";
+import { BrowserRouter, Navigate, Route, Routes } from "react-router-dom";
 import { Toaster } from "sonner";
 import { AuthProvider, useAuth } from "@/context/AuthContext";
 import { lazy, Suspense } from "react";
-import AuthCallback from "@/pages/AuthCallback";
-
 const AuthPage = lazy(() => import("@/pages/AuthPage"));
 const Dashboard = lazy(() => import("@/pages/Dashboard"));
 const Studio = lazy(() => import("@/pages/Studio"));
 const Settings = lazy(() => import("@/pages/Settings"));
 const SharePage = lazy(() => import("@/pages/SharePage"));
+const ProductPage = lazy(() => import("@/pages/ProductPage"));
+const ReviewPage = lazy(() => import("@/pages/ReviewPage"));
+const HelpPage = lazy(() => import("@/pages/HelpPage"));
+const LandingPage = lazy(() => import("@/pages/LandingPage"));
 import { Loader2 } from "lucide-react";
+import { ActivityDock } from "@/components/ActivityDock";
+import { ErrorBoundary } from "@/components/ErrorBoundary";
 
 const Splash = () => (
   <div className="min-h-screen grid place-items-center" data-testid="app-loading">
@@ -25,19 +29,27 @@ function Protected({ children }) {
   return children;
 }
 
+function ActivityGate() {
+  const { user } = useAuth();
+  if (!user) return null;
+  return <ActivityDock />;
+}
+
 function AppRouter() {
-  const location = useLocation();
-  if (location.hash?.includes("session_id=")) return <AuthCallback />;
   return (
     <Suspense fallback={<Splash />}>
     <Routes>
+      <Route path="/" element={<LandingPage />} />
       <Route path="/login" element={<AuthPage />} />
       <Route path="/share/:shareId" element={<SharePage />} />
+      <Route path="/p/:slug" element={<ProductPage />} />
+      <Route path="/review/:token" element={<ReviewPage />} />
+      <Route path="/help" element={<HelpPage />} />
       <Route path="/embed/:shareId" element={<SharePage embed />} />
       <Route path="/dashboard" element={<Protected><Dashboard /></Protected>} />
       <Route path="/projects/:pid" element={<Protected><Studio /></Protected>} />
       <Route path="/settings" element={<Protected><Settings /></Protected>} />
-      <Route path="*" element={<Navigate to="/dashboard" replace />} />
+      <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>
     </Suspense>
   );
@@ -45,12 +57,15 @@ function AppRouter() {
 
 export default function App() {
   return (
-    <div className="App grain">
+    <div className="App grain studio-root">
       <BrowserRouter>
-        <AuthProvider>
-          <AppRouter />
-          <Toaster theme="dark" position="bottom-right" richColors />
-        </AuthProvider>
+        <ErrorBoundary>
+          <AuthProvider>
+            <AppRouter />
+            <ActivityGate />
+            <Toaster theme="dark" position="bottom-right" richColors closeButton />
+          </AuthProvider>
+        </ErrorBoundary>
       </BrowserRouter>
     </div>
   );
