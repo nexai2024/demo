@@ -223,9 +223,13 @@ async def _drop_browser(session: _Session) -> None:
 
 
 async def _connect(session: _Session) -> None:
+    import netpolicy
+    await netpolicy.validate_url(session.start_url)
     session.playwright = await _playwright()().start()
     session.browser = await session.playwright.chromium.connect_over_cdp(_ws_url(), timeout=45000)
-    session.page = await (await session.browser.new_context(viewport=VIEWPORT, device_scale_factor=1)).new_page()
+    context = await session.browser.new_context(viewport=VIEWPORT, device_scale_factor=1)
+    await netpolicy.install_browser_guard(context)
+    session.page = await context.new_page()
     session.opened = time.monotonic()
 
 

@@ -27,8 +27,19 @@ def test_dev_secret_is_random_not_a_known_default():
     assert core._secret() != "local-dev-jwt-secret"
 
 
+def test_production_accepts_safe_config(monkeypatch):
+    monkeypatch.setenv("APP_ENV", "production")
+    monkeypatch.setenv("JWT_SECRET", "k9X2pQ7mR4vL8nT1wZ5cB3jF6hD0yG9a")
+    monkeypatch.setenv("VAULT_MASTER_KEY", "M3nP8qR2tV6wX1zC5bN7kJ4hF9gD0sA2")
+    monkeypatch.setenv("CORS_ORIGINS", "https://app.example.com/")
+    monkeypatch.setenv("S3_BUCKET", "flowcast-prod-media")
+    monkeypatch.setattr(core, "DB_BACKEND", "mongodb")
+    core.validate_config()
+    assert core.cors_origins() == ["https://app.example.com"]
+
+
 def test_tokens_are_type_scoped(monkeypatch):
-    monkeypatch.setenv("JWT_SECRET", "s" * 40)
+    monkeypatch.setenv("JWT_SECRET", "k9X2pQ7mR4vL8nT1wZ5cB3jF6hD0yG9a")
     assert core.decode_review_token(core.create_viewer_token("p1")) is None
     assert core.decode_review_token(core.create_review_token("p1")) == "p1"
     assert core.decode_viewer_token("garbage") is None
@@ -36,18 +47,13 @@ def test_tokens_are_type_scoped(monkeypatch):
 
 def test_production_rejects_wildcard_cors(monkeypatch):
     monkeypatch.setenv("APP_ENV", "production")
-    monkeypatch.setenv("JWT_SECRET", "s" * 40)
+    monkeypatch.setenv("JWT_SECRET", "k9X2pQ7mR4vL8nT1wZ5cB3jF6hD0yG9a")
+    monkeypatch.setenv("VAULT_MASTER_KEY", "M3nP8qR2tV6wX1zC5bN7kJ4hF9gD0sA2")
     monkeypatch.setenv("CORS_ORIGINS", "*")
+    monkeypatch.setenv("S3_BUCKET", "flowcast-prod-media")
+    monkeypatch.setattr(core, "DB_BACKEND", "mongodb")
     with pytest.raises(RuntimeError):
         core.validate_config()
-
-
-def test_production_accepts_safe_config(monkeypatch):
-    monkeypatch.setenv("APP_ENV", "production")
-    monkeypatch.setenv("JWT_SECRET", "s" * 40)
-    monkeypatch.setenv("CORS_ORIGINS", "https://app.example.com/")
-    core.validate_config()
-    assert core.cors_origins() == ["https://app.example.com"]
 
 
 def test_short_jwt_secret_is_flagged(monkeypatch):

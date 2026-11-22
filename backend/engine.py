@@ -2,6 +2,8 @@ import os
 import time
 from typing import Awaitable, Callable
 
+import netpolicy
+
 
 def _playwright():
     try:
@@ -138,6 +140,7 @@ async def _perform(page, step: dict, capture: bool, pace: str = "show"):
     box, pre_shot = None, None
     step["resolved_selector"] = None
     if a == "goto":
+        await netpolicy.validate_url(step["url"])
         await page.goto(step["url"], wait_until="domcontentloaded", timeout=30000)
         try:
             await page.wait_for_load_state("networkidle", timeout=6000)
@@ -183,6 +186,7 @@ async def _sign_in(page, login: dict | None) -> None:
     if not login or not (login.get("url") or login.get("recipe")):
         return
     if login.get("url"):
+        await netpolicy.validate_url(login["url"])
         await page.goto(login["url"], wait_until="domcontentloaded", timeout=30000)
     recipe = [step for step in (login.get("recipe") or []) if step.get("action")]
     if recipe:
@@ -205,6 +209,7 @@ async def _connect_page(playwright, viewport: dict | None, storage_state: dict |
     if storage_state:
         kwargs["storage_state"] = storage_state
     context = await browser.new_context(**kwargs)
+    await netpolicy.install_browser_guard(context)
     return browser, context, await context.new_page()
 
 
@@ -305,6 +310,7 @@ async def read_page(url: str) -> dict:
 async def inspect_after(start_url: str, steps: list, login: dict | None = None, scroll: int = 0,
                         storage_state: dict | None = None) -> dict:
     """Open the target, replay steps, then list the elements visible on that screen."""
+    await netpolicy.validate_url(start_url)
     async with _playwright()() as p:
         browser, _, page = await _connect_page(p, VIEWPORT, storage_state)
         try:
@@ -347,6 +353,8 @@ async def capture_storage(login: dict) -> dict:
 
 async def score_script(start_url: str, steps: list, login: dict | None = None, storage_state: dict | None = None) -> list:
     """Replay a script without saving frames. Each selector is found, ambiguous, or missing."""
+    if start_url:
+        await netpolicy.validate_url(start_url)
     results = []
     async with _playwright()() as p:
         browser, _, page = await _connect_page(p, VIEWPORT, storage_state)

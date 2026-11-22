@@ -31,12 +31,16 @@ except ImportError:
 from auth_routes import router as auth_router, seed_admin
 from datetime import datetime, timedelta, timezone
 
+import copy
 from core import (DB_BACKEND, DuplicateKeyError, cors_origins, create_viewer_token, db, validate_config, decode_viewer_token, get_current_user, hash_password, new_id,
                   now, now_iso, verify_password)
 import cinematic
+import jobs
+import netpolicy
 from product import (VIEWPORTS, apply_track, environment_base, estimate_seconds, parse_playwright, prepare_step,
                      public_view, publish_diff, speak, substitute, transcript)
-from storage import APP_NAME, get_object, init_storage, put_object, status as storage_status
+from storage import APP_NAME, StorageError, get_object, init_storage, put_object, status as storage_status
+import vault
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -47,10 +51,13 @@ async def ensure_indexes() -> None:
     await db.projects.create_index("id", unique=True)
     await db.projects.create_index([("user_id", 1), ("updated_at", -1)])
     await db.runs.create_index("id", unique=True)
+    await db.runs.create_index([("status", 1), ("started_at", 1)])
     await db.runs.create_index([("project_id", 1), ("started_at", -1)])
     await db.cron_runs.create_index("run_id", unique=True)
     await db.analytics_events.create_index([("project_id", 1), ("created_at", -1)])
     await db.login_attempts.create_index("identifier", unique=True)
+    await db["quota_counters"].create_index("id", unique=True)
+    await db["quota_reservations"].create_index("id", unique=True)
 
 
 app = FastAPI()
@@ -60,10 +67,16 @@ app = FastAPI()
 async def ai_unavailable_handler(request: Request, exc):
     from fastapi.responses import JSONResponse
     return JSONResponse(status_code=503, content={"detail": str(exc), "code": getattr(exc, "code", "ai_error")})
+
+
+@app.exception_handler(StorageError)
+async def storage_error_handler(request: Request, exc):
+    from fastapi.responses import JSONResponse
+    return JSONResponse(status_code=503, content={"detail": str(exc), "code": "storage_unavailable"})
+
+
 api = APIRouter(prefix="/api")
 TASKS: set = set()
-ACTIVE_RUNS: set = set()
-CANCELLED: set = set()
 MONTHLY_LIMIT = int(os.environ.get("MONTHLY_RECORDING_LIMIT", "20"))
 DEFAULT_BRAND = {"accent": "#6366F1", "caption_position": "bottom", "watermark": True, "zoom": True}
 
@@ -255,11 +268,14 @@ async def get_project(pid: str, user: dict) -> dict:
     if not p:
         raise HTTPException(404, "Project not found")
     p["has_share_password"] = bool(p.pop("share_password_hash", None))
-    login = dict(p.get("login") or {})
-    p["has_login"] = bool(login.get("password") or login.get("username") or login.get("recipe"))
-    p["has_storage"] = bool(login.pop("storage_state", None))
-    login.pop("password", None)
-    p["login"] = login
+    raw_login = dict(p.get("login") or {})
+    flags = vault.login_flags(raw_login)
+    p["has_login"] = bool(flags["has_password"] or raw_login.get("username") or raw_login.get("recipe"))
+    p["has_storage"] = flags["has_storage"]
+    p["credential_expired"] = flags["credential_expired"]
+    p["storage_expired"] = flags["storage_expired"]
+    p["login"] = vault.owner_login_view(raw_login, pid)
+    p["steps"] = vault.mask_steps(p.get("steps") or [])
     published = p.pop("published", None) or {}
     p["published_at"] = published.get("published_at")
     p["publish_diff"] = publish_diff(p.get("steps") or [], published.get("steps") or [])
@@ -275,13 +291,13 @@ async def get_project(pid: str, user: dict) -> dict:
 def ai_error(exc: Exception) -> str:
     msg = str(exc)
     if "Budget has been exceeded" in msg or "budget" in msg.lower():
-        return "Your AI balance is used up. Top up under Profile → Manage plan → Universal Key → Add Balance."
+        return "Your OpenAI account is out of credit. Add billing or raise the spend limit, then retry."
     return msg[:160]
 
 
 async def log_history(project: dict, event: str, detail: str = "", snapshot: bool = False) -> None:
     doc = {"id": new_id("h_"), "project_id": project["id"], "event": event, "detail": detail,
-           "created_at": now_iso(), "steps": project.get("steps") if snapshot else None}
+           "created_at": now_iso(), "steps": vault.redact_steps(project.get("steps")) if snapshot else None}
     await db.history.insert_one(doc)
 
 
@@ -295,73 +311,23 @@ def spawn(coro) -> None:
     task.add_done_callback(TASKS.discard)
 
 
-async def new_run(project: dict, kind: str, total: int, message: str) -> dict:
-    run = {"id": new_id("run_"), "project_id": project["id"], "user_id": project["user_id"], "kind": kind,
-           "status": "running", "total": total, "current": 0, "message": message,
-           "logs": [{"t": now_iso(), "level": "info", "msg": message}], "result": None,
-           "started_at": now_iso(), "finished_at": None, "heartbeat_at": now_iso(), "owner": INSTANCE_ID}
-    await db.runs.insert_one(dict(run))
-    ACTIVE_RUNS.add(run["id"])
-    await touch(project["id"], {"active_run_id": run["id"]})
-    run.pop("_id", None)
-    return run
-
-
-INSTANCE_ID = new_id("srv_")
-RUN_STALE_SECONDS = int(os.environ.get("RUN_STALE_SECONDS", "150"))
-
-
-async def reap_stale_runs() -> int:
-    """Fail only runs whose owner stopped heartbeating, so a restart or another healthy
-    instance never kills each other's in-flight jobs."""
-    reaped = 0
-    for run in await db.runs.find({"status": "running"}, {"_id": 0}).to_list(500):
-        beat = run.get("heartbeat_at") or run.get("started_at")
-        try:
-            age = (now() - datetime.fromisoformat(beat)).total_seconds()
-        except (TypeError, ValueError):
-            age = RUN_STALE_SECONDS + 1
-        if run.get("owner") == INSTANCE_ID or age <= RUN_STALE_SECONDS:
-            continue
-        await db.runs.update_one({"id": run["id"], "status": "running"}, {"$set": {
-            "status": "failed", "message": "Interrupted: the worker stopped responding", "finished_at": now_iso()}})
-        await db.projects.update_one({"id": run["project_id"], "active_run_id": run["id"]}, {"$set": {"active_run_id": None}})
-        reaped += 1
-    return reaped
-
-
-async def reaper_loop() -> None:
-    while True:
-        await asyncio.sleep(max(15, RUN_STALE_SECONDS // 3))
-        try:
-            for run_id in list(ACTIVE_RUNS):  # heartbeat for jobs this instance owns
-                await db.runs.update_one({"id": run_id}, {"$set": {"heartbeat_at": now_iso(), "owner": INSTANCE_ID}})
-            await reap_stale_runs()
-        except Exception as exc:  # never let the loop die
-            logger.warning("reaper: %s", exc)
+INSTANCE_ID = jobs.INSTANCE_ID
 
 
 async def run_log(run_id: str, msg: str, level: str = "info", **fields) -> None:
-    await db.runs.update_one({"id": run_id}, {"$set": {"message": msg, "heartbeat_at": now_iso(), "owner": INSTANCE_ID, **fields},
+    await db.runs.update_one({"id": run_id}, {"$set": {"message": msg, "heartbeat_at": now_iso(),
+                                                       "lease_expires_at": jobs._lease_until(), "owner": INSTANCE_ID, **fields},
                                              "$push": {"logs": {"t": now_iso(), "level": level, "msg": msg}}})
 
 
 async def _post_json(url: str, payload: dict) -> tuple[bool, int, str]:
-    import httpx
-    try:
-        async with httpx.AsyncClient(timeout=8) as client:
-            response = await client.post(url, json=payload)
-        return response.status_code < 400, response.status_code, ""
-    except Exception as exc:
-        return False, 0, str(exc)[:160]
+    return await netpolicy.post_json(url, payload)
 
 
 async def finish_run(run_id: str, pid: str, status: str, msg: str, result=None) -> None:
-    await run_log(run_id, msg, "error" if status == "failed" else "success",
-                  status=status, finished_at=now_iso(), result=result)
-    await touch(pid, {"active_run_id": None})
-    CANCELLED.discard(run_id)
-    ACTIVE_RUNS.discard(run_id)
+    won = await jobs.finalize_run(run_id, pid, status, msg, result=result)
+    if not won:
+        return
     try:
         project = await db.projects.find_one({"id": pid}, {"_id": 0})
         if not project:
@@ -381,7 +347,7 @@ async def finish_run(run_id: str, pid: str, status: str, msg: str, result=None) 
 
 async def ensure_idle(project: dict) -> None:
     rid = project.get("active_run_id")
-    if rid and await db.runs.find_one({"id": rid, "status": "running"}, {"_id": 0}):
+    if rid and await db.runs.find_one({"id": rid, "status": {"$in": ["queued", "running"]}}, {"_id": 0}):
         raise HTTPException(409, "Another job is already running for this project")
 
 
@@ -419,32 +385,58 @@ async def narrated_script(draft: str, target_url: str, elements: list, session_i
 
 
 # ---------- background jobs ----------
+def _collect_secrets(login: dict, steps: list) -> set[str]:
+    found: set[str] = set()
+    if login.get("password"):
+        found.add(str(login["password"]))
+    for s in login.get("recipe") or []:
+        if s.get("action") == "type" and s.get("text"):
+            found.add(str(s["text"]))
+    for s in steps or []:
+        if s.get("sensitive") and s.get("text"):
+            found.add(str(s["text"]))
+    return found
+
+
 async def job_record(project: dict, run_id: str, only_idx: Optional[int], final: bool = True,
                      health: bool = False, only: Optional[set] = None) -> str:
-    pid, steps = project["id"], project["steps"]
-    capture = only if only is not None else (None if only_idx is None else {only_idx})
+    pid = project["id"]
     stored = await db.projects.find_one({"id": pid}, {"_id": 0}) or {}
-    project = {**stored, **project, "steps": steps, "login": stored.get("login") or {}}
-    prepared = [prepare_step(s, project) for s in steps]
+    steps = list(stored.get("steps") or project.get("steps") or [])
+    if only_idx is not None:
+        steps = steps[: only_idx + 1]
+    capture = only if only is not None else (None if only_idx is None else {only_idx})
+    login = vault.open_login(stored.get("login") or {}, pid)
+    opened_steps = [{**s, "text": vault.open_step_text(s, pid)} if s.get("sensitive") else dict(s) for s in steps]
+    secrets_to_scrub = _collect_secrets(login, opened_steps)
+    project = {**stored, **project, "steps": steps, "login": login}
+    prepared = [prepare_step(s, project) for s in opened_steps]
     viewport_name = project.get("viewport") or "desktop"
     viewport = VIEWPORTS["mobile" if viewport_name == "mobile" else "desktop"]
     n = len(steps)
     prev_done = {s["id"] for s in steps if s.get("status") == "done" and s.get("screenshot_path")}
+    done_in_run = await jobs.completed_checkpoint_steps(run_id)
+    if done_in_run and capture is None:
+        capture = {i for i, s in enumerate(steps) if s["id"] not in done_in_run}
+    elif done_in_run and capture is not None:
+        capture = {i for i in capture if i < len(steps) and steps[i]["id"] not in done_in_run}
 
     async def on_progress(i: int, step: dict, state: str, data: dict) -> None:
-        if run_id in CANCELLED:
+        if await jobs.is_cancelled(run_id):
             raise Cancelled()
         if capture is not None and i not in capture:
             if state == "running":
                 await run_log(run_id, f"Replaying step {i + 1}/{n} to reach target: {engine.describe(step)}", current=i + 1)
             elif state == "failed":
-                await run_log(run_id, f"Replay of step {i + 1} failed: {data.get('error')}", "warn")
+                err_txt = vault.scrub(str(data.get("error") or ""), secrets_to_scrub)
+                await run_log(run_id, f"Replay of step {i + 1} failed: {err_txt}", "warn")
             return
         if state == "running":
             await db.projects.update_one({"id": pid, "steps.id": step["id"]}, {"$set": {"steps.$.status": "running"}})
             await run_log(run_id, f"Step {i + 1}/{n}: {engine.describe(step)}...", current=i + 1)
             return
-        upd = {"steps.$.status": state, "steps.$.error": data.get("error"), "steps.$.attempts": data.get("attempts", 1),
+        clean_err = vault.scrub(str(data.get("error")), secrets_to_scrub) if data.get("error") else None
+        upd = {"steps.$.status": state, "steps.$.error": clean_err, "steps.$.attempts": data.get("attempts", 1),
                "steps.$.page_url": data.get("url"), "steps.$.resolved_selector": data.get("resolved_selector"),
                "steps.$.regression": state == "failed" and step["id"] in prev_done}
         keep_old = health and state == "failed" and step["id"] in prev_done
@@ -487,28 +479,31 @@ async def job_record(project: dict, run_id: str, only_idx: Optional[int], final:
                 await touch(pid, {"thumbnail_path": path})
                 project["thumbnail_path"] = path
         await db.projects.update_one({"id": pid, "steps.id": step["id"]}, {"$set": upd})
+        await jobs.record_checkpoint(run_id, step["id"])
         if state == "failed":
-            await run_log(run_id, f"Step {i + 1} failed after {data.get('attempts')} attempts: {data.get('error')}", "error")
+            await run_log(run_id, f"Step {i + 1} failed after {data.get('attempts')} attempts: {clean_err}", "error")
         else:
             await run_log(run_id, f"Step {i + 1}/{n} captured", "success")
 
     try:
-        login = dict(project.get("login") or {})
         storage = login.get("storage_state") or None
 
         async def remember(state: dict) -> None:
             fresh_login = dict((await db.projects.find_one({"id": pid}, {"_id": 0}) or {}).get("login") or {})
             fresh_login["storage_state"] = state
             fresh_login["storage_saved_at"] = now_iso()
-            await touch(pid, {"login": fresh_login})
+            await touch(pid, {"login": vault.seal_login(fresh_login, pid)})
 
-        await engine.run_steps(prepared, on_progress, capture_only=capture, viewport=viewport,
-                               login=None if storage else login, storage_state=storage,
-                               on_storage=None if storage else remember)
+        if capture is None or capture:
+            await engine.run_steps(prepared, on_progress, capture_only=capture, viewport=viewport,
+                                   login=None if storage else login, storage_state=storage,
+                                   on_storage=None if storage else remember)
         if viewport_name == "both" and capture is None:
             mobile: list = []
 
             async def collect(i: int, step: dict, state: str, data: dict) -> None:
+                if await jobs.is_cancelled(run_id):
+                    raise Cancelled()
                 if state == "done" and data.get("screenshot"):
                     mobile.append((step["id"], data["screenshot"]))
 
@@ -558,7 +553,8 @@ async def job_record(project: dict, run_id: str, only_idx: Optional[int], final:
         await db.projects.update_one({"id": pid}, {"$set": {"steps.$[s].status": "failed"}},
                                      array_filters=[{"s.status": "running"}])
         await touch(pid, {"status": "failed"})
-        await finish_run(run_id, pid, "failed", f"Recording failed: {str(exc)[:200]}")
+        clean = vault.scrub(str(exc), secrets_to_scrub)[:200]
+        await finish_run(run_id, pid, "failed", f"Recording failed: {clean}")
         return "failed"
 
 
@@ -583,7 +579,7 @@ async def job_voiceover(project: dict, run_id: str, final: bool = True) -> str:
             todo.append((s, "alt", alt, clip_voice))
     try:
         for i, (s, track, spoken, clip_voice) in enumerate(todo):
-            if run_id in CANCELLED:
+            if await jobs.is_cancelled(run_id):
                 await finish_run(run_id, pid, "cancelled", f"Voiceover cancelled after {i} clip(s)")
                 return "cancelled"
             label = s.get("voiceover_alt") if track == "alt" else s.get("voiceover")
@@ -622,12 +618,13 @@ async def job_autopilot(project: dict, run_id: str) -> None:
             brief = reading.get("brief") or {}
         except Exception as exc:
             await run_log(run_id, f"Page scan skipped: {str(exc)[:120]}", "warn")
-        if run_id in CANCELLED:
+        if await jobs.is_cancelled(run_id):
             raise Cancelled()
         await run_log(run_id, f"Reading the page and writing the narration ({len(elements)} live elements found)...")
         result, steps = await narrated_script(project["draft"], project["target_url"], elements, f"auto_{pid}_{new_id()}", brief)
         if not steps:
             raise ValueError("AI returned no usable steps. Add more detail to your draft.")
+        steps = vault.seal_steps(steps, pid)
         project.update({"steps": steps, "thumbnail_path": None})
         await touch(pid, {"steps": steps, "status": "recording", "thumbnail_path": None})
         await log_history(project, "Generated script with AI", f"{len(steps)} steps (one-click run)", snapshot=True)
@@ -654,14 +651,18 @@ async def refresh_all(cron_run_id: str) -> None:
         return
     projects = await db.projects.find({"auto_refresh": True, "is_deleted": False, "steps.0": {"$exists": True}},
                                       {"_id": 0}).to_list(500)
-    done = 0
+    queued = 0
     for p in projects:
-        if p.get("active_run_id") and await db.runs.find_one({"id": p["active_run_id"], "status": "running"}, {"_id": 0}):
-            continue
-        run = await new_run(p, "health", len(p["steps"]), "Weekly health check: re-recording to catch UI changes...")
-        await job_record(p, run["id"], None, health=True)
-        done += 1
-    await db.cron_runs.update_one({"run_id": cron_run_id}, {"$set": {"finished_at": now_iso(), "projects": done}})
+        try:
+            await jobs.enqueue_run(
+                p, "health", len(p["steps"]),
+                "Weekly health check: re-recording to catch UI changes...",
+                {"action": "record", "only_idx": None, "health": True, "only": None},
+            )
+            queued += 1
+        except HTTPException:
+            continue  # project already has an active run
+    await db.cron_runs.update_one({"run_id": cron_run_id}, {"$set": {"finished_at": now_iso(), "projects": queued}})
 
 
 def fingerprint(project: dict) -> str:
@@ -675,7 +676,8 @@ def fingerprint(project: dict) -> str:
 
 async def job_export(project: dict, run_id: str, fmt: str, preset: str = "standard") -> None:
     pid = project["id"]
-    project = {**project, "export_preset": preset}
+    fresh_proj = await db.projects.find_one({"id": pid}, {"_id": 0}) or project
+    project = {**fresh_proj, "export_preset": preset}
     if project.get("active_track") == "alt":
         project = {**project, "steps": apply_track(project["steps"], "alt")}
     fp = fingerprint(project)
@@ -683,19 +685,87 @@ async def job_export(project: dict, run_id: str, fmt: str, preset: str = "standa
     if cached:
         return await finish_run(run_id, pid, "completed", f"{fmt.upper()} unchanged — reused cached export", result=cached)
     try:
+        if await jobs.is_cancelled(run_id):
+            return await finish_run(run_id, pid, "cancelled", f"{fmt.upper()} export cancelled")
         await run_log(run_id, f"Composing {len(project['steps'])} frames with captions & hotspots...", current=1)
         data = await render.render(project, fmt)
+        if await jobs.is_cancelled(run_id):
+            return await finish_run(run_id, pid, "cancelled", f"{fmt.upper()} export cancelled")
         await run_log(run_id, f"Uploading {fmt.upper()} ({len(data) // 1024} KB)...", current=2)
-        path = await put_object(f"{APP_NAME}/u/{project['user_id']}/{pid}/export_{new_id()}.{fmt}", data,
+        # Deterministic key per (project, format, fingerprint) so retries never duplicate artifacts
+        path = await put_object(f"{APP_NAME}/u/{project['user_id']}/{pid}/export_{fp[:16]}.{fmt}", data,
                                 "image/gif" if fmt == "gif" else "video/mp4")
-        exp = {"id": new_id("ex_"), "format": fmt, "path": path, "size": len(data), "created_at": now_iso(),
-               "fingerprint": fp}
-        await db.projects.update_one({"id": pid}, {"$push": {"exports": exp}, "$set": {"updated_at": now_iso()}})
-        await log_history(project, f"Exported {fmt.upper()}", f"{len(data) // 1024} KB")
+        latest = await db.projects.find_one({"id": pid}, {"_id": 0}) or project
+        existing = next((e for e in latest.get("exports", []) if e.get("fingerprint") == fp and e["format"] == fmt), None)
+        if existing:
+            exp = existing
+        else:
+            exp = {"id": new_id("ex_"), "format": fmt, "path": path, "size": len(data), "created_at": now_iso(),
+                   "fingerprint": fp}
+            await db.projects.update_one({"id": pid}, {"$push": {"exports": exp}, "$set": {"updated_at": now_iso()}})
+            await log_history(project, f"Exported {fmt.upper()}", f"{len(data) // 1024} KB")
         await finish_run(run_id, pid, "completed", f"{fmt.upper()} export ready", result=exp)
     except Exception as exc:
         logger.exception("export job failed")
         await finish_run(run_id, pid, "failed", f"Export failed: {str(exc)[:200]}")
+
+
+async def execute_run(run: dict) -> None:
+    """Execute one claimed durable run and keep its lease renewed until completion."""
+    run_id, pid = run["id"], run["project_id"]
+    spec = run.get("job_spec") or {}
+    action = spec.get("action") or run.get("kind")
+    project = await db.projects.find_one({"id": pid}, {"_id": 0})
+    if not project:
+        await finish_run(run_id, pid, "failed", "Project no longer exists")
+        return
+
+    stop_hb = asyncio.Event()
+
+    async def heartbeat() -> None:
+        interval = max(10, jobs.LEASE_SECONDS // 3)
+        while not stop_hb.is_set():
+            try:
+                await asyncio.wait_for(stop_hb.wait(), timeout=interval)
+            except asyncio.TimeoutError:
+                try:
+                    await jobs.renew_lease(run_id)
+                except Exception as exc:
+                    logger.warning("lease renew failed for %s: %s", run_id, exc)
+
+    hb_task = asyncio.create_task(heartbeat())
+    try:
+        if action == "record":
+            only = set(spec["only"]) if spec.get("only") is not None else None
+            await job_record(project, run_id, spec.get("only_idx"), health=bool(spec.get("health")), only=only)
+        elif action == "autopilot":
+            await job_autopilot(project, run_id)
+        elif action == "voiceover":
+            await job_voiceover(project, run_id)
+        elif action == "export":
+            await job_export(project, run_id, spec.get("format", "mp4"), spec.get("preset", "standard"))
+        else:
+            await finish_run(run_id, pid, "failed", f"Unknown job action: {action}")
+    finally:
+        stop_hb.set()
+        hb_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await hb_task
+
+
+async def worker_loop(poll_seconds: float = 1.0) -> None:
+    """Durable worker loop: claims queued runs and reclaims expired leases from crashed workers."""
+    while True:
+        try:
+            run = await jobs.claim_next_run()
+            if run:
+                await execute_run(run)
+                continue
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("worker loop error: %s", exc)
+        await asyncio.sleep(poll_seconds)
 
 
 # ---------- project routes ----------
@@ -723,11 +793,22 @@ async def list_projects(view: Literal["active", "archived", "trash"] = "active",
     return await db.projects.aggregate(pipeline).to_list(200)
 
 
+def _validate_customer_url(url: str | None, label: str = "URL") -> str:
+    text = (url or "").strip()
+    if not text:
+        return ""
+    try:
+        return netpolicy.validate_url_sync(text).url
+    except netpolicy.DestinationBlocked as exc:
+        raise HTTPException(400, f"Invalid {label}: {exc}")
+
+
 @api.post("/projects")
 async def create_project(body: ProjectIn, user: dict = Depends(get_current_user)):
+    target = _validate_customer_url(body.target_url, "target URL") if body.target_url.strip() else ""
     prefs = user.get("preferences") or {}
     p = {"id": new_id("prj_"), "user_id": user["user_id"], "name": body.name.strip(), "draft": body.draft,
-         "target_url": body.target_url.strip(), "steps": [], "status": "draft",
+         "target_url": target, "steps": [], "status": "draft",
          "voice": prefs.get("voice", "nova"), "narration_mode": prefs.get("narration_mode", "both"),
          "share_id": new_id(), "is_public": False, "thumbnail_path": None, "exports": [], "brand": DEFAULT_BRAND,
          "auto_refresh": False, "health": None, "share_password_hash": None, "share_expires_at": None,
@@ -745,7 +826,19 @@ async def read_project(pid: str, user: dict = Depends(get_current_user)):
 @api.put("/projects/{pid}")
 async def update_project(pid: str, body: ProjectUpdate, user: dict = Depends(get_current_user)):
     p = await get_project(pid, user)
+    raw = await db.projects.find_one({"id": pid}, {"_id": 0}) or {}
     fields = body.model_dump(exclude_none=True, exclude={"clear_login", "login_url", "login_username", "login_password", "cta_label", "cta_url", "login_recipe"})
+    if "target_url" in fields and fields["target_url"].strip():
+        fields["target_url"] = _validate_customer_url(fields["target_url"], "target URL")
+    if "webhook_url" in fields and fields["webhook_url"].strip():
+        fields["webhook_url"] = _validate_customer_url(fields["webhook_url"], "webhook URL")
+    if "notify_url" in fields and fields["notify_url"].strip():
+        fields["notify_url"] = _validate_customer_url(fields["notify_url"], "notification URL")
+    if "environments" in fields and isinstance(fields["environments"], dict):
+        cleaned_envs = {}
+        for env_name, env_url in fields["environments"].items():
+            cleaned_envs[env_name] = _validate_customer_url(env_url, f"{env_name} URL") if str(env_url or "").strip() else ""
+        fields["environments"] = cleaned_envs
     if body.cta_label is not None or body.cta_url is not None:
         cta = dict(p.get("cta") or {})
         if body.cta_label is not None:
@@ -754,34 +847,41 @@ async def update_project(pid: str, body: ProjectUpdate, user: dict = Depends(get
             cta["url"] = body.cta_url
         fields["cta"] = cta
     if body.clear_login or body.login_url is not None or body.login_username is not None or body.login_password:
-        raw = await db.projects.find_one({"id": pid}, {"_id": 0})
-        login = {} if body.clear_login else dict((raw or {}).get("login") or {})
+        login = {} if body.clear_login else dict(raw.get("login") or {})
         if not body.clear_login:
             if body.login_url is not None:
-                login["url"] = body.login_url
+                login["url"] = _validate_customer_url(body.login_url, "login URL") if body.login_url.strip() else ""
             if body.login_username is not None:
                 login["username"] = body.login_username
             if body.login_password:
                 login["password"] = body.login_password
-        fields["login"] = login
+                login["credentials_saved_at"] = now_iso()
+        fields["login"] = vault.seal_login(login, pid)
     if body.login_recipe is not None:
-        raw = await db.projects.find_one({"id": pid}, {"_id": 0})
         login = fields.get("login")
         if login is None:
-            login = {} if body.clear_login else dict((raw or {}).get("login") or {})
-        login["recipe"] = [step.model_dump() for step in body.login_recipe]
-        fields["login"] = login
+            login = {} if body.clear_login else dict(raw.get("login") or {})
+        recipe = [step.model_dump() for step in body.login_recipe]
+        for step in recipe:
+            if step.get("action") == "goto" and step.get("url"):
+                step["url"] = _validate_customer_url(step["url"], "login recipe URL")
+        login["recipe"] = recipe
+        login["credentials_saved_at"] = now_iso()
+        fields["login"] = vault.seal_login(login, pid)
     if body.glossary is not None:
         fields["glossary"] = [item.model_dump() for item in body.glossary]
     if "steps" in fields:
-        stored = {s["id"]: s for s in p["steps"]}
+        stored = {s["id"]: s for s in raw.get("steps") or p["steps"]}
         fields["steps"] = []
         for s in body.steps:
             d = s.model_dump()
+            if d.get("action") == "goto" and d.get("url") and "{{" not in d["url"]:
+                d["url"] = _validate_customer_url(d["url"], "step URL")
             prev = stored.get(d["id"], {})
             for k in SERVER_FIELDS:
                 d[k] = prev.get(k, Step.model_fields[k].default if k in Step.model_fields else None)
             fields["steps"].append(d)
+        fields["steps"] = vault.seal_steps(fields["steps"], pid, existing=raw.get("steps"))
         fields["search_text"] = " ".join(
             " ".join(str(s.get(k) or "") for k in ("caption", "voiceover", "caption_alt", "voiceover_alt", "selector", "url", "error"))
             for s in fields["steps"])[:4000]
@@ -794,11 +894,12 @@ async def update_project(pid: str, body: ProjectUpdate, user: dict = Depends(get
     p.update(fields)
     if "steps" in fields:
         last = await db.history.find_one({"project_id": pid}, {"_id": 0}, sort=[("created_at", -1)])
+        redacted = vault.redact_steps(fields["steps"])
         if last and last["event"] == "Edited timeline" and last["created_at"] > (now() - timedelta(minutes=2)).isoformat():
-            await db.history.update_one({"id": last["id"]}, {"$set": {"steps": fields["steps"], "created_at": now_iso(),
-                                                                     "detail": f"{len(fields['steps'])} steps"}})
+            await db.history.update_one({"id": last["id"]}, {"$set": {"steps": redacted, "created_at": now_iso(),
+                                                                     "detail": f"{len(redacted)} steps"}})
         else:
-            await log_history(p, "Edited timeline", f"{len(fields['steps'])} steps", snapshot=True)
+            await log_history(p, "Edited timeline", f"{len(redacted)} steps", snapshot=True)
     elif "is_public" in fields:
         await log_history(p, "Sharing enabled" if body.is_public else "Sharing disabled")
     return await get_project(pid, user)
@@ -814,13 +915,19 @@ async def delete_project(pid: str, user: dict = Depends(get_current_user)):
 @api.post("/projects/{pid}/duplicate")
 async def duplicate_project(pid: str, user: dict = Depends(get_current_user)):
     p = await get_project(pid, user)
-    p.pop("has_share_password", None)
-    copy = {**p, "id": new_id("prj_"), "name": f"{p['name']} (copy)", "share_id": new_id(), "is_public": False,
-            "share_password_hash": None, "share_expires_at": None, "auto_refresh": False, "health": None,
-            "exports": [], "active_run_id": None, "created_at": now_iso(), "updated_at": now_iso()}
-    await db.projects.insert_one(dict(copy))
-    await log_history(copy, "Duplicated", f"from {p['name']}", snapshot=True)
-    return copy
+    raw = await db.projects.find_one({"id": pid}, {"_id": 0}) or p
+    new_pid = new_id("prj_")
+    resealed = vault.reseal_project(raw, pid, new_pid)
+    copy_doc = {**p, "id": new_pid, "name": f"{p['name']} (copy)", "share_id": new_id(), "is_public": False,
+                "share_password_hash": None, "share_expires_at": None, "auto_refresh": False, "health": None,
+                "exports": [], "active_run_id": None, "published": None, "review_token_jti": None,
+                "login": resealed["login"], "steps": vault.seal_steps(resealed["steps"], new_pid),
+                "created_at": now_iso(), "updated_at": now_iso()}
+    for ephemeral in ("has_share_password", "has_login", "has_storage", "credential_expired", "storage_expired"):
+        copy_doc.pop(ephemeral, None)
+    await db.projects.insert_one(dict(copy_doc))
+    await log_history(copy_doc, "Duplicated", f"from {p['name']}", snapshot=True)
+    return await get_project(new_pid, user)
 
 
 @api.get("/projects/{pid}/history")
@@ -837,11 +944,13 @@ async def project_history(pid: str, user: dict = Depends(get_current_user)):
 @api.post("/projects/{pid}/history/{hid}/restore")
 async def restore_history(pid: str, hid: str, user: dict = Depends(get_current_user)):
     p = await get_project(pid, user)
+    raw = await db.projects.find_one({"id": pid}, {"_id": 0}) or {}
     h = await db.history.find_one({"id": hid, "project_id": pid}, {"_id": 0})
     if not h or not h.get("steps"):
         raise HTTPException(404, "Snapshot not found")
-    await touch(pid, {"steps": h["steps"]})
-    p["steps"] = h["steps"]
+    merged = vault.merge_sensitive(h["steps"], raw.get("steps") or [])
+    await touch(pid, {"steps": merged})
+    p["steps"] = merged
     await log_history(p, "Restored version", h["event"], snapshot=True)
     return await get_project(pid, user)
 
@@ -851,8 +960,7 @@ async def generate(pid: str, user: dict = Depends(get_current_user)):
     p = await get_project(pid, user)
     if len(p["draft"].strip()) < 10:
         raise HTTPException(400, "Write a draft of at least a few words first")
-    if not p["target_url"].startswith(("http://", "https://")):
-        raise HTTPException(400, "Add a valid target URL (starting with http:// or https://)")
+    _validate_customer_url(p["target_url"], "target URL")
     elements, inspected, brief = [], False, {}
     if engine is not None and engine.is_configured():
         try:
@@ -893,24 +1001,12 @@ def month_start() -> str:
 
 
 async def usage_count(user: dict) -> int:
-    return await db.runs.count_documents({"user_id": user["user_id"], "kind": {"$in": ["record", "rerecord", "autopilot"]},
-                                          "started_at": {"$gte": month_start()}})
+    count, _ = await jobs.usage_summary(user["user_id"])
+    return count
 
 
 async def usage_seconds(user: dict) -> int:
-    runs = await db.runs.find({"user_id": user["user_id"], "kind": {"$in": ["record", "rerecord", "autopilot"]},
-                               "started_at": {"$gte": month_start()}}, {"_id": 0}).to_list(500)
-    return sum(int(run.get("seconds") or 0) for run in runs)
-
-
-async def enforce_quota(user: dict, project: dict | None = None) -> int:
-    if await usage_count(user) >= MONTHLY_LIMIT:
-        raise HTTPException(402, f"Monthly limit of {MONTHLY_LIMIT} recordings reached. Upgrade to keep recording.")
-    seconds = estimate_seconds(project) if project else 0
-    cap = MONTHLY_LIMIT * 120
-    used = await usage_seconds(user)
-    if project and used + seconds > cap:
-        raise HTTPException(402, f"This run is about {seconds}s. The monthly browser budget is {cap}s and {used}s is already used.")
+    _, seconds = await jobs.usage_summary(user["user_id"])
     return seconds
 
 
@@ -925,17 +1021,15 @@ async def autopilot(pid: str, user: dict = Depends(get_current_user)):
     _require_browserless()
     if len(p["draft"].strip()) < 10:
         raise HTTPException(400, "Write a draft of at least a few words first")
-    if not p["target_url"].startswith(("http://", "https://")):
-        raise HTTPException(400, "Add a valid target URL (starting with http:// or https://)")
-    await ensure_idle(p)
-    seconds = await enforce_quota(user, p)
-    await touch(pid, {"status": "recording"})
+    _validate_customer_url(p["target_url"], "target URL")
+    seconds = estimate_seconds(p)
     note = "One-click run: script → record → voiceover"
     if seconds > 120:
         note = "One-click run continues in parts because it is longer than a 120s browser session"
-    run = await new_run(p, "autopilot", 3, note)
-    await db.runs.update_one({"id": run["id"]}, {"$set": {"seconds": seconds}})
-    spawn(job_autopilot(p, run["id"]))
+    run = await jobs.enqueue_run(
+        p, "autopilot", 3, note, {"action": "autopilot"}, seconds=seconds, monthly_limit=MONTHLY_LIMIT
+    )
+    await touch(pid, {"status": "recording"})
     return run
 
 
@@ -945,10 +1039,10 @@ async def health_check(pid: str, user: dict = Depends(get_current_user)):
     _require_browserless()
     if not p["steps"]:
         raise HTTPException(400, "Record the demo first")
-    await ensure_idle(p)
-    run = await new_run(p, "health", len(p["steps"]), "Health check: re-recording to catch UI changes...")
-    spawn(job_record(p, run["id"], None, health=True))
-    return run
+    return await jobs.enqueue_run(
+        p, "health", len(p["steps"]), "Health check: re-recording to catch UI changes...",
+        {"action": "record", "only_idx": None, "health": True, "only": None},
+    )
 
 
 @api.put("/projects/{pid}/share-settings")
@@ -968,7 +1062,7 @@ async def share_settings(pid: str, body: ShareSettingsIn, user: dict = Depends(g
 
 @api.post("/cron/refresh-demos")
 async def cron_refresh_demos(request: Request):
-    # Cron endpoints must ack 2xx immediately; enqueue/background the actual work.
+    # Cron endpoints must ack 2xx immediately; enqueue durable runs for workers.
     auth = request.headers.get("Authorization", "")
     cron_secret = os.environ.get("WEBHOOK_CRON_SECRET", "")
     if not cron_secret:
@@ -996,17 +1090,17 @@ async def record(pid: str, user: dict = Depends(get_current_user)):
     _require_browserless()
     if not p["steps"]:
         raise HTTPException(400, "Generate or add steps before recording")
-    await ensure_idle(p)
-    seconds = await enforce_quota(user, p)
-    await db.projects.update_one({"id": pid}, {"$set": {"steps.$[].status": "pending", "steps.$[].error": None,
-                                                       "status": "recording"}})
-    p = await get_project(pid, user)
+    seconds = estimate_seconds(p)
     note = "Launching secure Browserless Chromium session..."
     if seconds > 120:
         note = "This run is longer than one 120s browser session, so it will continue in parts."
-    run = await new_run(p, "record", len(p["steps"]), note)
-    await db.runs.update_one({"id": run["id"]}, {"$set": {"seconds": seconds}})
-    spawn(job_record(p, run["id"], None))
+    run = await jobs.enqueue_run(
+        p, "record", len(p["steps"]), note,
+        {"action": "record", "only_idx": None, "health": False, "only": None},
+        seconds=seconds, monthly_limit=MONTHLY_LIMIT,
+    )
+    await db.projects.update_one({"id": pid}, {"$set": {"steps.$[].status": "pending", "steps.$[].error": None,
+                                                       "status": "recording"}})
     return run
 
 
@@ -1017,13 +1111,12 @@ async def rerecord(pid: str, sid: str, user: dict = Depends(get_current_user)):
     idx = next((i for i, s in enumerate(p["steps"]) if s["id"] == sid), None)
     if idx is None:
         raise HTTPException(404, "Step not found")
-    await ensure_idle(p)
-    seconds = await enforce_quota(user, p)
-    p["steps"] = p["steps"][: idx + 1]
-    run = await new_run(p, "rerecord", idx + 1, f"Re-recording step {idx + 1} (replaying previous steps first)...")
-    await db.runs.update_one({"id": run["id"]}, {"$set": {"seconds": seconds}})
-    spawn(job_record(p, run["id"], idx))
-    return run
+    seconds = estimate_seconds({**p, "steps": p["steps"][: idx + 1]})
+    return await jobs.enqueue_run(
+        p, "rerecord", idx + 1, f"Re-recording step {idx + 1} (replaying previous steps first)...",
+        {"action": "record", "only_idx": idx, "health": False, "only": None},
+        seconds=seconds, monthly_limit=MONTHLY_LIMIT,
+    )
 
 
 @api.post("/projects/{pid}/voiceover")
@@ -1031,10 +1124,10 @@ async def voiceover(pid: str, user: dict = Depends(get_current_user)):
     p = await get_project(pid, user)
     if not any((s.get("voiceover") or s.get("voiceover_alt") or "").strip() for s in p["steps"]):
         raise HTTPException(400, "Add voiceover text to at least one step first")
-    await ensure_idle(p)
-    run = await new_run(p, "voiceover", len(p["steps"]), f"Synthesizing voiceover with voice '{p.get('voice')}'...")
-    spawn(job_voiceover(p, run["id"]))
-    return run
+    return await jobs.enqueue_run(
+        p, "voiceover", len(p["steps"]), f"Synthesizing voiceover with voice '{p.get('voice')}'...",
+        {"action": "voiceover"},
+    )
 
 
 @api.post("/projects/{pid}/export")
@@ -1042,10 +1135,10 @@ async def export(pid: str, body: ExportIn, user: dict = Depends(get_current_user
     p = await get_project(pid, user)
     if not any(s.get("screenshot_path") for s in p["steps"]):
         raise HTTPException(400, "Record the demo before exporting")
-    await ensure_idle(p)
-    run = await new_run(p, "export", 3, f"Rendering {body.format.upper()}...")
-    spawn(job_export(p, run["id"], body.format, body.preset))
-    return run
+    return await jobs.enqueue_run(
+        p, "export", 3, f"Rendering {body.format.upper()}...",
+        {"action": "export", "format": body.format, "preset": body.preset},
+    )
 
 
 @api.get("/runs/{rid}")
@@ -1071,7 +1164,7 @@ async def stream_run(rid: str, request: Request, user: dict = Depends(get_curren
             if payload != last:
                 yield f"data: {payload}\n\n"
                 last = payload
-            if run["status"] != "running":
+            if run["status"] not in ("queued", "running"):
                 break
             await asyncio.sleep(0.5)
     return StreamingResponse(gen(), media_type="text/event-stream",
@@ -1080,13 +1173,7 @@ async def stream_run(rid: str, request: Request, user: dict = Depends(get_curren
 
 @api.post("/runs/{rid}/cancel")
 async def cancel_run(rid: str, user: dict = Depends(get_current_user)):
-    run = await db.runs.find_one({"id": rid, "user_id": user["user_id"]}, {"_id": 0})
-    if not run:
-        raise HTTPException(404, "Run not found")
-    if run["status"] == "running":
-        CANCELLED.add(rid)
-        await run_log(rid, "Cancellation requested — stopping after current step...", "warn")
-    return {"ok": True}
+    return await jobs.request_cancel(rid, user["user_id"])
 
 
 @api.post("/projects/{pid}/rewrite")
@@ -1118,7 +1205,7 @@ async def repair_step(pid: str, sid: str, user: dict = Depends(get_current_user)
         raise HTTPException(400, "Only click, type and hover steps can be repaired")
     step = p["steps"][idx]
     prev_url = next((s.get("page_url") for s in reversed(p["steps"][:idx]) if s.get("page_url")), None)
-    url = step.get("page_url") or prev_url or p["target_url"]
+    url = _validate_customer_url(step.get("page_url") or prev_url or p["target_url"], "page URL")
     blocked = engine.blocked_page(url)
     if blocked:
         raise HTTPException(400, blocked)
@@ -1142,25 +1229,34 @@ async def repair_step(pid: str, sid: str, user: dict = Depends(get_current_user)
 async def rerecord_failed(pid: str, user: dict = Depends(get_current_user)):
     p = await get_project(pid, user)
     _require_browserless()
-    failed = {i for i, s in enumerate(p["steps"]) if s.get("status") == "failed"}
+    failed = sorted(i for i, s in enumerate(p["steps"]) if s.get("status") == "failed")
     if not failed:
         raise HTTPException(400, "No failed steps to re-record")
-    await ensure_idle(p)
-    seconds = await enforce_quota(user, p)
-    run = await new_run(p, "rerecord", max(failed) + 1, f"Re-recording {len(failed)} failed step(s)...")
-    await db.runs.update_one({"id": run["id"]}, {"$set": {"seconds": seconds}})
-    spawn(job_record(p, run["id"], None, only=failed))
-    return run
+    seconds = estimate_seconds(p)
+    return await jobs.enqueue_run(
+        p, "rerecord", max(failed) + 1, f"Re-recording {len(failed)} failed step(s)...",
+        {"action": "record", "only_idx": None, "health": False, "only": failed},
+        seconds=seconds, monthly_limit=MONTHLY_LIMIT,
+    )
 
 
 @api.post("/projects/{pid}/publish")
 async def publish(pid: str, user: dict = Depends(get_current_user)):
     p = await get_project(pid, user)
-    raw = await db.projects.find_one({"id": pid}, {"_id": 0})
-    snap = {"steps": (raw or p)["steps"], "name": p["name"], "brand": p.get("brand"),
-            "narration_mode": p.get("narration_mode"), "cta": p.get("cta"), "published_at": now_iso()}
+    raw = await db.projects.find_one({"id": pid}, {"_id": 0}) or p
+    if not raw.get("steps"):
+        raise HTTPException(400, "Add steps before publishing")
+    snap = {
+        "release_id": new_id("rel_"),
+        "steps": copy.deepcopy(vault.redact_steps(raw["steps"])),
+        "name": p["name"],
+        "brand": copy.deepcopy(p.get("brand")),
+        "narration_mode": p.get("narration_mode"),
+        "cta": copy.deepcopy(p.get("cta")),
+        "published_at": now_iso(),
+    }
     await touch(pid, {"published": snap, "is_public": True})
-    await log_history(p, "Published share", f"{len(snap['steps'])} steps")
+    await log_history(p, "Published share", f"{len(snap['steps'])} steps ({snap['release_id']})")
     return await get_project(pid, user)
 
 
@@ -1175,8 +1271,7 @@ async def project_transcript(pid: str, fmt: Literal["txt", "vtt"] = "txt", user:
 @api.post("/projects/{pid}/changelog")
 async def changelog(pid: str, body: SourceIn, user: dict = Depends(get_current_user)):
     p = await get_project(pid, user)
-    if not p["target_url"].startswith(("http://", "https://")):
-        raise HTTPException(400, "Add a valid target URL first")
+    _validate_customer_url(p["target_url"], "target URL")
     elements, brief = [], {}
     if engine is not None and engine.is_configured():
         try:
@@ -1225,16 +1320,16 @@ async def capture(pid: str, body: CaptureIn, user: dict = Depends(get_current_us
     p = await get_project(pid, user)
     _require_browserless()
     raw = await db.projects.find_one({"id": pid}, {"_id": 0}) or {}
-    project = {**raw, "steps": p["steps"], "login": raw.get("login") or {}}
-    start = environment_base(project) or p["target_url"]
-    if not str(start).startswith(("http://", "https://")):
-        raise HTTPException(400, "Add a target URL first")
-    if body.after > len(p["steps"]):
+    login = vault.open_login(raw.get("login") or {}, pid)
+    opened_steps = [{**s, "text": vault.open_step_text(s, pid)} if s.get("sensitive") else dict(s) for s in raw.get("steps") or p["steps"]]
+    project = {**raw, "steps": opened_steps, "login": login}
+    start = _validate_customer_url(environment_base(project) or p["target_url"], "target URL")
+    if body.after > len(opened_steps):
         raise HTTPException(400, "There are not that many steps to replay")
-    prepared = [prepare_step(step, project) for step in p["steps"][:body.after]]
+    prepared = [prepare_step(step, project) for step in opened_steps[:body.after]]
     try:
-        found = await engine.inspect_after(start, prepared, login=project.get("login"), scroll=body.scroll,
-                                           storage_state=(project.get("login") or {}).get("storage_state"))
+        found = await engine.inspect_after(start, prepared, login=None if login.get("storage_state") else login, scroll=body.scroll,
+                                           storage_state=login.get("storage_state"))
     except Exception as exc:
         raise HTTPException(424, f"Could not open the page: {str(exc)[:180]}")
     return {"url": found["url"], "elements": found["elements"][:40], "after": body.after}
@@ -1248,10 +1343,10 @@ def _live_ready() -> None:
 async def _live_project(pid: str, user: dict) -> tuple[dict, str]:
     p = await get_project(pid, user)
     raw = await db.projects.find_one({"id": pid}, {"_id": 0}) or {}
-    project = {**raw, "steps": p["steps"], "login": raw.get("login") or {}}
-    start = environment_base(project) or p["target_url"]
-    if not str(start).startswith(("http://", "https://")):
-        raise HTTPException(400, "Add a target URL first")
+    login = vault.open_login(raw.get("login") or {}, pid)
+    opened_steps = [{**s, "text": vault.open_step_text(s, pid)} if s.get("sensitive") else dict(s) for s in raw.get("steps") or p["steps"]]
+    project = {**raw, "steps": opened_steps, "login": login}
+    start = _validate_customer_url(environment_base(project) or p["target_url"], "target URL")
     return project, start
 
 
@@ -1411,7 +1506,14 @@ def _motion_response(step: dict | None, index: int) -> Response:
     return paths[index]
 
 
-async def _asset(p: dict, sid: str, kind: str) -> Response:
+def _share_cache_headers(project: dict) -> dict:
+    """Never allow shared/CDN caches to store restricted, expiring, or revocable share assets."""
+    if project.get("share_password_hash") or project.get("share_expires_at"):
+        return {"Cache-Control": "private, no-store", "Pragma": "no-cache", "Vary": "X-Viewer-Token"}
+    return {"Cache-Control": "private, no-cache", "Vary": "X-Viewer-Token"}
+
+
+async def _asset(p: dict, sid: str, kind: str, cache_headers: dict | None = None) -> Response:
     step = next((s for s in p["steps"] if s["id"] == sid), None)
     field = {"screenshot": "screenshot_path", "thumb": "thumb_path", "audio": "audio_path", "mobile": "screenshot_mobile_path"}[kind]
     path = step and (step.get(field) or (step.get("screenshot_path") if kind == "thumb" else None))
@@ -1419,7 +1521,7 @@ async def _asset(p: dict, sid: str, kind: str) -> Response:
         raise HTTPException(404, "Asset not found")
     data, _ = await get_object(path)
     media = "audio/mpeg" if kind == "audio" else ("image/webp" if path.endswith(".webp") else "image/jpeg")
-    return Response(content=data, media_type=media, headers={"Cache-Control": "private, max-age=86400"})
+    return Response(content=data, media_type=media, headers=cache_headers or {"Cache-Control": "private, no-store"})
 
 
 @api.get("/projects/{pid}/steps/{sid}/motion/{index}")
@@ -1513,14 +1615,29 @@ def _tour_key(row: dict):
     return (order if isinstance(order, int) else 50, row.get("name") or "")
 
 
+def _require_published(project: dict) -> dict:
+    view = public_view(project)
+    if not view:
+        raise HTTPException(404, "This demo has not been published yet")
+    return view
+
+
 @api.get("/public/products/{slug}")
 async def public_product(slug: str):
     rows = await db.projects.find({"product_slug": slug, "is_public": True, "is_deleted": False}, {"_id": 0}).to_list(50)
-    rows.sort(key=_tour_key)
-    return {"slug": slug, "demos": [{"name": r.get("name"), "share_id": r.get("share_id"),
+    cutoff = now_iso()
+    published_rows = [
+        r for r in rows
+        if (r.get("published") or {}).get("steps")
+        and (not r.get("share_expires_at") or r["share_expires_at"] >= cutoff)
+    ]
+    published_rows.sort(key=_tour_key)
+    return {"slug": slug, "demos": [{"name": (r.get("published") or {}).get("name") or r.get("name"),
+                                     "share_id": r.get("share_id"),
                                      "tour_order": r.get("tour_order") or 0,
-                                     "step_count": len((r.get("published") or {}).get("steps") or r.get("steps") or []),
-                                     "updated_at": r.get("updated_at")} for r in rows]}
+                                     "step_count": len((r.get("published") or {}).get("steps") or []),
+                                     "updated_at": (r.get("published") or {}).get("published_at") or r.get("updated_at")}
+                                    for r in published_rows]}
 
 
 async def _next_demo(project: dict, share_id: str) -> dict | None:
@@ -1528,6 +1645,9 @@ async def _next_demo(project: dict, share_id: str) -> dict | None:
     if not slug:
         return None
     rows = await db.projects.find({"product_slug": slug, "is_public": True, "is_deleted": False}, {"_id": 0}).to_list(50)
+    cutoff = now_iso()
+    rows = [r for r in rows if (r.get("published") or {}).get("steps")
+            and (not r.get("share_expires_at") or r["share_expires_at"] >= cutoff)]
     rows.sort(key=_tour_key)
     ids = [r.get("share_id") for r in rows]
     if share_id not in ids:
@@ -1535,12 +1655,15 @@ async def _next_demo(project: dict, share_id: str) -> dict | None:
     nxt = ids.index(share_id) + 1
     if nxt >= len(rows):
         return None
-    return {"name": rows[nxt].get("name"), "share_id": rows[nxt].get("share_id")}
+    return {"name": (rows[nxt].get("published") or {}).get("name") or rows[nxt].get("name"), "share_id": rows[nxt].get("share_id")}
 
 
 @api.get("/public/{share_id}")
-async def public_demo(share_id: str, request: Request, track: Optional[Literal["primary", "alt"]] = None):
-    p = public_view(await _public_project(share_id, request))
+async def public_demo(share_id: str, request: Request, response: Response, track: Optional[Literal["primary", "alt"]] = None):
+    raw = await _public_project(share_id, request)
+    p = _require_published(raw)
+    for k, v in _share_cache_headers(raw).items():
+        response.headers[k] = v
     variables = p.get("variables") or {}
     source = apply_track(p["steps"], track or p.get("active_track") or "primary")
     keep = ("id", "action", "caption", "voiceover", "duration_ms", "transition", "transition_ms", "hotspot",
@@ -1562,7 +1685,8 @@ async def public_demo(share_id: str, request: Request, track: Optional[Literal["
     return {"name": p["name"], "narration_mode": p.get("narration_mode", "both"), "steps": steps,
             "brand": brand, "updated_at": p["updated_at"],
             "expires_at": p.get("share_expires_at"), "cta": p.get("cta") or {},
-            "published_at": p.get("published_at"), "product_slug": p.get("product_slug") or "",
+            "published_at": p.get("published_at"), "release_id": p.get("release_id"),
+            "product_slug": p.get("product_slug") or "",
             "guided": bool(p.get("guided")), "tracks": ["primary", "alt"] if has_alt else ["primary"],
             "track": track or p.get("active_track") or "primary",
             "next": await _next_demo(p, share_id)}
@@ -1570,14 +1694,15 @@ async def public_demo(share_id: str, request: Request, track: Optional[Literal["
 
 @api.get("/public/{share_id}/transcript")
 async def public_transcript(share_id: str, request: Request, fmt: Literal["txt", "vtt"] = "vtt"):
-    p = public_view(await _public_project(share_id, request))
+    raw = await _public_project(share_id, request)
+    p = _require_published(raw)
     media = "text/vtt" if fmt == "vtt" else "text/plain"
-    return Response(content=transcript(p, fmt), media_type=f"{media}; charset=utf-8")
+    return Response(content=transcript(p, fmt), media_type=f"{media}; charset=utf-8", headers=_share_cache_headers(raw))
 
 
 @api.post("/public/{share_id}/events")
 async def public_event(share_id: str, body: EventIn, request: Request):
-    p = await _public_project(share_id, request)
+    p = _require_published(await _public_project(share_id, request))
     fields = {"created_at": now_iso()}
     if body.dwell_ms is not None:
         fields["dwell_ms"] = body.dwell_ms
@@ -1600,20 +1725,22 @@ async def public_event(share_id: str, body: EventIn, request: Request):
 
 @api.get("/public/{share_id}/steps/{sid}/motion/{index}")
 async def public_motion(share_id: str, sid: str, index: int, request: Request):
-    project = public_view(await _public_project(share_id, request))
+    raw = await _public_project(share_id, request)
+    project = _require_published(raw)
     step = next((s for s in project["steps"] if s["id"] == sid), None)
     path = _motion_response(step, index)
     data, _ = await get_object(path)
-    return Response(content=data, media_type="image/jpeg", headers={"Cache-Control": "public, max-age=3600"})
+    return Response(content=data, media_type="image/jpeg", headers=_share_cache_headers(raw))
 
 
 @api.get("/public/{share_id}/steps/{sid}/{kind}")
 async def public_asset(share_id: str, sid: str, kind: Literal["screenshot", "thumb", "audio", "mobile"], request: Request,
                        track: Optional[Literal["primary", "alt"]] = None):
-    project = public_view(await _public_project(share_id, request))
+    raw = await _public_project(share_id, request)
+    project = _require_published(raw)
     if kind == "audio" and track == "alt":
         project = {**project, "steps": apply_track(project["steps"], "alt")}
-    return await _asset(project, sid, kind)
+    return await _asset(project, sid, kind, cache_headers=_share_cache_headers(raw))
 
 
 # ---------- settings ----------
@@ -1626,17 +1753,19 @@ async def health():
 @api.get("/ready")
 async def ready():
     """Readiness: dependencies this instance needs are configured and reachable."""
+    st = storage_status()
     checks = {"database": DB_BACKEND, "ai": bool(ai and ai.provider()[2]),
-              "browserless": bool(engine and engine.is_configured())}
+              "browserless": bool(engine and engine.is_configured()),
+              "storage": st.get("mode"), "storage_ok": st.get("mode") in {"s3", "remote", "local"}}
     try:
         await db.runs.find_one({"id": "__ready__"}, {"_id": 0})
         checks["database_ok"] = True
     except Exception as exc:
         checks["database_ok"] = False
         logger.warning("readiness db check failed: %s", exc)
-    status_code = 200 if checks["database_ok"] else 503
+    ok = checks["database_ok"] and checks["storage_ok"]
     from fastapi.responses import JSONResponse
-    return JSONResponse(status_code=status_code, content=checks)
+    return JSONResponse(status_code=200 if ok else 503, content=checks)
 
 
 @api.get("/settings")
@@ -1687,26 +1816,25 @@ app.add_middleware(
     allow_credentials=True,
     allow_origins=cors_origins(),
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=["Content-Type", "Authorization", "X-Requested-With", "X-Webhook-Id"],
+    allow_headers=["Content-Type", "Authorization", "X-Requested-With", "X-Webhook-Id", "X-Viewer-Token"],
 )
 
 
 @app.on_event("startup")
 async def startup():
+    validate_config()
+    await asyncio.to_thread(init_storage)
     app.state.index_task = asyncio.create_task(ensure_indexes())
     await seed_admin()
-    validate_config()
-    await reap_stale_runs()
-    app.state.reaper_task = asyncio.create_task(reaper_loop())
-    try:
-        await asyncio.to_thread(init_storage)
-    except Exception as exc:
-        logger.error("Storage init failed: %s", exc)
+    embedded = os.environ.get("EMBEDDED_WORKER", "true").strip().lower() not in {"0", "false", "no"}
+    app.state.worker_task = asyncio.create_task(worker_loop()) if embedded else None
 
 
 @app.on_event("shutdown")
 async def shutdown():
-    for task in (app.state.index_task, app.state.reaper_task):
+    for task in (getattr(app.state, "index_task", None), getattr(app.state, "worker_task", None)):
+        if task is None:
+            continue
         task.cancel()
         with suppress(asyncio.CancelledError):
             await task

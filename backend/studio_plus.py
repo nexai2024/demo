@@ -8,9 +8,11 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
-from core import create_review_token, db, decode_review_token, get_current_user, new_id, now_iso
-from product import assert_public_url, transcript
+from core import create_review_token, db, decode_review_claims, get_current_user, new_id, now_iso
+import netpolicy
+from product import transcript
 from storage import APP_NAME, get_object, put_object
+import vault
 
 router = APIRouter(prefix="/api")
 
@@ -136,10 +138,15 @@ async def preflight(pid: str, user: dict = Depends(get_current_user)):
     if not project["steps"]:
         raise HTTPException(400, "Add steps before checking selectors")
     raw = await db.projects.find_one({"id": pid}, {"_id": 0}) or {}
-    login = raw.get("login") or {}
+    login = vault.open_login(raw.get("login") or {}, pid)
     start = (project.get("target_url") or "").strip()
     try:
-        rows = await engine.score_script(start, project["steps"], login=None if login.get("storage_state") else login,
+        await netpolicy.validate_url(start)
+    except netpolicy.DestinationBlocked as exc:
+        raise HTTPException(400, str(exc))
+    steps = [{**s, "text": vault.open_step_text(s, pid)} if s.get("sensitive") else s for s in raw.get("steps") or project["steps"]]
+    try:
+        rows = await engine.score_script(start, steps, login=None if login.get("storage_state") else login,
                                          storage_state=login.get("storage_state"))
     except Exception as exc:
         raise HTTPException(424, f"Selector check failed: {str(exc)[:180]}")
@@ -204,17 +211,23 @@ async def save_auth_profile(pid: str, user: dict = Depends(get_current_user)):
     await _owned(pid, user)
     _srv()._require_browserless()
     raw = await db.projects.find_one({"id": pid}, {"_id": 0}) or {}
-    login = dict(raw.get("login") or {})
-    if not login.get("url") and not login.get("recipe"):
+    raw_login = dict(raw.get("login") or {})
+    opened_login = vault.open_login(raw_login, pid)
+    if not opened_login.get("url") and not opened_login.get("recipe"):
         raise HTTPException(400, "Add a login URL or a login recipe first")
+    if opened_login.get("url"):
+        try:
+            await netpolicy.validate_url(opened_login["url"])
+        except netpolicy.DestinationBlocked as exc:
+            raise HTTPException(400, str(exc))
     try:
-        state = await engine.capture_storage(login)
+        state = await engine.capture_storage(opened_login)
     except Exception as exc:
         raise HTTPException(424, f"Could not save the signed-in browser: {str(exc)[:180]}")
-    login["storage_state"] = state
-    login["storage_saved_at"] = now_iso()
-    await _srv().touch(pid, {"login": login})
-    return {"has_storage": True, "saved_at": login["storage_saved_at"]}
+    raw_login["storage_state"] = state
+    raw_login["storage_saved_at"] = now_iso()
+    await _srv().touch(pid, {"login": vault.seal_login(raw_login, pid)})
+    return {"has_storage": True, "saved_at": raw_login["storage_saved_at"]}
 
 
 @router.delete("/projects/{pid}/auth-profile")
@@ -232,15 +245,12 @@ async def clear_auth_profile(pid: str, user: dict = Depends(get_current_user)):
 async def watch_release(pid: str, body: WatchIn, user: dict = Depends(get_current_user)):
     project = await _owned(pid, user)
     try:
-        url = assert_public_url(body.url)
-    except ValueError as exc:
+        response = await netpolicy.fetch(body.url)
+    except netpolicy.DestinationBlocked as exc:
         raise HTTPException(400, str(exc))
-    import httpx
-    try:
-        async with httpx.AsyncClient(timeout=12, follow_redirects=False) as client:
-            response = await client.get(url)
     except Exception as exc:
         raise HTTPException(424, f"Could not read that page: {str(exc)[:140]}")
+    url = body.url.strip()
     if response.status_code in (301, 302, 303, 307, 308):
         raise HTTPException(400, "That page redirects. Paste the final URL.")
     if response.status_code >= 400:
@@ -269,23 +279,34 @@ async def watch_release(pid: str, body: WatchIn, user: dict = Depends(get_curren
 @router.post("/projects/{pid}/review-link")
 async def review_link(pid: str, user: dict = Depends(get_current_user)):
     await _owned(pid, user)
-    token = create_review_token(pid)
+    jti = new_id("rv_")
+    await _srv().touch(pid, {"review_token_jti": jti})
+    token = create_review_token(pid, jti=jti)
     return {"token": token, "path": f"/review/{token}"}
 
 
-def _review_project(token: str) -> dict:
-    pid = decode_review_token(token)
-    if not pid:
+@router.delete("/projects/{pid}/review-link")
+async def revoke_review_link(pid: str, user: dict = Depends(get_current_user)):
+    await _owned(pid, user)
+    await _srv().touch(pid, {"review_token_jti": None})
+    return {"ok": True}
+
+
+async def _review_project(token: str) -> dict:
+    claims = decode_review_claims(token)
+    if not claims:
         raise HTTPException(401, "This review link has expired")
-    return pid
+    pid, jti = claims
+    project = await db.projects.find_one({"id": pid, "is_deleted": False}, {"_id": 0})
+    if not project or not project.get("review_token_jti") or project.get("review_token_jti") != jti:
+        raise HTTPException(401, "This review link has been revoked or expired")
+    return project
 
 
 @router.get("/review/{token}")
 async def review_demo(token: str):
-    pid = _review_project(token)
-    project = await db.projects.find_one({"id": pid, "is_deleted": False}, {"_id": 0})
-    if not project:
-        raise HTTPException(404, "Demo not found")
+    project = await _review_project(token)
+    pid = project["id"]
     keep = ("id", "action", "caption", "voiceover", "duration_ms", "hotspot", "chapter", "annotations", "comments")
     steps = [{k: s.get(k) for k in keep} | {"has_screenshot": bool(s.get("screenshot_path")),
                                             "has_audio": bool(s.get("audio_path")),
@@ -299,17 +320,14 @@ async def review_demo(token: str):
 async def review_asset(token: str, sid: str, kind: str):
     if kind not in {"screenshot", "thumb", "audio"}:
         raise HTTPException(404, "Asset not found")
-    pid = _review_project(token)
-    project = await db.projects.find_one({"id": pid, "is_deleted": False}, {"_id": 0})
-    if not project:
-        raise HTTPException(404, "Demo not found")
-    return await _srv()._asset(project, sid, kind)
+    project = await _review_project(token)
+    return await _srv()._asset(project, sid, kind, cache_headers={"Cache-Control": "private, no-store", "Pragma": "no-cache"})
 
 
 @router.post("/review/{token}/comments")
 async def review_comment(token: str, body: ReviewCommentIn):
-    pid = _review_project(token)
-    project = await db.projects.find_one({"id": pid, "is_deleted": False}, {"_id": 0})
+    project = await _review_project(token)
+    pid = project["id"]
     step = next((s for s in (project or {}).get("steps") or [] if s.get("id") == body.step_id), None)
     if not step:
         raise HTTPException(404, "Step not found")
@@ -321,8 +339,8 @@ async def review_comment(token: str, body: ReviewCommentIn):
 
 @router.post("/review/{token}/approve")
 async def review_approve(token: str):
-    pid = _review_project(token)
-    await db.projects.update_one({"id": pid}, {"$set": {"review_status": "approved", "updated_at": now_iso()}})
+    project = await _review_project(token)
+    await db.projects.update_one({"id": project["id"]}, {"$set": {"review_status": "approved", "updated_at": now_iso()}})
     return {"ok": True}
 
 

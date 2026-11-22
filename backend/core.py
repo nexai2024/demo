@@ -94,6 +94,58 @@ def _verification_secrets() -> list[str]:
     return keys
 
 
+def create_access_token(user_id: str, email: str) -> str:
+    payload = {"sub": user_id, "email": email, "type": "access", "exp": now() + timedelta(minutes=15)}
+    return jwt.encode(payload, _secret(), algorithm=JWT_ALG)
+
+
+def create_refresh_token(user_id: str) -> str:
+    payload = {"sub": user_id, "type": "refresh", "exp": now() + timedelta(days=7)}
+    return jwt.encode(payload, _secret(), algorithm=JWT_ALG)
+
+
+def create_viewer_token(subject: str) -> str:
+    payload = {"sub": subject, "type": "viewer", "exp": now() + timedelta(hours=12)}
+    return jwt.encode(payload, _secret(), algorithm=JWT_ALG)
+
+
+def create_review_token(project_id: str, jti: str | None = None, days: int = 7) -> str:
+    payload = {"sub": project_id, "type": "review", "exp": now() + timedelta(days=days), "jti": jti or new_id("rv_")}
+    return jwt.encode(payload, _secret(), algorithm=JWT_ALG)
+
+
+def _decode(token: str) -> dict | None:
+    if not token:
+        return None
+    for key in _verification_secrets():
+        try:
+            return jwt.decode(token, key, algorithms=[JWT_ALG])
+        except jwt.InvalidTokenError:
+            continue
+    return None
+
+
+def decode_token(token: str, expected: str) -> str | None:
+    payload = _decode(token)
+    return payload["sub"] if payload and payload.get("type") == expected else None
+
+
+def decode_viewer_token(token: str) -> str | None:
+    return decode_token(token, "viewer")
+
+
+def decode_review_token(token: str) -> str | None:
+    return decode_token(token, "review")
+
+
+def decode_review_claims(token: str) -> tuple[str, str] | None:
+    """(project_id, jti) for a valid review token; the jti is checked against the project to support revocation."""
+    claims = _decode(token)
+    if not claims or claims.get("type") != "review" or not claims.get("jti"):
+        return None
+    return claims["sub"], claims["jti"]
+
+
 def cors_origins() -> list[str]:
     raw = os.environ.get("CORS_ORIGINS", "")
     origins = [o.strip().rstrip("/") for o in raw.split(",") if o.strip()]

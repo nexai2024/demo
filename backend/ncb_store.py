@@ -33,6 +33,12 @@ def _match(doc: dict, filt: dict) -> bool:
                 return False
             if "$gte" in expected and (value is None or value < expected["$gte"]):
                 return False
+            if "$lte" in expected and (value is None or value > expected["$lte"]):
+                return False
+            if "$lt" in expected and (value is None or value >= expected["$lt"]):
+                return False
+            if "$gt" in expected and (value is None or value <= expected["$gt"]):
+                return False
             if "$ne" in expected and value == expected["$ne"]:
                 return False
             if "$exists" in expected and (key in doc and value is not None) != bool(expected["$exists"]):
@@ -155,6 +161,12 @@ class _Cursor:
         return [_project(doc, self.projection) for doc in docs[:limit]]
 
 
+class _UpdateResult:
+    def __init__(self, matched: int, modified: int):
+        self.matched_count = matched
+        self.modified_count = modified
+
+
 class Collection:
     def __init__(self, name: str):
         self.name = name
@@ -233,14 +245,15 @@ class Collection:
         docs = await self._filtered(filt, 20)
         if not docs:
             if not upsert:
-                return
+                return _UpdateResult(0, 0)
             doc = {k: v for k, v in filt.items() if not isinstance(v, dict) and "." not in k}
             _apply(doc, update, filt, array_filters, inserting=True)
             await self.insert_one(doc)
-            return
+            return _UpdateResult(0, 1)
         doc = docs[0]
         _apply(doc, update, filt, array_filters, inserting=False)
         await self._save(doc)
+        return _UpdateResult(1, 1)
 
     async def update_many(self, filt: dict, update: dict):
         for doc in await self._filtered(filt, 500):

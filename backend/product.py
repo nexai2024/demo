@@ -168,34 +168,27 @@ def apply_track(steps: list, track: str) -> list:
 
 
 def assert_public_url(url: str) -> str:
-    import ipaddress
-    import socket
-    parsed = urlparse((url or "").strip())
-    host = (parsed.hostname or "").strip("[]").lower()
-    if parsed.scheme not in ("http", "https") or not host:
-        raise ValueError("Use an http or https URL")
-    if host in {"localhost", "metadata.google.internal"} or host.endswith(".local"):
-        raise ValueError("That address is not allowed")
-    try:
-        infos = socket.getaddrinfo(host, None)
-    except socket.gaierror as exc:
-        raise ValueError("Could not resolve that host") from exc
-    for info in infos:
-        ip = ipaddress.ip_address(info[4][0])
-        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
-            raise ValueError("That address is not allowed")
-    return url.strip()
+    """Shared outbound destination check (delegates to netpolicy)."""
+    import netpolicy
+    return netpolicy.validate_url_sync(url).url
 
 
-def public_view(project: dict) -> dict:
+def public_view(project: dict) -> dict | None:
+    """Return an explicit, immutable published release view, or None if not published.
+
+    Never falls back to draft ``project["steps"]`` so unpublished edits cannot leak.
+    """
+    import copy
     published = project.get("published") or {}
-    if published.get("steps"):
-        view = dict(project)
-        view["steps"] = published["steps"]
-        view["name"] = published.get("name") or project.get("name")
-        view["brand"] = published.get("brand") or project.get("brand")
-        view["narration_mode"] = published.get("narration_mode") or project.get("narration_mode")
-        view["cta"] = published.get("cta") or project.get("cta")
-        view["published_at"] = published.get("published_at")
-        return view
-    return project
+    steps = published.get("steps")
+    if not isinstance(steps, list) or not steps:
+        return None
+    view = dict(project)
+    view["steps"] = copy.deepcopy(steps)
+    view["name"] = published.get("name") or project.get("name")
+    view["brand"] = copy.deepcopy(published.get("brand") or project.get("brand"))
+    view["narration_mode"] = published.get("narration_mode") or project.get("narration_mode")
+    view["cta"] = copy.deepcopy(published.get("cta") or project.get("cta"))
+    view["published_at"] = published.get("published_at")
+    view["release_id"] = published.get("release_id")
+    return view
