@@ -217,8 +217,13 @@ export const AnalyticsPanel = ({ project }) => {
       )}
       {data.leads?.length > 0 && (
         <div className="rounded-xl border border-slate-800 bg-slate-900/60 p-5" data-testid="analytics-leads">
-          <h3 className="font-semibold mb-3">Leads</h3>
-          <ul className="text-sm space-y-1">{data.leads.map((l, i) => <li key={i}>{l.email} · step {l.step_index + 1}</li>)}</ul>
+          <div className="flex items-center justify-between gap-3 mb-3">
+            <h3 className="font-semibold">Leads</h3>
+            <a href={`${API}/projects/${project.id}/leads.csv`} className="flex items-center gap-1 text-sm text-cyan-400 hover:text-cyan-300" data-testid="leads-csv-download"><Download className="h-4 w-4" /> CSV</a>
+          </div>
+          <ul className="text-sm space-y-1">{data.leads.map((l, i) => (
+            <li key={i}>{l.email}{l.name ? ` · ${l.name}` : ""}{l.scene_type ? ` · ${l.scene_type} scene` : ""} · step {(l.step_index ?? 0) + 1}</li>
+          ))}</ul>
         </div>
       )}
     </div>

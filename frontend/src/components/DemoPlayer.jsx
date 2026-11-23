@@ -6,11 +6,96 @@ const ACTION_LABEL = { goto: "Navigate", click: "Click", type: "Type", hover: "H
 
 const sceneMs = (s, withAudio) => {
   const chosen = Number(s?.duration_ms) || 3000;
+  const audio = withAudio && s?.audio_duration_ms ? s.audio_duration_ms + 700 : 0;
+  if (s?.scene_type) return Math.max(chosen === 3000 ? 4000 : chosen, audio);
   const floor = s?.action === "scroll" ? 7000 : 5500;
   const base = chosen === 3000 ? floor : chosen;
-  const audio = withAudio && s?.audio_duration_ms ? s.audio_duration_ms + 700 : 0;
   return Math.max(base, audio);
 };
+export const SCENE_LABEL = { title: "Title", credits: "Credits", email: "Email", waitlist: "Waitlist", cta: "Call to action" };
+const stepLabel = (s) => (s?.scene_type ? (s.scene?.title || s.caption || SCENE_LABEL[s.scene_type]) : (s?.caption || ACTION_LABEL[s?.action] || "Step"));
+const EMAIL_OK = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+function SceneStage({ step, accent, onAdvance, onLead }) {
+  const cfg = step.scene || {};
+  const kind = step.scene_type;
+  const isForm = kind === "email" || kind === "waitlist";
+  const [email, setEmail] = useState("");
+  const [name, setName] = useState("");
+  const [error, setError] = useState("");
+  const [sending, setSending] = useState(false);
+  const [done, setDone] = useState(false);
+
+  useEffect(() => {
+    if (!done) return undefined;
+    const t = setTimeout(onAdvance, 1600);
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [done]);
+
+  const submit = async (e) => {
+    e.preventDefault();
+    if (!EMAIL_OK.test(email.trim())) { setError("Enter a valid email to continue."); return; }
+    if (kind === "waitlist" && cfg.collect_name !== false && !name.trim()) { setError("Enter your name to join the waitlist."); return; }
+    setError("");
+    setSending(true);
+    try {
+      if (onLead) await onLead(step, { email: email.trim(), name: name.trim() });
+      setDone(true);
+    } catch {
+      setError("That didn't go through. Check the email and try again.");
+    } finally {
+      setSending(false);
+    }
+  };
+
+  const buttonCls = "h-11 px-5 rounded-xl text-sm font-semibold text-white inline-flex items-center justify-center gap-2 disabled:opacity-50";
+  return (
+    <div className="absolute inset-0 grid place-items-center overflow-hidden" data-testid={`player-scene-${kind}`}
+      style={{ background: `radial-gradient(720px 380px at 85% -10%, ${accent}40, transparent 60%), radial-gradient(560px 340px at 0% 110%, ${accent}30, transparent 55%), linear-gradient(180deg, rgb(10 12 24), rgb(5 6 14))` }}>
+      <div className="absolute inset-x-0 top-0 h-1.5" style={{ background: accent }} />
+      <div className="w-full max-w-xl px-6 sm:px-10 text-center">
+        {done ? (
+          <>
+            <p className="font-display text-2xl sm:text-4xl font-bold tracking-tight" data-testid="scene-success-title">{cfg.success_title || "You're in"}</p>
+            <p className="mt-3 text-sm sm:text-base text-slate-400">{cfg.success_body || "Continuing the demo…"}</p>
+          </>
+        ) : (
+          <>
+            <p className="font-mono text-[10px] sm:text-xs uppercase tracking-[0.2em]" style={{ color: accent }}>{SCENE_LABEL[kind]}</p>
+            <h3 className="mt-3 font-display text-2xl sm:text-4xl font-bold tracking-tight leading-tight">{cfg.title || step.caption}</h3>
+            {(cfg.subtitle || cfg.body) && <p className="mt-3 text-sm sm:text-base text-slate-400 leading-relaxed">{cfg.subtitle || cfg.body}</p>}
+            {isForm ? (
+              <form onSubmit={submit} noValidate className="mt-6 space-y-2.5 max-w-md mx-auto" data-testid="scene-form">
+                {kind === "waitlist" && cfg.collect_name !== false && (
+                  <input value={name} onChange={(e) => setName(e.target.value)} placeholder="Your name" autoComplete="name"
+                    className="w-full h-11 rounded-xl border border-slate-700 bg-slate-950/80 px-3.5 text-sm outline-none focus:border-indigo-400" data-testid="scene-name-input" />
+                )}
+                <input value={email} onChange={(e) => setEmail(e.target.value)} type="text" inputMode="email" placeholder={cfg.placeholder || "you@company.com"} autoComplete="email"
+                  className="w-full h-11 rounded-xl border border-slate-700 bg-slate-950/80 px-3.5 text-sm outline-none focus:border-indigo-400" data-testid="scene-email-input" />
+                {error && <p className="text-sm text-red-300" role="alert" data-testid="scene-form-error">{error}</p>}
+                <button type="submit" disabled={sending} className={`${buttonCls} w-full`} style={{ background: accent }} data-testid="scene-submit">
+                  {sending ? "Sending…" : (cfg.button_label || (kind === "waitlist" ? "Join the waitlist" : "Continue"))}
+                </button>
+              </form>
+            ) : (cfg.button_label || kind === "cta") && step.exit_trigger !== "timer" ? (
+              <div className="mt-6">
+                {cfg.cta_url ? (
+                  <a href={cfg.cta_url} target="_blank" rel="noreferrer" onClick={onAdvance} className={buttonCls} style={{ background: accent }} data-testid="scene-cta-button">{cfg.button_label || "Continue"}</a>
+                ) : (
+                  <button type="button" onClick={onAdvance} className={buttonCls} style={{ background: accent }} data-testid="scene-continue-button">{cfg.button_label || "Continue"}</button>
+                )}
+              </div>
+            ) : null}
+            {step.skippable && (
+              <button type="button" onClick={onAdvance} className="mt-4 text-sm text-slate-400 hover:text-white underline underline-offset-4" data-testid="scene-skip">Skip</button>
+            )}
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
 const fadeSec = (s) => (s?.transition === "none" ? 0 : (Number(s?.transition_ms) === 400 ? 800 : (s?.transition_ms || 800)) / 1000);
 const motionCount = (s) => s?.motion_count || (s?.motion_paths || []).length;
 const hasShot = (s) => s.has_screenshot ?? !!s.screenshot_path;
@@ -134,7 +219,7 @@ const remembered = (key, fallback) => {
   try { const v = sessionStorage.getItem(key); return v == null ? fallback : v === "1"; } catch { return fallback; }
 };
 
-export const DemoPlayer = ({ steps, src, narrationMode = "both", brand = {}, initialStep = 0, onStepChange, onEvent, onDwell, chapters = false, shareUrl, globalKeys = false, cta, guided = false, autoplay = false, startMuted = false, onCta }) => {
+export const DemoPlayer = ({ steps, src, narrationMode = "both", brand = {}, initialStep = 0, onStepChange, onEvent, onDwell, chapters = false, shareUrl, globalKeys = false, cta, guided = false, autoplay = false, startMuted = false, onCta, onLead }) => {
   const [branch, setBranch] = useState("");
   const visible = steps.filter((s) => !s.branch || s.branch === branch);
   const [idx, setIdx] = useState(Math.min(initialStep, Math.max(visible.length - 1, 0)));
@@ -148,8 +233,10 @@ export const DemoPlayer = ({ steps, src, narrationMode = "both", brand = {}, ini
   const showCaption = narrationMode !== "voiceover" && captionsOn;
   const withAudio = narrationMode !== "captions";
   const step = visible[idx];
-  const choices = step?.choices || [];
-  const hold = (guided && step?.hotspot && ["click", "hover", "type"].includes(step?.action)) || choices.length > 0;
+  const isScene = !!step?.scene_type;
+  const choices = isScene ? [] : (step?.choices || []);
+  const hold = isScene ? step.exit_trigger !== "timer"
+    : (guided && step?.hotspot && ["click", "hover", "type"].includes(step?.action)) || choices.length > 0;
   const [mobile, setMobile] = useState(false);
   const entered = useRef(Date.now());
 
@@ -213,6 +300,12 @@ export const DemoPlayer = ({ steps, src, narrationMode = "both", brand = {}, ini
     return () => window.removeEventListener("keydown", h);
   }, [globalKeys]);
 
+  const advanceFromScene = useCallback(() => {
+    if (idx < visible.length - 1) { setPlaying(true); go(idx + 1); }
+    else { setPlaying(false); onEvent?.("complete", idx); }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [idx, visible.length, go]);
+
   const pickBranch = (option) => {
     onEvent?.("branch", idx, option.branch);
     const next = steps.filter((s) => !s.branch || s.branch === option.branch);
@@ -229,8 +322,13 @@ export const DemoPlayer = ({ steps, src, narrationMode = "both", brand = {}, ini
     <div className="space-y-3">
       <div ref={boxRef} tabIndex={0} onKeyDown={onKey} aria-label="Demo player. Space to play, arrows to navigate"
         className="relative aspect-[16/10] rounded-xl overflow-hidden border border-slate-800 bg-slate-950 focus:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500 group" data-testid="demo-player">
-        <Stage step={step} mobile={mobile} fade={fadeSec(step)} playing={playing} src={src} />
-        {hasShot(step) && ["click", "hover", "type"].includes(step.action) && <Hotspot box={step.hotspot} accent={accent} onClick={() => go(idx + 1)} />}
+        {isScene ? (
+          <SceneStage key={step.id} step={step} accent={accent} onAdvance={advanceFromScene}
+            onLead={onLead ? (s, payload) => onLead(s, idx, payload) : undefined} />
+        ) : (
+          <Stage step={step} mobile={mobile} fade={fadeSec(step)} playing={playing} src={src} />
+        )}
+        {!isScene && hasShot(step) && ["click", "hover", "type"].includes(step.action) && <Hotspot box={step.hotspot} accent={accent} onClick={() => go(idx + 1)} />}
         {choices.length > 0 && (
           <div className="absolute bottom-16 left-1/2 -translate-x-1/2 flex gap-2" data-testid="player-choices">
             {choices.map((option) => (
@@ -238,22 +336,24 @@ export const DemoPlayer = ({ steps, src, narrationMode = "both", brand = {}, ini
             ))}
           </div>
         )}
-        {(step.annotations || []).map((ann, i) => (
+        {!isScene && (step.annotations || []).map((ann, i) => (
           <span key={i} className="pointer-events-none absolute" style={{ left: `${(ann.x / 1280) * 100}%`, top: `${(ann.y / 800) * 100}%`, width: ann.w ? `${(ann.w / 1280) * 100}%` : 12, height: ann.h ? `${(ann.h / 800) * 100}%` : 18, background: ann.kind === "blur" ? "rgba(15,23,42,0.72)" : "transparent", borderBottom: ann.kind === "arrow" ? `2px solid ${accent}` : undefined, boxShadow: ann.kind === "hover" ? `0 0 0 8px ${accent}55` : undefined, outline: ["highlight", "callout", "hover"].includes(ann.kind) ? `2px solid ${accent}` : undefined, borderRadius: ["highlight", "callout", "hover"].includes(ann.kind) ? 12 : undefined }} data-testid={ann.kind === "callout" ? "player-callout" : `player-annotation-${i}`}>
             {ann.kind === "callout" && ann.text && <span className="absolute -top-7 left-0 whitespace-nowrap rounded-md px-2 py-1 text-xs font-semibold text-white" style={{ background: accent }}>{ann.text}</span>}
           </span>
         ))}
-        {showCaption && <Caption text={step.caption} accent={accent} top={brand.caption_position === "top"} />}
+        {!isScene && showCaption && <Caption text={step.caption} accent={accent} top={brand.caption_position === "top"} />}
         {cta?.url && idx === visible.length - 1 && choices.length === 0 && (
           <a href={cta.url} onClick={() => onCta?.(idx)} className="absolute bottom-16 left-1/2 -translate-x-1/2 rounded-lg px-4 py-2 text-sm font-semibold text-white" style={{ background: accent }} data-testid="player-cta">{cta.label || "Continue"}</a>
         )}
         {brand.watermark !== false && (
           <span className="absolute top-3 right-3 rounded-md bg-slate-950/70 backdrop-blur px-2 py-1 text-[10px] font-mono text-slate-300" data-testid="player-watermark">Made with AppShowcase</span>
         )}
-        <button onClick={() => setPlaying((p) => !p)} aria-label={playing ? "Pause" : "Play"} data-testid="player-overlay-play"
-          className={`absolute inset-0 grid place-items-center transition-opacity ${playing ? "opacity-0" : "opacity-100 bg-slate-950/30"}`}>
-          {!playing && <span className="h-14 w-14 rounded-full grid place-items-center shadow-2xl" style={{ background: accent }}><Play className="h-6 w-6 ml-0.5 fill-white" /></span>}
-        </button>
+        {!isScene && (
+          <button onClick={() => setPlaying((p) => !p)} aria-label={playing ? "Pause" : "Play"} data-testid="player-overlay-play"
+            className={`absolute inset-0 grid place-items-center transition-opacity ${playing ? "opacity-0" : "opacity-100 bg-slate-950/30"}`}>
+            {!playing && <span className="h-14 w-14 rounded-full grid place-items-center shadow-2xl" style={{ background: accent }}><Play className="h-6 w-6 ml-0.5 fill-white" /></span>}
+          </button>
+        )}
       </div>
       <div className="flex gap-1" aria-hidden="true">
         {visible.map((s, i) => (
@@ -271,7 +371,7 @@ export const DemoPlayer = ({ steps, src, narrationMode = "both", brand = {}, ini
           {withAudio && !hasAudio(step) && <span className="hidden sm:inline text-[10px] text-slate-500" data-testid="player-no-audio">No voice on this step</span>}
         </div>
         <div className="flex items-center gap-1">
-          {step.action && <span className="hidden sm:flex items-center gap-1 font-mono text-[10px] uppercase text-slate-500 mr-2"><MousePointerClick className="h-3 w-3" />{ACTION_LABEL[step.action]}</span>}
+          {step.action && <span className="hidden sm:flex items-center gap-1 font-mono text-[10px] uppercase text-slate-500 mr-2"><MousePointerClick className="h-3 w-3" />{isScene ? SCENE_LABEL[step.scene_type] : ACTION_LABEL[step.action]}</span>}
           {visible.some((s) => s.has_mobile || s.screenshot_mobile_path) && (
             <button onClick={() => setMobile((m) => !m)} className="h-9 px-2 rounded-lg hover:bg-slate-800 text-xs" data-testid="player-viewport-toggle">{mobile ? "Phone" : "Desktop"}</button>
           )}
@@ -288,7 +388,7 @@ export const DemoPlayer = ({ steps, src, narrationMode = "both", brand = {}, ini
           {visible.map((s, i) => (
             <li key={s.id} className={`flex items-center gap-2 rounded-lg border px-3 py-2 text-sm cursor-pointer transition-colors ${i === idx ? "border-indigo-500/50 bg-indigo-500/10" : "border-slate-800 hover:border-slate-700"}`} onClick={() => go(i)} data-testid={`chapter-${i}`}>
               <span className="font-mono text-xs text-slate-500 w-5">{String(i + 1).padStart(2, "0")}</span>
-              <span className="flex-1 truncate">{s.chapter ? `${s.chapter} · ` : ""}{s.caption || ACTION_LABEL[s.action]}</span>
+              <span className="flex-1 truncate">{s.chapter ? `${s.chapter} · ` : ""}{stepLabel(s)}</span>
               {shareUrl && (
                 <button aria-label={`Copy link to step ${i + 1}`} onClick={(e) => { e.stopPropagation(); navigator.clipboard.writeText(`${shareUrl}?step=${i + 1}`); }} className="text-slate-500 hover:text-white" data-testid={`chapter-copy-${i}`}>
                   <Link2 className="h-3.5 w-3.5" />

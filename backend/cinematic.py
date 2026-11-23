@@ -29,6 +29,8 @@ def needs_story_pass(steps: list) -> bool:
 def direct(steps: list) -> list:
     """Fill a shot treatment and a short callout when the model left them blank."""
     for index, step in enumerate(steps):
+        if step.get("scene_type"):
+            continue
         action = step.get("action")
         treatment = (step.get("treatment") or "").strip()
         if treatment not in {"establish", "highlight", "callout", "hover"}:

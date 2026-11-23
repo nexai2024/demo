@@ -63,7 +63,7 @@ def estimate_seconds(project: dict) -> int:
     login = project.get("login") or {}
     extra = 12 if login.get("url") else 0
     passes = 2 if project.get("viewport") == "both" else 1
-    body = sum(14 if s.get("action") == "scroll" else 8 for s in steps)
+    body = sum(0 if s.get("scene_type") else 14 if s.get("action") == "scroll" else 8 for s in steps)
     return (body + extra) * passes
 
 
@@ -138,7 +138,7 @@ def publish_diff(current: list, published: list) -> dict:
     added = sum(1 for s in current or [] if s.get("id") and s.get("id") not in pub)
     removed = sum(1 for s in published or [] if s.get("id") and s.get("id") not in cur_ids)
     changed = []
-    keys = ("caption", "voiceover", "selector", "action", "url", "text")
+    keys = ("caption", "voiceover", "selector", "action", "url", "text", "scene_type", "scene", "exit_trigger", "skippable")
     for step in current or []:
         old = pub.get(step.get("id"))
         if not old:

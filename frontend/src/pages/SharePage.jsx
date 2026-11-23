@@ -86,10 +86,15 @@ export default function SharePage({ embed = false }) {
     axios.post(`${API}/public/${shareId}/events`, { type: "lead", session, step_index: 0, email: lead }, { headers })
       .then(() => setLeadSent(true)).catch(() => {});
   };
+  const sceneLead = async (step, stepIndex, { email, name }) => {
+    await axios.post(`${API}/public/${shareId}/events`,
+      { type: "lead", session, step_index: stepIndex, email, name: name || undefined, scene_id: step.id, scene_type: step.scene_type },
+      { headers });
+  };
   const player = (
     <DemoPlayer steps={demo.steps} src={(s, k, i) => publicAsset(shareId, { ...s, audio_track: demo.track }, k, token, i)} narrationMode={demo.narration_mode} brand={demo.brand} cta={demo.cta}
       initialStep={initial} chapters={!embed && !hideChapters} globalKeys shareUrl={`${window.location.origin}/share/${shareId}`} onEvent={(t, i, branch) => track(t, i, branch)} onDwell={dwell}
-      guided={!!demo.guided} autoplay={autoplay} startMuted={startMuted} onCta={(i) => track("cta", i)} />
+      guided={!!demo.guided} autoplay={autoplay} startMuted={startMuted} onCta={(i) => track("cta", i)} onLead={sceneLead} />
   );
   if (embed) return <div className="p-3 bg-slate-950 min-h-screen relative z-10" data-testid="public-demo-player">{player}</div>;
   return (

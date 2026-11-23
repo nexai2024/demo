@@ -16,7 +16,30 @@ export const newStep = () => ({
   duration_ms: 6000, transition: "fade", transition_ms: 800, screenshot_path: null, thumb_path: null, audio_voice: null,
   audio_path: null, audio_text: null, audio_duration_ms: null, hotspot: null, status: "pending", error: null, attempts: 0, page_url: null,
   voice: null, chapter: "", callout: "", treatment: "", annotations: [], comments: [], health_failed_path: null, screenshot_mobile_path: null,
+  scene_type: "", scene: {}, exit_trigger: "timer", skippable: false,
 });
+
+export const SCENE_TYPES = [
+  { type: "title", label: "Title scene", hint: "Headline card that opens the demo" },
+  { type: "credits", label: "Credits scene", hint: "Closing card with an optional button" },
+  { type: "email", label: "Email scene", hint: "Collect an email before the demo continues" },
+  { type: "waitlist", label: "Waitlist scene", hint: "Email + name with a you're-in confirmation" },
+  { type: "cta", label: "CTA scene", hint: "One message, one button, one link out" },
+];
+
+const SCENE_DEFAULTS = {
+  title: { scene: { title: "Your product, in two minutes", subtitle: "A narrated walkthrough — no meeting required." }, exit_trigger: "timer", duration_ms: 4000 },
+  credits: { scene: { title: "Thanks for watching", subtitle: "Made with AppShowcase.", button_label: "Book a demo", cta_url: "" }, exit_trigger: "timer", duration_ms: 5000 },
+  email: { scene: { title: "Get the full walkthrough", subtitle: "Drop your email and the demo continues right where it left off.", button_label: "Continue", placeholder: "you@company.com", success_title: "You're in", success_body: "Continuing the demo…" }, exit_trigger: "submit", duration_ms: 6000 },
+  waitlist: { scene: { title: "Join the waitlist", subtitle: "Be first to know when this launches.", button_label: "Join the waitlist", placeholder: "you@company.com", collect_name: true, success_title: "You're on the list", success_body: "We'll be in touch. Continuing the demo…" }, exit_trigger: "submit", duration_ms: 6000 },
+  cta: { scene: { title: "See it on your own data", subtitle: "", button_label: "Start free", cta_url: "https://" }, exit_trigger: "continue", duration_ms: 6000 },
+};
+
+export const newScene = (type) => {
+  const d = SCENE_DEFAULTS[type] || SCENE_DEFAULTS.title;
+  return { ...newStep(), action: "wait", status: "done", scene_type: type, scene: { ...d.scene },
+           exit_trigger: d.exit_trigger, duration_ms: d.duration_ms, caption: d.scene.title || "", voiceover: "" };
+};
 
 export const ElementChips = ({ elements, pageUrl, onPickElement, onScanDown }) => elements?.length > 0 ? (
   <div className="rounded-xl border border-slate-800 p-4 space-y-2" data-testid="capture-elements">
@@ -110,11 +133,24 @@ export const DraftTab = ({ meta, setMeta, onGenerate, onAutopilot, onChangelog, 
   </div>
 );
 
-export const TimelineToolbar = ({ meta, setMeta, undo, redo, canUndo, canRedo, onAdd, onRewrite, rewriting, locked, onCapture, captureBusy, browserless }) => (
+export const TimelineToolbar = ({ meta, setMeta, undo, redo, canUndo, canRedo, onAdd, onAddScene, onRewrite, rewriting, locked, onCapture, captureBusy, browserless }) => (
   <div className="flex flex-wrap items-center gap-2 pb-4">
     <button onClick={undo} disabled={!canUndo || locked} aria-label="Undo" className="h-9 w-9 rounded-lg border border-slate-700 hover:bg-slate-800 grid place-items-center disabled:opacity-30" data-testid="timeline-undo-button"><Undo2 className="h-4 w-4" /></button>
     <button onClick={redo} disabled={!canRedo || locked} aria-label="Redo" className="h-9 w-9 rounded-lg border border-slate-700 hover:bg-slate-800 grid place-items-center disabled:opacity-30" data-testid="timeline-redo-button"><Redo2 className="h-4 w-4" /></button>
     <button onClick={onAdd} disabled={locked} className="h-9 px-3 rounded-lg border border-slate-700 hover:bg-slate-800 text-sm flex items-center gap-1.5 disabled:opacity-30" data-testid="timeline-add-step-button"><Plus className="h-4 w-4" /> Step</button>
+    <DropdownMenu>
+      <DropdownMenuTrigger disabled={locked || !onAddScene} className="h-9 px-3 rounded-lg border border-indigo-500/40 text-indigo-300 hover:bg-indigo-500/10 text-sm flex items-center gap-1.5 disabled:opacity-40" data-testid="timeline-add-scene-button">
+        <Plus className="h-4 w-4" /> Scene
+      </DropdownMenuTrigger>
+      <DropdownMenuContent className="bg-slate-950 border-slate-800 w-72">
+        <DropdownMenuLabel className="text-xs text-slate-500">Insert scene after the selected step</DropdownMenuLabel>
+        {SCENE_TYPES.map((s) => (
+          <DropdownMenuItem key={s.type} onClick={() => onAddScene(s.type)} data-testid={`add-scene-${s.type}`}>
+            <span><span className="block">{s.label}</span><span className="block text-xs text-slate-500">{s.hint}</span></span>
+          </DropdownMenuItem>
+        ))}
+      </DropdownMenuContent>
+    </DropdownMenu>
     <span className="inline-flex items-center">
       <button onClick={onCapture} disabled={locked || captureBusy || !browserless} className="h-9 px-3 rounded-lg border border-slate-700 hover:bg-slate-800 text-sm disabled:opacity-40" data-testid="timeline-capture-button" data-help="capture-clicks">{captureBusy ? "Scanning…" : "Capture clicks"}</button>
       <HelpLink topic="capture-clicks" label="Capture clicks" />

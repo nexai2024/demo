@@ -166,6 +166,56 @@ def zoom_filter(hotspot: dict, frames: int) -> str:
     return f"scale={w * 2}:{h * 2},zoompan=z='{z}':x='{x}':y='{y}':d=1:s={w}x{h}:fps=30"
 
 
+def compose_scene(step: dict, brand: dict) -> Image.Image:
+    """Draw an interactive scene (title / credits / form / CTA) as a still frame for exports."""
+    w, h = _wh()
+    accent = _rgb(brand.get("accent"))
+    cfg = step.get("scene") or {}
+    kind = step.get("scene_type") or ""
+    img = Image.new("RGB", (w, h), (7, 9, 18))
+    d = ImageDraw.Draw(img, "RGBA")
+    d.rectangle([0, 0, w, 10], fill=accent)
+    d.ellipse([w - 340, -180, w + 120, 280], fill=accent + (36,))
+    d.ellipse([-160, h - 260, 300, h + 200], fill=accent + (26,))
+    title = str(cfg.get("title") or step.get("caption") or "").strip()
+    body = str(cfg.get("subtitle") or cfg.get("body") or "").strip()
+    title_font, body_font, small_font = _font(54), _font(28), _font(20)
+    lines = _wrap(d, title, title_font, w - 320) if title else []
+    body_lines = _wrap(d, body, body_font, w - 360) if body else []
+    total = len(lines) * 68 + (len(body_lines) * 40 + 18 if body_lines else 0)
+    y = max(120, (h - total) // 2 - 60)
+    for line in lines:
+        tw = d.textlength(line, font=title_font)
+        d.text(((w - tw) / 2, y), line, font=title_font, fill=(248, 250, 252))
+        y += 68
+    if body_lines:
+        y += 10
+        for line in body_lines:
+            tw = d.textlength(line, font=body_font)
+            d.text(((w - tw) / 2, y), line, font=body_font, fill=(148, 163, 184))
+            y += 40
+    y += 34
+    if kind in ("email", "waitlist"):
+        box_w = min(560, w - 320)
+        x0 = (w - box_w) // 2
+        d.rounded_rectangle([x0, y, x0 + box_w, y + 58], radius=12, outline=(71, 85, 105), width=2, fill=(2, 6, 23))
+        hint = str(cfg.get("placeholder") or "you@company.com")
+        d.text((x0 + 20, y + 17), hint, font=small_font, fill=(100, 116, 139))
+        label = str(cfg.get("button_label") or ("Join the waitlist" if kind == "waitlist" else "Continue"))
+        tw = d.textlength(label, font=body_font)
+        bw = int(tw + 56)
+        d.rounded_rectangle([(w - bw) // 2, y + 76, (w + bw) // 2, y + 136], radius=12, fill=accent)
+        d.text(((w - tw) / 2, y + 90), label, font=body_font, fill=(255, 255, 255))
+    elif kind in ("credits", "cta"):
+        label = str(cfg.get("button_label") or cfg.get("cta_label") or "")
+        if label:
+            tw = d.textlength(label, font=body_font)
+            bw = int(tw + 56)
+            d.rounded_rectangle([(w - bw) // 2, y, (w + bw) // 2, y + 60], radius=12, fill=accent)
+            d.text(((w - tw) / 2, y + 14), label, font=body_font, fill=(255, 255, 255))
+    return img
+
+
 async def load_frames(project: dict) -> list:
     show_caption = project.get("narration_mode", "both") in ("captions", "both")
     if project.get("export_preset") == "master":
@@ -175,6 +225,13 @@ async def load_frames(project: dict) -> list:
     hook = project.get("export_preset") == "hook"
     elapsed = 0
     for s in project["steps"]:
+        if s.get("scene_type"):
+            audio = (await get_object(s["audio_path"]))[0] if s.get("audio_path") else None
+            frames.append((s, compose_scene(s, brand), compose_overlay("", False, brand), audio, []))
+            elapsed += _step_ms(s, bool(audio))
+            if hook and elapsed >= 15000:
+                break
+            continue
         shot = (await get_object(s["screenshot_path"]))[0] if s.get("screenshot_path") else None
         audio = (await get_object(s["audio_path"]))[0] if s.get("audio_path") else None
         motion = []
@@ -206,6 +263,12 @@ def audio_duration_ms(data: bytes) -> int:
 
 def _step_ms(step: dict, has_audio: bool) -> int:
     chosen = int(step.get("duration_ms") or 3000)
+    if step.get("scene_type"):
+        # Interactive scenes play as a timed card in exports (their configured duration).
+        base = chosen if chosen != 3000 else 4000
+        if has_audio:
+            base = max(base, int(step.get("audio_duration_ms") or 0) + 700)
+        return base
     floor = 7000 if step.get("action") == "scroll" else 5500
     base = floor if chosen == 3000 else chosen
     if has_audio:

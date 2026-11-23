@@ -1,5 +1,7 @@
 import asyncio
 import hashlib
+import io
+import re
 import hmac
 import json
 import logging
@@ -127,6 +129,12 @@ class Step(BaseModel):
     choices: list[dict] = []
     caption_alt: str = ""
     voiceover_alt: str = ""
+    # Interactive scenes: a step with scene_type set is not recorded by the browser.
+    # It is rendered by the player (and as a timed frame in exports) and ends via exit_trigger.
+    scene_type: Literal["", "title", "credits", "email", "waitlist", "cta"] = ""
+    scene: dict = {}
+    exit_trigger: Literal["timer", "continue", "submit"] = "timer"
+    skippable: bool = False
 
 
 SERVER_FIELDS = ("screenshot_path", "thumb_path", "audio_path", "audio_text", "audio_voice", "audio_duration_ms",
@@ -181,6 +189,9 @@ class EventIn(BaseModel):
     step_index: int = Field(0, ge=0, le=200)
     dwell_ms: Optional[int] = Field(None, ge=0, le=600000)
     email: Optional[str] = Field(None, max_length=200)
+    name: Optional[str] = Field(None, max_length=120)
+    scene_id: Optional[str] = Field(None, max_length=40)
+    scene_type: Optional[str] = Field(None, max_length=20)
     referrer: Optional[str] = Field(None, max_length=300)
     device: Optional[Literal["desktop", "phone"]] = None
     branch: Optional[str] = Field(None, max_length=40)
@@ -410,7 +421,10 @@ async def job_record(project: dict, run_id: str, only_idx: Optional[int], final:
     opened_steps = [{**s, "text": vault.open_step_text(s, pid)} if s.get("sensitive") else dict(s) for s in steps]
     secrets_to_scrub = _collect_secrets(login, opened_steps)
     project = {**stored, **project, "steps": steps, "login": login}
-    prepared = [prepare_step(s, project) for s in opened_steps]
+    # Scenes are rendered by the player/exporter, never sent to the browser.
+    rec_pairs = [(i, s) for i, s in enumerate(opened_steps) if not s.get("scene_type")]
+    prepared = [prepare_step(s, project) for _, s in rec_pairs]
+    cap_rec = None if capture is None else {pi for pi, (oi, _) in enumerate(rec_pairs) if oi in capture}
     viewport_name = project.get("viewport") or "desktop"
     viewport = VIEWPORTS["mobile" if viewport_name == "mobile" else "desktop"]
     n = len(steps)
@@ -424,16 +438,17 @@ async def job_record(project: dict, run_id: str, only_idx: Optional[int], final:
     async def on_progress(i: int, step: dict, state: str, data: dict) -> None:
         if await jobs.is_cancelled(run_id):
             raise Cancelled()
-        if capture is not None and i not in capture:
+        oi = rec_pairs[i][0] if i < len(rec_pairs) else i
+        if cap_rec is not None and i not in cap_rec:
             if state == "running":
-                await run_log(run_id, f"Replaying step {i + 1}/{n} to reach target: {engine.describe(step)}", current=i + 1)
+                await run_log(run_id, f"Replaying step {oi + 1}/{n} to reach target: {engine.describe(step)}", current=oi + 1)
             elif state == "failed":
                 err_txt = vault.scrub(str(data.get("error") or ""), secrets_to_scrub)
-                await run_log(run_id, f"Replay of step {i + 1} failed: {err_txt}", "warn")
+                await run_log(run_id, f"Replay of step {oi + 1} failed: {err_txt}", "warn")
             return
         if state == "running":
             await db.projects.update_one({"id": pid, "steps.id": step["id"]}, {"$set": {"steps.$.status": "running"}})
-            await run_log(run_id, f"Step {i + 1}/{n}: {engine.describe(step)}...", current=i + 1)
+            await run_log(run_id, f"Step {oi + 1}/{n}: {engine.describe(step)}...", current=oi + 1)
             return
         clean_err = vault.scrub(str(data.get("error")), secrets_to_scrub) if data.get("error") else None
         upd = {"steps.$.status": state, "steps.$.error": clean_err, "steps.$.attempts": data.get("attempts", 1),
@@ -481,9 +496,9 @@ async def job_record(project: dict, run_id: str, only_idx: Optional[int], final:
         await db.projects.update_one({"id": pid, "steps.id": step["id"]}, {"$set": upd})
         await jobs.record_checkpoint(run_id, step["id"])
         if state == "failed":
-            await run_log(run_id, f"Step {i + 1} failed after {data.get('attempts')} attempts: {clean_err}", "error")
+            await run_log(run_id, f"Step {oi + 1} failed after {data.get('attempts')} attempts: {clean_err}", "error")
         else:
-            await run_log(run_id, f"Step {i + 1}/{n} captured", "success")
+            await run_log(run_id, f"Step {oi + 1}/{n} captured", "success")
 
     try:
         storage = login.get("storage_state") or None
@@ -494,11 +509,11 @@ async def job_record(project: dict, run_id: str, only_idx: Optional[int], final:
             fresh_login["storage_saved_at"] = now_iso()
             await touch(pid, {"login": vault.seal_login(fresh_login, pid)})
 
-        if capture is None or capture:
-            await engine.run_steps(prepared, on_progress, capture_only=capture, viewport=viewport,
+        if prepared and (cap_rec is None or cap_rec):
+            await engine.run_steps(prepared, on_progress, capture_only=cap_rec, viewport=viewport,
                                    login=None if storage else login, storage_state=storage,
                                    on_storage=None if storage else remember)
-        if viewport_name == "both" and capture is None:
+        if prepared and viewport_name == "both" and capture is None:
             mobile: list = []
 
             async def collect(i: int, step: dict, state: str, data: dict) -> None:
@@ -667,7 +682,7 @@ async def refresh_all(cron_run_id: str) -> None:
 
 def fingerprint(project: dict) -> str:
     keys = ("screenshot_path", "audio_path", "caption", "hotspot", "duration_ms", "transition", "transition_ms",
-            "audio_duration_ms", "annotations", "motion_paths")
+            "audio_duration_ms", "annotations", "motion_paths", "scene_type", "scene", "exit_trigger", "skippable")
     payload = [[s.get(k) for k in keys] for s in project["steps"]]
     raw = json.dumps([payload, project.get("narration_mode"), project.get("brand"), project.get("export_preset"),
                       project.get("active_track")], sort_keys=True, default=str)
@@ -880,6 +895,14 @@ async def update_project(pid: str, body: ProjectUpdate, user: dict = Depends(get
             prev = stored.get(d["id"], {})
             for k in SERVER_FIELDS:
                 d[k] = prev.get(k, Step.model_fields[k].default if k in Step.model_fields else None)
+            if d.get("scene_type"):
+                cfg = d.get("scene") or {}
+                if cfg.get("webhook_url") and str(cfg["webhook_url"]).strip():
+                    cfg["webhook_url"] = _validate_customer_url(str(cfg["webhook_url"]), "scene webhook URL")
+                if cfg.get("cta_url") and str(cfg["cta_url"]).strip() and "{{" not in str(cfg["cta_url"]):
+                    cfg["cta_url"] = _validate_customer_url(str(cfg["cta_url"]), "scene link URL")
+                d["scene"] = cfg
+                d["status"] = "done"  # scenes are rendered, never recorded
             fields["steps"].append(d)
         fields["steps"] = vault.seal_steps(fields["steps"], pid, existing=raw.get("steps"))
         fields["search_text"] = " ".join(
@@ -1107,10 +1130,12 @@ async def record(pid: str, user: dict = Depends(get_current_user)):
 @api.post("/projects/{pid}/steps/{sid}/rerecord")
 async def rerecord(pid: str, sid: str, user: dict = Depends(get_current_user)):
     p = await get_project(pid, user)
-    _require_browserless()
     idx = next((i for i, s in enumerate(p["steps"]) if s["id"] == sid), None)
     if idx is None:
         raise HTTPException(404, "Step not found")
+    if p["steps"][idx].get("scene_type"):
+        raise HTTPException(400, "Scenes are rendered, not recorded — nothing to re-record")
+    _require_browserless()
     seconds = estimate_seconds({**p, "steps": p["steps"][: idx + 1]})
     return await jobs.enqueue_run(
         p, "rerecord", idx + 1, f"Re-recording step {idx + 1} (replaying previous steps first)...",
@@ -1133,7 +1158,7 @@ async def voiceover(pid: str, user: dict = Depends(get_current_user)):
 @api.post("/projects/{pid}/export")
 async def export(pid: str, body: ExportIn, user: dict = Depends(get_current_user)):
     p = await get_project(pid, user)
-    if not any(s.get("screenshot_path") for s in p["steps"]):
+    if not any(s.get("screenshot_path") or s.get("scene_type") for s in p["steps"]):
         raise HTTPException(400, "Record the demo before exporting")
     return await jobs.enqueue_run(
         p, "export", 3, f"Rendering {body.format.upper()}...",
@@ -1470,13 +1495,30 @@ async def analytics(pid: str, user: dict = Depends(get_current_user)):
         if e.get("dwell_ms"):
             dwells.setdefault(int(e.get("step_index") or 0), []).append(e["dwell_ms"])
         if e["type"] == "lead" and e.get("email"):
-            leads.append({"email": e["email"], "step_index": e.get("step_index"), "at": e.get("created_at")})
+            leads.append({"email": e["email"], "name": e.get("name") or "", "scene_type": e.get("scene_type") or "",
+                          "scene_id": e.get("scene_id") or "", "step_index": e.get("step_index"), "at": e.get("created_at")})
     avg_dwell = [round(sum(dwells.get(i, [])) / len(dwells[i])) if dwells.get(i) else 0 for i in range(n)]
     return {"views": len(views), "completions": len(completes),
             "completion_rate": round(len(completes) / len(views) * 100) if views else 0, "per_step": per_step,
-            "avg_dwell_ms": avg_dwell, "leads": leads[:50], "cta_clicks": cta_clicks,
+            "avg_dwell_ms": avg_dwell, "leads": leads[:500], "cta_clicks": cta_clicks,
             "devices": devices, "referrers": [{"host": k, "views": v} for k, v in sorted(referrers.items(), key=lambda item: -item[1])[:8]],
             "series": [{"day": day, "views": series[day]} for day in sorted(series)[-14:]]}
+
+
+@api.get("/projects/{pid}/leads.csv")
+async def leads_csv(pid: str, user: dict = Depends(get_current_user)):
+    await get_project(pid, user)
+    events = await db.analytics_events.find({"project_id": pid, "type": "lead"}, {"_id": 0}).sort("created_at", -1).to_list(5000)
+    import csv as csv_mod
+    buf = io.StringIO()
+    writer = csv_mod.writer(buf)
+    writer.writerow(["email", "name", "scene_type", "scene_id", "step_index", "captured_at"])
+    for e in events:
+        if e.get("email"):
+            writer.writerow([e["email"], e.get("name") or "", e.get("scene_type") or "", e.get("scene_id") or "",
+                             e.get("step_index"), e.get("created_at") or ""])
+    return Response(content=buf.getvalue(), media_type="text/csv",
+                    headers={"Content-Disposition": 'attachment; filename="leads.csv"'})
 
 
 def fire_webhook(project: dict, payload: dict) -> None:
@@ -1667,10 +1709,12 @@ async def public_demo(share_id: str, request: Request, response: Response, track
     variables = p.get("variables") or {}
     source = apply_track(p["steps"], track or p.get("active_track") or "primary")
     keep = ("id", "action", "caption", "voiceover", "duration_ms", "transition", "transition_ms", "hotspot",
-            "audio_duration_ms", "chapter", "annotations")
+            "audio_duration_ms", "chapter", "annotations", "scene_type", "exit_trigger", "skippable")
     steps = []
     for s in source:
         item = {k: s.get(k) for k in keep}
+        # Never expose delivery endpoints (webhooks / owner-notify flags) to viewers.
+        item["scene"] = {k: v for k, v in (s.get("scene") or {}).items() if k not in ("webhook_url", "notify_owner")}
         item["caption"] = substitute(item.get("caption"), variables)
         item["voiceover"] = substitute(item.get("voiceover"), variables)
         item.update({"has_screenshot": bool(s.get("screenshot_path")),
@@ -1700,26 +1744,54 @@ async def public_transcript(share_id: str, request: Request, fmt: Literal["txt",
     return Response(content=transcript(p, fmt), media_type=f"{media}; charset=utf-8", headers=_share_cache_headers(raw))
 
 
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
 @api.post("/public/{share_id}/events")
 async def public_event(share_id: str, body: EventIn, request: Request):
     p = _require_published(await _public_project(share_id, request))
+    if body.type == "lead" and not _EMAIL_RE.match((body.email or "").strip()):
+        raise HTTPException(400, "A valid email is required")
     fields = {"created_at": now_iso()}
     if body.dwell_ms is not None:
         fields["dwell_ms"] = body.dwell_ms
     if body.email:
         fields["email"] = body.email.strip()
+    if body.name:
+        fields["name"] = body.name.strip()
+    if body.scene_id:
+        fields["scene_id"] = body.scene_id
+    if body.scene_type:
+        fields["scene_type"] = body.scene_type
     if body.referrer:
         fields["referrer"] = body.referrer[:300]
     if body.device:
         fields["device"] = body.device
     if body.branch:
         fields["branch"] = body.branch[:40]
-    await db.analytics_events.update_one(
-        {"project_id": p["id"], "session": body.session, "type": body.type, "step_index": body.step_index},
-        {"$set": fields}, upsert=True)
+    if body.type == "lead":
+        # Every submission is a lead, even repeat submits in one session.
+        await db.analytics_events.insert_one({"project_id": p["id"], "session": body.session,
+                                              "type": body.type, "step_index": body.step_index, **fields})
+    else:
+        await db.analytics_events.update_one(
+            {"project_id": p["id"], "session": body.session, "type": body.type, "step_index": body.step_index},
+            {"$set": fields}, upsert=True)
     if body.type in ("complete", "lead", "cta"):
-        fire_webhook(p, {"event": body.type, "demo": p.get("name"), "share_id": share_id,
-                         "step_index": body.step_index, "email": body.email, "session": body.session})
+        payload = {"event": body.type, "demo": p.get("name"), "share_id": share_id,
+                   "step_index": body.step_index, "email": body.email, "name": body.name,
+                   "scene_id": body.scene_id, "scene_type": body.scene_type, "session": body.session}
+        fire_webhook(p, payload)
+        if body.type == "lead" and body.scene_id:
+            step = next((s for s in p["steps"] if s["id"] == body.scene_id), None)
+            cfg = (step or {}).get("scene") or {}
+            hook = str(cfg.get("webhook_url") or "").strip()
+            if hook.startswith(("http://", "https://")):
+                spawn(_post_json(hook, payload))
+            if cfg.get("notify_owner"):
+                notify = str(p.get("notify_url") or "").strip()
+                if notify.startswith(("http://", "https://")):
+                    spawn(_post_json(notify, payload))
     return {"ok": True}
 
 

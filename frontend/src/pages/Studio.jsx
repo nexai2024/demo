@@ -10,7 +10,8 @@ import { StepCard } from "@/components/StepCard";
 import { ExportPanel, AnalyticsPanel } from "@/components/ExportPanel";
 import { HistorySheet } from "@/components/HistorySheet";
 import { StatusBadge } from "@/components/StatusBadge";
-import { CommandPalette, DraftTab, ElementChips, TimelineToolbar, newStep } from "@/components/StudioParts";
+import { CommandPalette, DraftTab, ElementChips, TimelineToolbar, newScene, newStep } from "@/components/StudioParts";
+import { SceneCard } from "@/components/SceneCard";
 import { StudioExtras } from "@/components/StudioExtras";
 import { HelpLink } from "@/components/HelpLink";
 import { LivePane } from "@/components/LivePane";
@@ -234,7 +235,7 @@ export default function Studio() {
   const delStep = (id) => steps.set((arr) => arr.filter((s) => s.id !== id));
   const dupStep = (i) => steps.set((arr) => {
     const fresh = newStep();
-    const copy = { ...arr[i], id: fresh.id };
+    const copy = { ...arr[i], id: fresh.id, scene: arr[i].scene ? { ...arr[i].scene } : {} };
     ["screenshot_path", "thumb_path", "audio_path", "audio_text", "audio_voice", "audio_duration_ms", "hotspot", "error", "page_url", "resolved_selector"].forEach((k) => { copy[k] = fresh[k]; });
     Object.assign(copy, { status: "pending", attempts: 0 });
     const a = [...arr];
@@ -242,6 +243,11 @@ export default function Studio() {
     return a;
   });
   const addStep = () => { steps.set((arr) => [...arr, newStep()]); setSelected(steps.value.length); };
+  const addScene = (type) => {
+    const at = Math.min(selected + 1, steps.value.length);
+    steps.set((arr) => { const a = [...arr]; a.splice(at, 0, newScene(type)); return a; });
+    setSelected(at);
+  };
 
   useEffect(() => {
     const h = (e) => {
@@ -337,7 +343,7 @@ export default function Studio() {
                 <button onClick={rerecordFailed} disabled={running} className="mb-3 h-9 px-3 rounded-lg border border-red-500/40 text-red-200 text-sm" data-testid="rerecord-failed-button">Re-record failed steps</button>
               )}
               <TimelineToolbar meta={meta} setMeta={setMeta} undo={steps.undo} redo={steps.redo} canUndo={steps.canUndo} canRedo={steps.canRedo}
-                onAdd={addStep} onRewrite={rewrite} rewriting={busy === "rewrite"} locked={running}
+                onAdd={addStep} onAddScene={addScene} onRewrite={rewrite} rewriting={busy === "rewrite"} locked={running}
                 onCapture={() => capture(list.length)} captureBusy={busy === "capture"} browserless={settings?.browserless_configured} />
               <div className="mb-3"><ElementChips elements={elements} pageUrl={captureUrl} onPickElement={pickElement} onScanDown={() => capture(list.length, 900)} /></div>
               {list.length === 0 ? (
@@ -347,7 +353,10 @@ export default function Studio() {
                 </div>
               ) : (
                 <Reorder.Group axis="y" values={list} onReorder={(v) => steps.set(v, { coalesce: true })} as="div" className="space-y-3" data-testid="timeline-list">
-                  {list.map((s, i) => (
+                  {list.map((s, i) => s.scene_type ? (
+                    <SceneCard key={s.id} s={s} i={i} total={list.length} active={i === selected} locked={running}
+                      onChange={editStep} onMove={moveStep} onDelete={delStep} onDuplicate={dupStep} onSelect={setSelected} />
+                  ) : (
                     <StepCard key={s.id} s={s} i={i} total={list.length} active={i === selected} locked={running}
                       thumb={s.screenshot_path ? stepAsset(pid, { ...s, screenshot_path: s.thumb_path || s.screenshot_path }, s.thumb_path ? "thumb" : "screenshot") : null}
                       failedThumb={s.health_failed_path ? stepAsset(pid, { ...s, screenshot_path: s.health_failed_path }, "screenshot") : null}
