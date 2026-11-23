@@ -1,0 +1,4 @@
+# Local development & tests on top of the runtime dependencies.
+-r requirements.txt
+pytest==9.2.0
+pytest-xdist==3.8.0
