@@ -212,6 +212,8 @@ def _put_ncb(path: str, data: bytes, content_type: str, attempts: int = 3) -> st
                 payload = raw.get("data") if isinstance(raw.get("data"), dict) else raw
                 return str(payload.get("url") or payload.get("path") or payload.get("key") or path)
             last = StorageError(f"Remote storage rejected upload ({response.status_code}): {response.text[:160]}")
+            if response.status_code == 404 or "R2 Storage is not configured" in response.text:
+                break  # misconfigured backend: retrying cannot fix it
         except Exception as exc:
             last = exc
         if attempt < attempts - 1:
@@ -222,19 +224,16 @@ def _put_ncb(path: str, data: bytes, content_type: str, attempts: int = 3) -> st
 def _put(path: str, data: bytes, content_type: str) -> str:
     if _s3_config():
         return _put_s3(path, data, content_type)
+    if _allow_local_fallback():
+        # Dev: local disk IS the store. Trying the remote first made every
+        # file pay several failed uploads (plus backoff) before landing here.
+        target = LOCAL_ROOT / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+        return path
     if _ncb_configured():
-        try:
-            return _put_ncb(path, data, content_type)
-        except StorageError:
-            if not _allow_local_fallback():
-                raise
-            logger.warning("Remote storage upload failed in dev; falling back to local disk for %s", path)
-    if not _allow_local_fallback():
-        raise StorageError("Shared object storage is required in production (set S3_BUCKET)")
-    target = LOCAL_ROOT / path
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_bytes(data)
-    return path
+        return _put_ncb(path, data, content_type)
+    raise StorageError("Shared object storage is required in production (set S3_BUCKET)")
 
 
 def _get(path: str) -> tuple[bytes, str]:
@@ -245,6 +244,10 @@ def _get(path: str) -> tuple[bytes, str]:
             response = client.get(path)
         response.raise_for_status()
         return response.content, response.headers.get("content-type", _guess_media(path))
+    if _allow_local_fallback():
+        local = LOCAL_ROOT / path
+        if local.exists():
+            return local.read_bytes(), _guess_media(path)
     if _ncb_configured():
         from ncb import cfg
         conf = cfg()

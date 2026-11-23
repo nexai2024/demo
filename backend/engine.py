@@ -522,7 +522,7 @@ ProgressFn = Callable[[int, dict, str, dict], Awaitable[None]]
 
 async def run_steps(steps: list, on_progress: ProgressFn, capture_only: set | None = None, retries: int = 1,
                     viewport: dict | None = None, login: dict | None = None, storage_state: dict | None = None,
-                    on_storage=None, record_video: bool = True):
+                    on_storage=None, record_video: bool = True, on_phase=None):
     """Record steps. A Browserless session ends at 120s, so a long script reconnects and replays."""
     budget = 90
     recorder = _VideoRecorder(enabled=record_video)
@@ -596,6 +596,8 @@ async def run_steps(steps: list, on_progress: ProgressFn, capture_only: set | No
             await recorder.stop(page)
             clips: list[bytes] = []
             if recorder.clips:
+                if on_phase is not None:
+                    await on_phase("encoding")
                 try:
                     clips = await asyncio.to_thread(recorder.encode_all)
                 except Exception:

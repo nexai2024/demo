@@ -1,13 +1,17 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, API } from "@/lib/api";
 
+const ACTIVE_RUN = ["queued", "running"];
+
 export function useRun({ onUpdate, onDone } = {}) {
   const [run, setRun] = useState(null);
   const cbs = useRef({ onUpdate, onDone });
   cbs.current = { onUpdate, onDone };
 
   useEffect(() => {
-    if (!run?.id || run.status !== "running") return;
+    // Runs are created "queued" and claimed by the worker moments later;
+    // subscribing only to "running" runs stranded the UI on "Queued".
+    if (!run?.id || !ACTIVE_RUN.includes(run.status)) return;
     let es;
     let timer;
     let closed = false;
@@ -19,7 +23,7 @@ export function useRun({ onUpdate, onDone } = {}) {
     const handle = (data) => {
       setRun(data);
       cbs.current.onUpdate?.(data);
-      if (data.status !== "running") {
+      if (!ACTIVE_RUN.includes(data.status)) {
         cleanup();
         cbs.current.onDone?.(data);
       }
@@ -44,7 +48,7 @@ export function useRun({ onUpdate, onDone } = {}) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [run?.id]);
 
-  return { run, setRun, running: run?.status === "running" };
+  return { run, setRun, running: ACTIVE_RUN.includes(run?.status || "") };
 }
 
 export function useUndoable(initial) {

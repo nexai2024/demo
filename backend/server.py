@@ -519,14 +519,19 @@ async def job_record(project: dict, run_id: str, only_idx: Optional[int], final:
             await touch(pid, {"login": vault.seal_login(fresh_login, pid)})
 
         if prepared and (cap_rec is None or cap_rec):
+            async def _phase(name: str) -> None:
+                if name == "encoding":
+                    await run_log(run_id, "Encoding recorded video…", current=n)
+
             result = await engine.run_steps(prepared, on_progress, capture_only=cap_rec, viewport=viewport,
                                             login=None if storage else login, storage_state=storage,
-                                            on_storage=None if storage else remember)
+                                            on_storage=None if storage else remember, on_phase=_phase)
             # Upload the recorded session clips and point each captured step
             # at its (clip, start_ms, end_ms) window — the edit decision list
             # the player and exporter consume.
             clip_blobs = (result or {}).get("video_clips") or []
             if clip_blobs and pending_video:
+                await run_log(run_id, f"Uploading {len([b for b in clip_blobs if b])} video clip(s)…", current=n)
                 fresh_proj = await db.projects.find_one({"id": pid}, {"_id": 0}) or {}
                 existing_clips = list(fresh_proj.get("video_clips") or [])
                 offset = len(existing_clips)
