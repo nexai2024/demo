@@ -1830,6 +1830,7 @@ async def ready():
     fatal = [p for p in problems if p.startswith(FATAL_PREFIXES)]
     checks = {"database": DB_BACKEND, "ai": bool(ai and ai.provider()[2]),
               "browserless": bool(engine and engine.is_configured()),
+              "browser_driver_lib": bool(engine and engine._driver_lib_dir()),
               "storage": st.get("mode"), "storage_ok": st.get("mode") in {"s3", "remote", "local"},
               "config_ok": not fatal, "config_problems": problems,
               "cors_origins": cors_origins(),

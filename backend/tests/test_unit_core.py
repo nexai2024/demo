@@ -1,6 +1,7 @@
 """Offline unit tests: no server, no network, no database."""
 import asyncio
 import importlib
+import os
 
 import pytest
 
@@ -126,6 +127,39 @@ def test_dead_driver_error_quotes_its_stderr(tmp_path):
                          cwd=str(Path(engine.__file__).parent), env=env, timeout=60)
     assert "fake-driver-fatal: libnss3.so missing" in out.stdout, out.stdout + out.stderr
     assert "UNEXPECTED SUCCESS" not in out.stdout
+
+
+def test_driver_lib_dir_only_on_linux_with_vendored_lib(monkeypatch, tmp_path):
+    fake_engine = tmp_path / "engine.py"
+    fake_engine.touch()
+    lib_dir = tmp_path / "native" / "lib"
+    lib_dir.mkdir(parents=True)
+    monkeypatch.setattr(engine, "__file__", str(fake_engine))
+    assert engine._driver_lib_dir("linux") is None  # lib not present yet
+    (lib_dir / "libatomic.so.1").touch()
+    assert engine._driver_lib_dir("linux") == lib_dir
+    assert engine._driver_lib_dir("darwin") is None
+
+
+def test_ensure_driver_runtime_prepends_ld_library_path(monkeypatch, tmp_path):
+    lib_dir = tmp_path / "native" / "lib"
+    monkeypatch.setattr(engine, "_driver_lib_dir", lambda platform=None: lib_dir)
+    monkeypatch.setenv("LD_LIBRARY_PATH", "/usr/lib")
+    monkeypatch.delenv("VERCEL", raising=False)
+    engine._ensure_driver_runtime()
+    assert os.environ["LD_LIBRARY_PATH"] == f"{lib_dir}:/usr/lib"
+    engine._ensure_driver_runtime()  # idempotent, no duplicate entry
+    assert os.environ["LD_LIBRARY_PATH"] == f"{lib_dir}:/usr/lib"
+
+
+def test_vendored_libatomic_is_a_real_x86_64_elf():
+    from pathlib import Path
+
+    lib = Path(engine.__file__).parent / "native" / "lib" / "libatomic.so.1"
+    assert lib.is_file()
+    head = lib.read_bytes()[:20]
+    assert head[:4] == b"\x7fELF" and head[4] == 2  # ELF64
+    assert int.from_bytes(head[18:20], "little") == 62  # x86-64
 
 
 def test_short_jwt_secret_is_flagged(monkeypatch):

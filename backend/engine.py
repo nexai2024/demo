@@ -9,16 +9,43 @@ from typing import Awaitable, Callable
 import netpolicy
 
 
-def _playwright():
-    try:
-        from playwright.async_api import async_playwright
-    except ImportError as exc:
-        raise RuntimeError("Playwright is not installed. Recording needs it, along with a Browserless API key.") from exc
+def _driver_lib_dir(platform: str | None = None) -> "Path | None":
+    """Directory with vendored shared libraries for the Playwright driver.
+
+    The driver's bundled Node binary links libatomic.so.1, which minimal
+    serverless images (Amazon Linux 2023 on Vercel) do not ship — the
+    driver then dies at load with "error while loading shared libraries:
+    libatomic.so.1", surfaced to Python as "Connection closed while
+    reading from the driver". A copy is vendored under backend/native/lib.
+    """
+    from pathlib import Path
+
+    if not (platform or sys.platform).startswith("linux"):
+        return None
+    lib_dir = Path(__file__).resolve().parent / "native" / "lib"
+    return lib_dir if (lib_dir / "libatomic.so.1").is_file() else None
+
+
+def _ensure_driver_runtime() -> None:
+    """Make the environment safe for the Playwright Node driver to launch."""
     if os.environ.get("VERCEL"):
         # Serverless filesystems are read-only outside /tmp. If the driver
         # tries to resolve its browser registry under HOME or the package
         # directory it dies before speaking; keep it in /tmp.
         os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", "/tmp/ms-playwright")
+    lib_dir = _driver_lib_dir()
+    if lib_dir is not None:
+        parts = [p for p in os.environ.get("LD_LIBRARY_PATH", "").split(":") if p]
+        if str(lib_dir) not in parts:
+            os.environ["LD_LIBRARY_PATH"] = ":".join([str(lib_dir), *parts])
+
+
+def _playwright():
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError as exc:
+        raise RuntimeError("Playwright is not installed. Recording needs it, along with a Browserless API key.") from exc
+    _ensure_driver_runtime()
     return async_playwright
 
 

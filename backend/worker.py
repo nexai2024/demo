@@ -33,6 +33,7 @@ async def run_worker() -> None:
     logger.info("Worker %s started", server.INSTANCE_ID)
     while not stop.is_set():
         try:
+            await server.jobs.note_worker_presence()
             run = await server.jobs.claim_next_run()
             if run:
                 logger.info("Claimed run %s (%s, attempt %s)", run["id"], run["kind"], run.get("attempt"))

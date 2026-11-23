@@ -23,6 +23,11 @@ logger = logging.getLogger(__name__)
 INSTANCE_ID = new_id("wrk_")
 LEASE_SECONDS = int(os.environ.get("JOB_LEASE_SECONDS", "120"))
 MAX_JOB_ATTEMPTS = int(os.environ.get("JOB_MAX_ATTEMPTS", "2"))
+# A queued run no worker has claimed for this long, or a running run whose
+# lease/heartbeat is this far past due, belongs to a worker that is gone
+# (e.g. jobs were enqueued on a serverless API host with no worker at all).
+# Such runs are finalized so they stop leasing their project forever.
+STALE_SECONDS = int(os.environ.get("JOB_STALE_SECONDS", "300"))
 QUOTA_KINDS = {"record", "rerecord", "autopilot"}
 
 
@@ -38,28 +43,91 @@ def _month_start() -> str:
     return now().replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
 
 
+def _age_seconds(iso_value) -> float:
+    try:
+        return (now() - datetime.fromisoformat(iso_value)).total_seconds()
+    except (TypeError, ValueError):
+        return float("inf")
+
+
+async def clear_stale_run(pid: str, run: dict) -> bool:
+    """Finalize a queued/running run that no living worker will ever finish.
+
+    Workers poll every second and heartbeat at least every lease third, so a
+    run untouched for STALE_SECONDS has no worker behind it. Returns True if
+    the run was terminalized (which also releases the project lease).
+    """
+    status = run.get("status")
+    if status == "queued":
+        if _age_seconds(run.get("started_at")) <= STALE_SECONDS:
+            return False
+        msg = ("No worker picked up this job, so it was cleared. "
+               "Jobs need a running worker — start one, then try again.")
+    elif status == "running":
+        ref = run.get("lease_expires_at") or run.get("heartbeat_at") or run.get("started_at")
+        if _age_seconds(ref) <= STALE_SECONDS:
+            return False
+        msg = "The worker stopped responding, so this job was cleared. Please try again."
+    else:
+        return False
+    logger.warning("clearing stale %s run %s for project %s", status, run.get("id"), pid)
+    return await finalize_run(run["id"], pid, "failed", msg)
+
+
+# ---------- worker presence ----------
+async def note_worker_presence(owner: str = INSTANCE_ID) -> None:
+    """Heartbeat so API replicas can tell whether any worker is alive."""
+    await db.worker_heartbeats.update_one(
+        {"id": owner}, {"$set": {"id": owner, "at": now_iso()}}, upsert=True
+    )
+
+
+async def any_worker_alive(within: int = 90) -> bool:
+    cutoff = (now() - timedelta(seconds=within)).isoformat()
+    if await db.worker_heartbeats.find_one({"at": {"$gte": cutoff}}, {"_id": 0}):
+        return True
+    # A worker busy executing renews its run heartbeat; that counts too.
+    run = await db.runs.find_one({"status": "running", "heartbeat_at": {"$gte": cutoff}}, {"_id": 0})
+    return bool(run)
+
+
+async def _require_worker() -> None:
+    embedded = os.environ.get("EMBEDDED_WORKER", "true").strip().lower() not in {"0", "false", "no"}
+    if embedded or await any_worker_alive():
+        return
+    raise HTTPException(
+        503,
+        "No background worker is running to process jobs. Start one "
+        "(python worker.py) on a long-lived host, then try again.",
+    )
+
+
 # ---------- atomic project lease ----------
 async def acquire_project_lease(pid: str, run_id: str) -> bool:
     """Atomically bind ``active_run_id`` on the project only when idle (or stale).
 
     Returns True if this run now owns the project lease, False if another active run holds it.
+    A stale queued/running predecessor (no worker behind it) is finalized first, so a
+    dead deployment can never lease a project forever.
     """
     cutoff = now_iso()
-    # First check if a stale active_run_id is pointing to a non-active run (cleanup)
     proj = await db.projects.find_one({"id": pid}, {"_id": 0})
     if not proj:
         raise HTTPException(404, "Project not found")
     current_rid = proj.get("active_run_id")
-    if current_rid:
+    if current_rid and current_rid != run_id:
         existing = await db.runs.find_one({"id": current_rid}, {"_id": 0})
         if existing and existing.get("status") in {"queued", "running"}:
-            return False
-        # Existing run already finished or vanished; try to atomically swap it out
+            if not await clear_stale_run(pid, existing):
+                return False
+            # Stale run finalized; its lease release cleared the pointer.
+        # Pointer references a finished, vanished, or just-cleared run: swap it out.
         res = await db.projects.update_one(
             {"id": pid, "active_run_id": current_rid},
             {"$set": {"active_run_id": run_id, "lease_expires_at": _lease_until(), "updated_at": cutoff}},
         )
-        return getattr(res, "modified_count", 1) == 1
+        if getattr(res, "modified_count", 1) == 1:
+            return True
 
     res = await db.projects.update_one(
         {"id": pid, "active_run_id": None},
@@ -156,6 +224,7 @@ async def release_quota(user_id: str, run_id: str) -> None:
 async def enqueue_run(project: dict, kind: str, total: int, message: str, job_spec: dict,
                       seconds: int = 0, monthly_limit: int | None = None) -> dict:
     """Atomically admit, reserve quota (if applicable), lease the project, and persist a queued run."""
+    await _require_worker()
     run_id = new_id("run_")
     pid = project["id"]
     uid = project["user_id"]
@@ -259,6 +328,7 @@ async def renew_lease(run_id: str, owner: str = INSTANCE_ID) -> None:
 
 async def claim_next_run(owner: str = INSTANCE_ID) -> dict | None:
     """Atomically claim one queued run, or reclaim one running run whose lease expired."""
+    await note_worker_presence(owner)
     cutoff = now_iso()
     # 1. Try queued runs first (oldest first)
     queued = await db.runs.find({"status": "queued"}, {"_id": 0}).sort("started_at", 1).to_list(20)

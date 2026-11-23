@@ -373,6 +373,8 @@ def test_share_access_immutable_releases_and_cache_headers(memdb, monkeypatch):
 
 # ========== 4. P0: Durable jobs, atomic leases & quotas, persisted cancellation ==========
 def test_durable_jobs_leases_quotas_cancellation_and_restart_recovery(memdb, monkeypatch):
+    # This test claims runs in-process, i.e. the embedded-worker topology.
+    monkeypatch.setenv("EMBEDDED_WORKER", "true")
     proj = {
         "id": "prj_j", "user_id": "u1", "name": "Job Demo", "status": "ready",
         "steps": [{"id": "s1", "screenshot_path": "a.jpg", "caption": "hi"}],
@@ -420,6 +422,7 @@ def test_durable_jobs_leases_quotas_cancellation_and_restart_recovery(memdb, mon
 
 
 def test_export_retry_does_not_duplicate_artifact(memdb, monkeypatch):
+    monkeypatch.setenv("EMBEDDED_WORKER", "true")
     proj = {
         "id": "prj_ex", "user_id": "u1", "name": "Export Demo", "status": "ready",
         "steps": [{"id": "s1", "screenshot_path": "a.jpg", "caption": "hi"}],
@@ -447,6 +450,82 @@ def test_export_retry_does_not_duplicate_artifact(memdb, monkeypatch):
 
     fresh = asyncio.run(memdb.projects.find_one({"id": "prj_ex"}))
     assert len(fresh["exports"]) == 1  # cached / deduplicated, never duplicated
+
+
+# ========== 4b. Stale runs never lease a project forever; enqueue needs a worker ==========
+def _job_proj(pid):
+    return {
+        "id": pid, "user_id": "u1", "name": "Stale Demo", "status": "ready",
+        "steps": [{"id": "s1", "screenshot_path": "a.jpg", "caption": "hi"}],
+        "exports": [], "active_run_id": None, "is_deleted": False,
+    }
+
+
+def test_enqueue_fails_fast_when_no_worker(memdb, monkeypatch):
+    monkeypatch.setenv("EMBEDDED_WORKER", "false")
+    proj = _job_proj("prj_nw")
+    asyncio.run(memdb.projects.insert_one(proj))
+
+    with pytest.raises(Exception) as exc:
+        asyncio.run(jobs.enqueue_run(proj, "export", 1, "x", {"action": "export"}))
+    assert getattr(exc.value, "status_code", None) == 503
+    # The rejected attempt must not lease the project or queue anything
+    fresh = asyncio.run(memdb.projects.find_one({"id": "prj_nw"}))
+    assert not fresh.get("active_run_id")
+    assert asyncio.run(memdb.runs.find_one({"project_id": "prj_nw"})) is None
+
+    # Once a worker heartbeats, enqueue succeeds again
+    asyncio.run(jobs.note_worker_presence("wrk_ext"))
+    run = asyncio.run(jobs.enqueue_run(proj, "export", 1, "x", {"action": "export"}))
+    assert run["status"] == "queued"
+
+
+def test_stale_queued_run_auto_clears_and_unblocks(memdb, monkeypatch):
+    monkeypatch.setenv("EMBEDDED_WORKER", "true")
+    proj = _job_proj("prj_sq")
+    asyncio.run(memdb.projects.insert_one(proj))
+    run1 = asyncio.run(jobs.enqueue_run(proj, "export", 1, "x", {"action": "export"}))
+
+    # No worker ever claimed it; age it past the stale window
+    past = (datetime.now(timezone.utc) - timedelta(seconds=jobs.STALE_SECONDS + 60)).isoformat()
+    asyncio.run(memdb.runs.update_one({"id": run1["id"]}, {"$set": {"started_at": past}}))
+
+    run2 = asyncio.run(jobs.enqueue_run(proj, "export", 1, "y", {"action": "export"}))
+    assert run2["status"] == "queued"
+    old = asyncio.run(memdb.runs.find_one({"id": run1["id"]}))
+    assert old["status"] == "failed" and "No worker picked up" in old["message"]
+    fresh = asyncio.run(memdb.projects.find_one({"id": "prj_sq"}))
+    assert fresh["active_run_id"] == run2["id"]
+
+
+def test_stale_running_run_auto_clears_and_unblocks(memdb, monkeypatch):
+    monkeypatch.setenv("EMBEDDED_WORKER", "true")
+    proj = _job_proj("prj_sr")
+    asyncio.run(memdb.projects.insert_one(proj))
+    run1 = asyncio.run(jobs.enqueue_run(proj, "export", 1, "x", {"action": "export"}))
+    claimed = asyncio.run(jobs.claim_next_run(owner="wrk_dead"))
+    assert claimed["id"] == run1["id"]
+
+    # Worker died: lease and heartbeat far past due
+    past = (datetime.now(timezone.utc) - timedelta(seconds=jobs.STALE_SECONDS + 60)).isoformat()
+    asyncio.run(memdb.runs.update_one({"id": run1["id"]},
+                                      {"$set": {"lease_expires_at": past, "heartbeat_at": past}}))
+
+    run2 = asyncio.run(jobs.enqueue_run(proj, "export", 1, "y", {"action": "export"}))
+    assert run2["status"] == "queued"
+    old = asyncio.run(memdb.runs.find_one({"id": run1["id"]}))
+    assert old["status"] == "failed" and "stopped responding" in old["message"]
+
+
+def test_recent_running_run_still_blocks(memdb, monkeypatch):
+    monkeypatch.setenv("EMBEDDED_WORKER", "true")
+    proj = _job_proj("prj_fresh")
+    asyncio.run(memdb.projects.insert_one(proj))
+    asyncio.run(jobs.enqueue_run(proj, "export", 1, "x", {"action": "export"}))
+    asyncio.run(jobs.claim_next_run(owner="wrk_live"))
+    with pytest.raises(Exception) as exc:
+        asyncio.run(jobs.enqueue_run(proj, "export", 1, "y", {"action": "export"}))
+    assert getattr(exc.value, "status_code", None) == 409
 
 
 # ========== 5. P0: Require durable shared media storage ==========
