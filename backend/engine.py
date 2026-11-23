@@ -1,4 +1,8 @@
+import contextlib
 import os
+import sys
+import tempfile
+import threading
 import time
 from typing import Awaitable, Callable
 
@@ -10,7 +14,113 @@ def _playwright():
         from playwright.async_api import async_playwright
     except ImportError as exc:
         raise RuntimeError("Playwright is not installed. Recording needs it, along with a Browserless API key.") from exc
+    if os.environ.get("VERCEL"):
+        # Serverless filesystems are read-only outside /tmp. If the driver
+        # tries to resolve its browser registry under HOME or the package
+        # directory it dies before speaking; keep it in /tmp.
+        os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", "/tmp/ms-playwright")
     return async_playwright
+
+
+class _DriverStderr:
+    """Temporarily redirect fd 2 to a temp file while the Playwright Node
+    driver starts. When the driver dies on a serverless host, Python only
+    reports "Connection closed while reading from the driver" — the actual
+    reason is whatever the driver printed to stderr, which would otherwise
+    vanish into platform logs. Capture it so errors can quote it."""
+
+    def __init__(self):
+        self._tmp = None
+        self._saved = None
+        self._fd = None
+        self._locked = False
+
+    def __enter__(self):
+        if not _STDERR_LOCK.acquire(blocking=False):
+            return self
+        self._locked = True
+        try:
+            self._fd = sys.stderr.fileno()
+            self._tmp = tempfile.TemporaryFile()
+            self._saved = os.dup(self._fd)
+            os.dup2(self._tmp.fileno(), self._fd)
+        except Exception:
+            self.stop()
+        return self
+
+    def stop(self) -> None:
+        if self._saved is not None and self._fd is not None:
+            try:
+                sys.stderr.flush()
+            except Exception:
+                pass
+            try:
+                os.dup2(self._saved, self._fd)
+            except Exception:
+                pass
+            try:
+                os.close(self._saved)
+            except Exception:
+                pass
+            self._saved = None
+        if self._locked:
+            self._locked = False
+            _STDERR_LOCK.release()
+
+    def tail(self, limit: int = 700) -> str:
+        if self._tmp is None:
+            return ""
+        try:
+            self._tmp.seek(0)
+            return self._tmp.read().decode("utf-8", "replace").strip()[-limit:]
+        except Exception:
+            return ""
+
+    def __exit__(self, *exc):
+        self.stop()
+        if self._tmp is not None:
+            try:
+                self._tmp.close()
+            except Exception:
+                pass
+            self._tmp = None
+        return False
+
+
+_STDERR_LOCK = threading.Lock()
+
+
+def _with_driver_stderr(exc: Exception, cap: "_DriverStderr") -> RuntimeError:
+    detail = cap.tail()
+    base = _short(exc)
+    if detail and detail not in base:
+        return RuntimeError(f"{base} — the browser driver reported: {detail}")
+    return RuntimeError(base)
+
+
+@contextlib.asynccontextmanager
+async def _driver():
+    """Start Playwright with driver stderr captured until first connect.
+
+    Yields (playwright, capture). Callers should invoke this only around
+    startup + connect_over_cdp; the capture releases fd 2 when stopped or
+    when the context exits. If startup fails, the raised error quotes the
+    driver's own stderr instead of the generic closed-connection message.
+    """
+    cap = _DriverStderr()
+    with cap:
+        cm = _playwright()()
+        p = None
+        try:
+            p = await cm.__aenter__()
+            yield p, cap
+        except Exception as exc:
+            if cap.tail():
+                raise _with_driver_stderr(exc, cap) from exc
+            raise
+        finally:
+            if p is not None:
+                await cm.__aexit__(None, None, None)
 
 VIEWPORT = {"width": 1280, "height": 800}
 MOBILE_VIEWPORT = {"width": 390, "height": 844}
@@ -221,10 +331,11 @@ async def run_steps(steps: list, on_progress: ProgressFn, capture_only: set | No
                     on_storage=None):
     """Record steps. A Browserless session ends at 120s, so a long script reconnects and replays."""
     budget = 90
-    async with _playwright()() as p:
+    async with _driver() as (p, cap):
         browser = None
         try:
             browser, context, page = await _connect_page(p, viewport, storage_state)
+            cap.stop()
             started = time.monotonic()
             if not storage_state:
                 await _sign_in(page, login)
@@ -311,8 +422,9 @@ async def inspect_after(start_url: str, steps: list, login: dict | None = None, 
                         storage_state: dict | None = None) -> dict:
     """Open the target, replay steps, then list the elements visible on that screen."""
     await netpolicy.validate_url(start_url)
-    async with _playwright()() as p:
+    async with _driver() as (p, cap):
         browser, _, page = await _connect_page(p, VIEWPORT, storage_state)
+        cap.stop()
         try:
             if not storage_state:
                 await _sign_in(page, login)
@@ -342,8 +454,9 @@ async def inspect_after(start_url: str, steps: list, login: dict | None = None, 
 
 
 async def capture_storage(login: dict) -> dict:
-    async with _playwright()() as p:
+    async with _driver() as (p, cap):
         browser, context, page = await _connect_page(p, VIEWPORT, None)
+        cap.stop()
         try:
             await _sign_in(page, login)
             return await context.storage_state()
@@ -356,8 +469,9 @@ async def score_script(start_url: str, steps: list, login: dict | None = None, s
     if start_url:
         await netpolicy.validate_url(start_url)
     results = []
-    async with _playwright()() as p:
+    async with _driver() as (p, cap):
         browser, _, page = await _connect_page(p, VIEWPORT, storage_state)
+        cap.stop()
         try:
             if not storage_state:
                 await _sign_in(page, login)
@@ -393,6 +507,7 @@ async def score_script(start_url: str, steps: list, login: dict | None = None, s
 
 
 async def test_connection() -> None:
-    async with _playwright()() as p:
+    async with _driver() as (p, cap):
         browser = await p.chromium.connect_over_cdp(_ws_url(), timeout=30000)
+        cap.stop()
         await browser.close()

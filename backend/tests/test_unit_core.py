@@ -6,6 +6,7 @@ import pytest
 
 import ai
 import core
+import engine
 import product
 
 
@@ -73,6 +74,58 @@ def test_production_rejects_wildcard_cors(monkeypatch):
     monkeypatch.setattr(core, "DB_BACKEND", "mongodb")
     with pytest.raises(RuntimeError):
         core.validate_config()
+
+
+def test_driver_stderr_is_quoted_in_errors():
+    class Cap:
+        def tail(self, limit=700):
+            return "node: cannot open shared object file"
+
+    err = engine._with_driver_stderr(RuntimeError("Connection closed while reading from the driver"), Cap())
+    assert "Connection closed" in str(err) and "cannot open shared object" in str(err)
+
+
+def test_driver_stderr_captures_fd2_output():
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    code = (
+        "import os, engine\n"
+        "with engine._DriverStderr() as cap:\n"
+        "    os.write(2, b'boom from driver\\n')\n"
+        "    assert 'boom from driver' in cap.tail(), cap.tail()\n"
+        "print('capture-ok')\n"
+    )
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
+                         cwd=str(Path(engine.__file__).parent), timeout=30)
+    assert out.returncode == 0 and "capture-ok" in out.stdout
+
+
+def test_dead_driver_error_quotes_its_stderr(tmp_path):
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    fake = tmp_path / "fake-node.sh"
+    fake.write_text("#!/bin/sh\necho 'fake-driver-fatal: libnss3.so missing' >&2\nexit 1\n")
+    fake.chmod(0o755)
+    code = "\n".join([
+        "import asyncio, engine",
+        "async def main():",
+        "    try:",
+        "        await engine.test_connection()",
+        "        print('UNEXPECTED SUCCESS')",
+        "    except Exception as exc:",
+        "        print('ERR:', exc)",
+        "asyncio.run(main())",
+    ])
+    env = {**os.environ, "PLAYWRIGHT_NODEJS_PATH": str(fake)}
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
+                         cwd=str(Path(engine.__file__).parent), env=env, timeout=60)
+    assert "fake-driver-fatal: libnss3.so missing" in out.stdout, out.stdout + out.stderr
+    assert "UNEXPECTED SUCCESS" not in out.stdout
 
 
 def test_short_jwt_secret_is_flagged(monkeypatch):

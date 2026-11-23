@@ -1385,7 +1385,7 @@ async def live_start(pid: str, body: LiveStartIn, user: dict = Depends(get_curre
     try:
         found = await live_browser.open_session(pid, start, prepared, project.get("login"), user["user_id"])
     except Exception as exc:
-        raise HTTPException(424, f"Could not open the live browser: {str(exc)[:180]}")
+        raise HTTPException(424, f"Could not open the live browser: {str(exc)[:700]}")
     return {"url": found["url"], "after": body.after}
 
 
@@ -1870,7 +1870,7 @@ async def test_browserless(user: dict = Depends(get_current_user)):
     try:
         await engine.test_connection()
     except Exception as exc:
-        raise HTTPException(424, f"Could not connect to Browserless: {str(exc)[:200]}")
+        raise HTTPException(424, f"Could not connect to Browserless: {str(exc)[:1000]}")
     return {"ok": True}
 
 

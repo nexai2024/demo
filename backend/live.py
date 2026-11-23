@@ -4,7 +4,7 @@ import json
 import os
 import time
 
-from engine import VIEWPORT, _perform, _playwright, _short, _sign_in, _ws_url, blocked_page
+from engine import VIEWPORT, _DriverStderr, _perform, _playwright, _short, _sign_in, _ws_url, _with_driver_stderr, blocked_page
 
 ELEMENT_AT = """({x, y}) => {
   const el = document.elementFromPoint(x, y);
@@ -225,8 +225,17 @@ async def _drop_browser(session: _Session) -> None:
 async def _connect(session: _Session) -> None:
     import netpolicy
     await netpolicy.validate_url(session.start_url)
-    session.playwright = await _playwright()().start()
-    session.browser = await session.playwright.chromium.connect_over_cdp(_ws_url(), timeout=45000)
+    # Capture the driver's stderr during startup so a dead-on-arrival driver
+    # (e.g. on a serverless host) reports its real error, not just
+    # "Connection closed while reading from the driver".
+    with _DriverStderr() as cap:
+        try:
+            session.playwright = await _playwright()().start()
+            session.browser = await session.playwright.chromium.connect_over_cdp(_ws_url(), timeout=45000)
+        except Exception as exc:
+            if cap.tail():
+                raise _with_driver_stderr(exc, cap) from exc
+            raise
     context = await session.browser.new_context(viewport=VIEWPORT, device_scale_factor=1)
     await netpolicy.install_browser_guard(context)
     session.page = await context.new_page()
