@@ -38,6 +38,25 @@ def test_production_accepts_safe_config(monkeypatch):
     assert core.cors_origins() == ["https://app.example.com"]
 
 
+@pytest.mark.parametrize("raw,expected", [
+    # exact value, as documented
+    ("https://www.appshowcase.xyz", ["https://www.appshowcase.xyz"]),
+    # scheme-less paste (the production incident: preflight 400 for every origin)
+    ("www.appshowcase.xyz", ["https://www.appshowcase.xyz"]),
+    # quoted / trailing slash / pasted with a page path
+    ('"https://www.appshowcase.xyz/"', ["https://www.appshowcase.xyz"]),
+    ("https://www.appshowcase.xyz/dashboard", ["https://www.appshowcase.xyz"]),
+    # apex + www, deduped
+    ("appshowcase.xyz, https://www.appshowcase.xyz, https://www.appshowcase.xyz",
+     ["https://appshowcase.xyz", "https://www.appshowcase.xyz"]),
+    # local dev stays http
+    ("localhost:3001", ["http://localhost:3001"]),
+])
+def test_cors_origins_tolerates_paste_errors(monkeypatch, raw, expected):
+    monkeypatch.setenv("CORS_ORIGINS", raw)
+    assert core.cors_origins() == expected
+
+
 def test_tokens_are_type_scoped(monkeypatch):
     monkeypatch.setenv("JWT_SECRET", "k9X2pQ7mR4vL8nT1wZ5cB3jF6hD0yG9a")
     assert core.decode_review_token(core.create_viewer_token("p1")) is None

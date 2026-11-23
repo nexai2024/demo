@@ -162,8 +162,32 @@ def decode_review_claims(token: str) -> tuple[str, str] | None:
 
 
 def cors_origins() -> list[str]:
-    raw = os.environ.get("CORS_ORIGINS", "")
-    origins = [o.strip().rstrip("/") for o in raw.split(",") if o.strip()]
+    """Parse CORS_ORIGINS, tolerating classic paste errors.
+
+    Browsers send Origin as exactly ``scheme://host[:port]``, and Starlette
+    compares it verbatim — so a scheme-less (``www.example.com``), quoted, or
+    path-carrying (``https://example.com/dashboard``) env value would never
+    match and every preflight would 400 with "Disallowed CORS origin".
+    Normalize each entry to a bare origin so those pastes still work.
+    """
+    from urllib.parse import urlparse
+
+    origins: list[str] = []
+    for part in os.environ.get("CORS_ORIGINS", "").split(","):
+        o = part.strip().strip('"').strip("'").strip().rstrip("/")
+        if not o:
+            continue
+        if o == "*":
+            origins.append(o)
+            continue
+        if "://" not in o:
+            scheme = "http" if o.startswith(("localhost", "127.0.0.1")) else "https"
+            o = f"{scheme}://{o}"
+        parsed = urlparse(o)
+        if parsed.netloc:
+            o = f"{parsed.scheme}://{parsed.netloc}"
+        if o not in origins:
+            origins.append(o)
     if origins:
         return origins
     return [] if is_production() else ["http://localhost:3000", "http://127.0.0.1:3000"]

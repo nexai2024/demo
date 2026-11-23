@@ -1832,6 +1832,7 @@ async def ready():
               "browserless": bool(engine and engine.is_configured()),
               "storage": st.get("mode"), "storage_ok": st.get("mode") in {"s3", "remote", "local"},
               "config_ok": not fatal, "config_problems": problems,
+              "cors_origins": cors_origins(),
               "startup_error": getattr(app.state, "config_error", None)}
     try:
         await db.runs.find_one({"id": "__ready__"}, {"_id": 0})
@@ -1898,6 +1899,7 @@ app.add_middleware(
 
 @app.on_event("startup")
 async def startup():
+    logger.info("CORS allowlist (from CORS_ORIGINS): %s", cors_origins() or "EMPTY — cross-origin requests will be rejected")
     # Never let a config/infra problem kill the whole function: on serverless
     # hosts a raised startup turns every route into an opaque
     # FUNCTION_INVOCATION_FAILED. Log it, remember it, and let /api/health
