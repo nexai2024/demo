@@ -222,12 +222,13 @@ async def load_frames(project: dict) -> list:
         show_caption = False
     brand = project.get("brand") or {}
     frames = []
+    clip_cache: dict[str, bytes] = {}
     hook = project.get("export_preset") == "hook"
     elapsed = 0
     for s in project["steps"]:
         if s.get("scene_type"):
             audio = (await get_object(s["audio_path"]))[0] if s.get("audio_path") else None
-            frames.append((s, compose_scene(s, brand), compose_overlay("", False, brand), audio, []))
+            frames.append((s, compose_scene(s, brand), compose_overlay("", False, brand), audio, [], None))
             elapsed += _step_ms(s, bool(audio))
             if hook and elapsed >= 15000:
                 break
@@ -241,8 +242,20 @@ async def load_frames(project: dict) -> list:
             except Exception:
                 continue
             motion.append(compose_base(blob, None, brand, s.get("annotations")))
+        video = None
+        vid = s.get("video") or {}
+        clips = project.get("video_clips") or []
+        clip_idx = vid.get("clip")
+        if isinstance(clip_idx, int) and 0 <= clip_idx < len(clips) and clips[clip_idx]:
+            try:
+                if clips[clip_idx] not in clip_cache:
+                    clip_cache[clips[clip_idx]] = (await get_object(clips[clip_idx]))[0]
+                video = (clip_cache[clips[clip_idx]],
+                         (vid.get("start_ms") or 0) / 1000, (vid.get("end_ms") or 0) / 1000)
+            except Exception:
+                video = None
         frames.append((s, compose_base(shot, s.get("hotspot"), brand, s.get("annotations")),
-                       compose_overlay(s.get("caption", ""), show_caption, brand), audio, motion))
+                       compose_overlay(s.get("caption", ""), show_caption, brand), audio, motion, video))
         elapsed += _step_ms(s, bool(audio))
         if hook and elapsed >= 15000:
             break
@@ -299,7 +312,7 @@ def _ease(images: list) -> list:
 
 def build_gif(frames: list) -> bytes:
     imgs, durs, prev = [], [], None
-    for step, base, over, _, motion in frames:
+    for step, base, over, _, motion, _video in frames:
         frame = Image.alpha_composite(base.convert("RGBA"), over).convert("RGB")
         small = frame.resize(_wh())
         tm = min(_fade_ms(step), 450)
@@ -394,11 +407,49 @@ def _dissolve(segs: list, durations: list, fades: list, tmp: str) -> None:
 def build_mp4(frames: list, with_audio: bool, zoom: bool = True) -> bytes:
     with tempfile.TemporaryDirectory() as tmp:
         segs, durations, fades = [], [], []
-        for i, (step, base, over, audio, motion) in enumerate(frames):
+        clip_files: dict[int, str] = {}
+        for i, (step, base, over, audio, motion, video) in enumerate(frames):
             use_audio = with_audio and audio is not None
             secs = _step_ms(step, use_audio) / 1000
             fades.append(0 if i == 0 else min(_fade_ms(step) / 1000, 0.45))
             slide = None
+            if video:
+                # Real recorded motion for this step's window; the last frame
+                # is cloned when narration runs longer than the action.
+                clip_bytes, v_start, v_end = video
+                key = id(clip_bytes)
+                if key not in clip_files:
+                    clip_path = os.path.join(tmp, f"clip{len(clip_files)}.mp4")
+                    with open(clip_path, "wb") as handle:
+                        handle.write(clip_bytes)
+                    clip_files[key] = clip_path
+                over.save(os.path.join(tmp, f"o{i}.png"))
+                seg = os.path.join(tmp, f"s{i}.mp4")
+                cmd = [FFMPEG, "-y", "-ss", f"{v_start:.3f}", "-to", f"{max(v_end, v_start + 0.1):.3f}",
+                       "-i", clip_files[key], "-loop", "1", "-framerate", "30", "-i", os.path.join(tmp, f"o{i}.png")]
+                if use_audio:
+                    a_path = os.path.join(tmp, f"a{i}.mp3")
+                    with open(a_path, "wb") as f:
+                        f.write(audio)
+                    cmd += ["-i", a_path]
+                else:
+                    cmd += ["-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo"]
+                w, h = _wh()
+                window = max(0.1, v_end - v_start)
+                # Speed long actions up to fit the narration (same rule as
+                # the web player) instead of cutting them off mid-motion;
+                # freeze the last frame when the clip is shorter.
+                speed = min(3.0, window / secs) if window > secs * 1.05 else 1.0
+                sped = f"setpts=PTS/{speed:.3f}," if speed > 1.0 else ""
+                graph = (f"[0:v]scale={w}:{h},{sped}tpad=stop_mode=clone:stop_duration={secs:.3f},"
+                         f"trim=duration={secs:.3f},setpts=PTS-STARTPTS[v0];[v0][1:v]overlay=0:0,format=yuv420p[v]")
+                cmd += ["-filter_complex", graph, "-map", "[v]", "-map", "2:a",
+                        "-t", f"{secs:.2f}", "-af", "apad", "-c:v", "libx264", "-preset", "veryfast",
+                        "-r", "30", "-pix_fmt", "yuv420p", "-c:a", "aac", "-ar", "44100", "-ac", "2", seg]
+                subprocess.run(cmd, check=True, capture_output=True)
+                segs.append(seg)
+                durations.append(secs)
+                continue
             if motion and step.get("action") == "scroll":
                 glide = min(3.2, max(1.8, len(motion) * 0.28))
                 pictures = _ease([_burn(shot, over) for shot in motion] + [_burn(base, over)])

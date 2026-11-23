@@ -48,6 +48,10 @@ export function errMsg(e) {
 }
 
 export const stepAsset = (pid, step, kind, index) => {
+  if (kind === "video") {
+    const v = step.video || {};
+    return `${API}/projects/${pid}/steps/${step.id}/video?v=${v.clip || 0}-${v.start_ms || 0}`;
+  }
   if (kind === "motion") {
     const stamp = (step.motion_paths?.[index] || step.screenshot_path || "").slice(-14);
     return `${API}/projects/${pid}/steps/${step.id}/motion/${index}?v=${encodeURIComponent(stamp)}`;
@@ -60,6 +64,7 @@ export const stepAsset = (pid, step, kind, index) => {
 
 export const publicAsset = (shareId, step, kind, token, index) => {
   const auth = token ? `&t=${encodeURIComponent(token)}` : "";
+  if (kind === "video") return `${API}/public/${shareId}/steps/${step.id}/video?v=${step.v}${auth}`;
   if (kind === "motion") return `${API}/public/${shareId}/steps/${step.id}/motion/${index}?v=${step.v}${auth}`;
   const track = kind === "audio" && step.audio_track === "alt" ? "&track=alt" : "";
   return `${API}/public/${shareId}/steps/${step.id}/${kind}?v=${step.v}${auth}${track}`;

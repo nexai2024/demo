@@ -1,3 +1,4 @@
+import asyncio
 import contextlib
 import os
 import sys
@@ -287,13 +288,24 @@ async def _perform(page, step: dict, capture: bool, pace: str = "show"):
         if not step.get("selector"):
             raise ValueError(f"{a} step needs a selector")
         loc, box = await _locate(page, step, quick=pace == "fast")
+        if box:
+            # Glide the (injected) cursor onto the target so the action is
+            # performed on camera instead of teleporting between stills.
+            try:
+                await page.mouse.move(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2, steps=24)
+                await page.wait_for_timeout(90)
+            except Exception:
+                pass
         if a == "click":
             if capture:
                 pre_shot = await page.screenshot(type="jpeg", quality=85)
+            step["_action_at"] = _VideoRecorder.now_ms()
             await loc.click(timeout=10000)
         elif a == "hover":
+            step["_action_at"] = _VideoRecorder.now_ms()
             await loc.hover(timeout=10000)
         else:
+            step["_action_at"] = _VideoRecorder.now_ms()
             await loc.click(timeout=10000)
             await loc.fill("")
             await loc.press_sequentially(step.get("text") or "", delay=35)
@@ -302,6 +314,7 @@ async def _perform(page, step: dict, capture: bool, pace: str = "show"):
         if motion:
             step["_motion"] = motion
     elif a == "press":
+        step["_action_at"] = _VideoRecorder.now_ms()
         key = step.get("text") or "Enter"
         if len(key) > 1 and key not in {"Enter", "Tab", "Escape", "Backspace", "Delete", "ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home", "End"}:
             await page.keyboard.insert_text(key)
@@ -340,6 +353,159 @@ async def _sign_in(page, login: dict | None) -> None:
     await page.wait_for_timeout(1200)
 
 
+CURSOR_JS = """(() => {
+  if (window.__fcCursor) return;
+  window.__fcCursor = true;
+  const boot = () => {
+    if (!document.body || document.getElementById('__fc_cursor')) return;
+    const style = document.createElement('style');
+    style.textContent = '#__fc_cursor{position:fixed;left:0;top:0;width:26px;height:26px;z-index:2147483647;pointer-events:none;filter:drop-shadow(0 2px 6px rgba(0,0,0,.45))}'
+      + '#__fc_cursor .ring{position:absolute;left:2px;top:2px;width:16px;height:16px;border:2px solid rgba(255,255,255,.92);border-radius:50%;opacity:0}'
+      + '#__fc_cursor.boom .ring{animation:fcboom .45s ease-out}@keyframes fcboom{0%{opacity:.95;transform:scale(.4)}100%{opacity:0;transform:scale(2.8)}}';
+    document.head.appendChild(style);
+    const el = document.createElement('div');
+    el.id = '__fc_cursor';
+    el.innerHTML = '<svg width="26" height="26" viewBox="0 0 24 24"><path d="M5 3l14 7-6.5 1.5L9 18z" fill="#fff" stroke="#0f172a" stroke-width="1.6"/></svg><span class="ring"></span>';
+    document.body.appendChild(el);
+    let tx = innerWidth / 2, ty = innerHeight / 2, x = tx, y = ty, pressed = false;
+    addEventListener('mousemove', (e) => { tx = e.clientX; ty = e.clientY; }, true);
+    addEventListener('mousedown', () => { pressed = true; el.classList.remove('boom'); void el.offsetWidth; el.classList.add('boom'); }, true);
+    addEventListener('mouseup', () => { pressed = false; }, true);
+    const loop = () => {
+      x += (tx - x) * 0.34; y += (ty - y) * 0.34;
+      el.style.transform = 'translate(' + x.toFixed(1) + 'px,' + y.toFixed(1) + 'px) scale(' + (pressed ? 0.8 : 1) + ')';
+      requestAnimationFrame(loop);
+    };
+    loop();
+  };
+  if (document.body) boot(); else addEventListener('DOMContentLoaded', boot);
+})()"""
+
+
+async def _install_cursor(context) -> None:
+    """Animated on-screen cursor: glides with easing, presses, ripples on click.
+
+    The page has no visible pointer in headless/CDP sessions; this overlay is
+    the demo's performer, in both the recorded video and poster screenshots.
+    It is JS-driven, so its motion also makes the screencast emit frames.
+    """
+    try:
+        await context.add_init_script(CURSOR_JS)
+    except Exception:
+        pass
+
+
+class _VideoRecorder:
+    """Streams CDP screencast frames to disk and encodes per-session clips.
+
+    Frames arrive only when the page repaints, each with an epoch-ms
+    timestamp. Steps are marked on the same clock and rebased to the clip's
+    first frame, giving the player/export an edit decision list:
+    step -> (clip, start_ms, end_ms). Encoding mirrors render._slideshow's
+    concat-demuxer approach, with our own ffmpeg (no Playwright ffmpeg).
+    """
+
+    def __init__(self, enabled: bool = True):
+        self.enabled = enabled and os.environ.get("VIDEO_CAPTURE", "true").strip().lower() not in {"0", "false", "no"}
+        self.clips: list[dict] = []
+        self._clip: dict | None = None
+
+    @staticmethod
+    def now_ms() -> float:
+        return time.time() * 1000
+
+    async def start(self, page) -> bool:
+        if not self.enabled:
+            return False
+        import tempfile
+
+        clip = {"dir": tempfile.mkdtemp(prefix="fc_clip_"), "frames": [], "t0": None, "started": self.now_ms()}
+
+        def on_frame(frame):
+            try:
+                idx = len(clip["frames"])
+                path = os.path.join(clip["dir"], f"{idx:05d}.jpg")
+                with open(path, "wb") as handle:
+                    handle.write(frame["data"])
+                ts = float(frame["timestamp"])
+                if clip["t0"] is None:
+                    clip["t0"] = ts
+                clip["frames"].append((path, ts))
+            except Exception:
+                pass
+
+        try:
+            await page.screencast.start(on_frame=on_frame, size={"width": 1920, "height": 1200}, quality=88)
+        except Exception:
+            self._clip = None
+            return False
+        clip["index"] = len(self.clips)
+        self.clips.append(clip)
+        self._clip = clip
+        return True
+
+    async def stop(self, page) -> None:
+        if self._clip is None:
+            return
+        try:
+            await page.screencast.stop()
+        except Exception:
+            pass
+        self._clip = None
+
+    def range_for(self, start_epoch: float, end_epoch: float, action_epoch: float | None = None) -> dict | None:
+        clip = self._clip
+        if clip is None or clip["t0"] is None:
+            return None
+        start = max(0, int(start_epoch - clip["t0"]))
+        end = max(start + 100, int(end_epoch - clip["t0"]))
+        window = {"clip": clip["index"], "start_ms": start, "end_ms": end}
+        if action_epoch:
+            # When the action itself landed (click/press/first keystroke),
+            # so renderers can time the zoom settle and click ripple to it.
+            window["action_ms"] = min(end, max(start, int(action_epoch - clip["t0"])))
+        return window
+
+    def encode_all(self) -> list[bytes]:
+        """Encode each clip to H.264 MP4 bytes (30fps, from frame timestamps)."""
+        import subprocess
+
+        import imageio_ffmpeg
+
+        ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+        out: list[bytes] = []
+        for clip in self.clips:
+            frames = clip["frames"]
+            if len(frames) < 2:
+                out.append(b"")
+                continue
+            lines, last = [], None
+            for j, (path, ts) in enumerate(frames):
+                nxt = frames[j + 1][1] if j + 1 < len(frames) else ts + 500
+                dur = max(0.016, min(2.0, (nxt - ts) / 1000))
+                lines.append(f"file '{path}'\nduration {dur:.3f}\n")
+                last = path
+            lines.append(f"file '{last}'\n")
+            list_path = os.path.join(clip["dir"], "frames.txt")
+            with open(list_path, "w") as handle:
+                handle.writelines(lines)
+            target = os.path.join(clip["dir"], "clip.mp4")
+            subprocess.run([ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", list_path,
+                            "-vf", "fps=30,format=yuv420p", "-c:v", "libx264", "-preset", "veryfast",
+                            "-pix_fmt", "yuv420p", "-movflags", "+faststart", target],
+                           check=True, capture_output=True)
+            with open(target, "rb") as handle:
+                out.append(handle.read())
+        return out
+
+    def cleanup(self) -> None:
+        import shutil
+
+        for clip in self.clips:
+            shutil.rmtree(clip["dir"], ignore_errors=True)
+        self.clips = []
+
+
 async def _connect_page(playwright, viewport: dict | None, storage_state: dict | None):
     browser = await playwright.chromium.connect_over_cdp(_ws_url(), timeout=45000)
     kwargs = {"viewport": viewport or VIEWPORT, "device_scale_factor": 1}
@@ -347,6 +513,7 @@ async def _connect_page(playwright, viewport: dict | None, storage_state: dict |
         kwargs["storage_state"] = storage_state
     context = await browser.new_context(**kwargs)
     await netpolicy.install_browser_guard(context)
+    await _install_cursor(context)
     return browser, context, await context.new_page()
 
 
@@ -355,14 +522,16 @@ ProgressFn = Callable[[int, dict, str, dict], Awaitable[None]]
 
 async def run_steps(steps: list, on_progress: ProgressFn, capture_only: set | None = None, retries: int = 1,
                     viewport: dict | None = None, login: dict | None = None, storage_state: dict | None = None,
-                    on_storage=None):
+                    on_storage=None, record_video: bool = True):
     """Record steps. A Browserless session ends at 120s, so a long script reconnects and replays."""
     budget = 90
+    recorder = _VideoRecorder(enabled=record_video)
     async with _driver() as (p, cap):
         browser = None
         try:
             browser, context, page = await _connect_page(p, viewport, storage_state)
             cap.stop()
+            await recorder.start(page)
             started = time.monotonic()
             if not storage_state:
                 await _sign_in(page, login)
@@ -374,11 +543,13 @@ async def run_steps(steps: list, on_progress: ProgressFn, capture_only: set | No
 
             async def renew(upto: int) -> None:
                 nonlocal browser, context, page, started
+                await recorder.stop(page)
                 try:
                     await browser.close()
                 except Exception:
                     pass
                 browser, context, page = await _connect_page(p, viewport, storage_state)
+                await recorder.start(page)
                 started = time.monotonic()
                 if not storage_state:
                     await _sign_in(page, login)
@@ -393,6 +564,7 @@ async def run_steps(steps: list, on_progress: ProgressFn, capture_only: set | No
                     await renew(i)
                 capture = capture_only is None or i in capture_only
                 await on_progress(i, step, "running", {})
+                v_start = recorder.now_ms()
                 err, box, pre_shot, attempts = None, None, None, 0
                 for attempts in range(1, retries + 2):
                     try:
@@ -417,10 +589,20 @@ async def run_steps(steps: list, on_progress: ProgressFn, capture_only: set | No
                     "attempts": attempts, "url": page.url, "captured": capture,
                     "resolved_selector": step.get("resolved_selector"),
                     "motion": step.pop("_motion", None) if capture else None,
+                    "video": recorder.range_for(v_start, recorder.now_ms(), step.get("_action_at")) if capture and not err else None,
                 })
                 if err and blocked_page(page.url):
                     raise RuntimeError(err)
+            await recorder.stop(page)
+            clips: list[bytes] = []
+            if recorder.clips:
+                try:
+                    clips = await asyncio.to_thread(recorder.encode_all)
+                except Exception:
+                    clips = []
+            return {"video_clips": clips}
         finally:
+            recorder.cleanup()
             if browser is not None:
                 await browser.close()
 

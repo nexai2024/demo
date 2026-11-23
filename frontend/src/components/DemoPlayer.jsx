@@ -204,14 +204,69 @@ function Stage({ step, mobile, fade, playing, src }) {
   });
 }
 
-function Caption({ text, accent, top }) {
-  if (!text) return null;
+function Caption({ text, accent, top, words, audioT }) {
+  const timed = Array.isArray(words) && words.length > 0;
+  if (!text && !timed) return null;
+  const nowMs = (audioT || 0) * 1000;
   return (
-    <motion.div key={text} initial={false} animate={{ opacity: 1 }} data-testid="player-caption"
+    <motion.div key={timed ? "karaoke" : text} initial={false} animate={{ opacity: 1 }} data-testid="player-caption"
       className={`absolute left-[6%] right-[6%] ${top ? "top-[5%]" : "bottom-[5%]"} rounded-xl bg-slate-950/85 backdrop-blur-md px-4 py-2.5 sm:px-5 sm:py-3 text-xs sm:text-base font-medium border-l-4 shadow-2xl`}
       style={{ borderColor: accent }}>
-      {text}
+      {timed ? (
+        words.map((w, i) => (
+          <span key={i} data-testid={nowMs >= w.start_ms && nowMs < w.end_ms ? "caption-word-active" : undefined}
+            style={nowMs >= w.start_ms && nowMs < w.end_ms ? { color: accent, fontWeight: 700 } : nowMs >= w.end_ms ? { color: "#e2e8f0" } : { color: "#94a3b8" }}>
+            {w.w}{i < words.length - 1 ? " " : ""}
+          </span>
+        ))
+      ) : text}
     </motion.div>
+  );
+}
+
+function VideoStage({ step, src, playing, rate, poster, holdMs }) {
+  const ref = useRef(null);
+  const v = step.video || {};
+  const start = (v.start_ms || 0) / 1000;
+  const end = Math.max(start + 0.1, (v.end_ms || 0) / 1000);
+  // Fit the recorded action window into the narration hold: speed long
+  // actions up instead of cutting them mid-motion (freeze covers short ones).
+  const windowS = end - start;
+  const fit = holdMs ? Math.min(Math.max((windowS * rate * 1000) / holdMs, rate), 4) : rate;
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const seek = () => { if (el.currentTime < start || el.currentTime >= end) { try { el.currentTime = start; } catch { /* not ready */ } } };
+    seek();
+    el.addEventListener("loadedmetadata", seek);
+    return () => el.removeEventListener("loadedmetadata", seek);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [step.id]);
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    el.playbackRate = fit || 1;
+    if (playing) {
+      if (el.currentTime >= end - 0.03 || el.currentTime < start) { try { el.currentTime = start; } catch { /* noop */ } }
+      el.play().catch(() => {});
+    } else {
+      el.pause();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [playing, fit, step.id]);
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return undefined;
+    const iv = setInterval(() => {
+      if (el.currentTime >= end) el.pause();
+      else if (el.currentTime < start) { try { el.currentTime = start; } catch { /* noop */ } }
+    }, 120);
+    return () => clearInterval(iv);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [step.id]);
+  return (
+    <video ref={ref} src={src(step, "video")} poster={poster} muted playsInline preload="auto"
+      className="absolute inset-0 h-full w-full object-cover object-top" data-testid="player-video" />
   );
 }
 
@@ -238,7 +293,16 @@ export const DemoPlayer = ({ steps, src, narrationMode = "both", brand = {}, ini
   const hold = isScene ? step.exit_trigger !== "timer"
     : (guided && step?.hotspot && ["click", "hover", "type"].includes(step?.action)) || choices.length > 0;
   const [mobile, setMobile] = useState(false);
+  const [audioT, setAudioT] = useState(0);
   const entered = useRef(Date.now());
+
+  useEffect(() => {
+    const a = audioRef.current;
+    if (!a) return undefined;
+    const h = () => setAudioT(a.currentTime);
+    a.addEventListener("timeupdate", h);
+    return () => a.removeEventListener("timeupdate", h);
+  }, []);
 
   const go = useCallback((i) => {
     if (!visible.length) return;
@@ -325,6 +389,10 @@ export const DemoPlayer = ({ steps, src, narrationMode = "both", brand = {}, ini
         {isScene ? (
           <SceneStage key={step.id} step={step} accent={accent} onAdvance={advanceFromScene}
             onLead={onLead ? (s, payload) => onLead(s, idx, payload) : undefined} />
+        ) : step.video?.end_ms ? (
+          <VideoStage key={step.id} step={step} src={src} playing={playing} rate={rate}
+            holdMs={hold ? 0 : sceneMs(step, withAudio && hasAudio(step))}
+            poster={hasShot(step) ? src(step, "screenshot") : undefined} />
         ) : (
           <Stage step={step} mobile={mobile} fade={fadeSec(step)} playing={playing} src={src} />
         )}
@@ -341,7 +409,7 @@ export const DemoPlayer = ({ steps, src, narrationMode = "both", brand = {}, ini
             {ann.kind === "callout" && ann.text && <span className="absolute -top-7 left-0 whitespace-nowrap rounded-md px-2 py-1 text-xs font-semibold text-white" style={{ background: accent }}>{ann.text}</span>}
           </span>
         ))}
-        {!isScene && showCaption && <Caption text={step.caption} accent={accent} top={brand.caption_position === "top"} />}
+        {!isScene && showCaption && <Caption text={step.caption} accent={accent} top={brand.caption_position === "top"} words={step.words} audioT={audioT} />}
         {cta?.url && idx === visible.length - 1 && choices.length === 0 && (
           <a href={cta.url} onClick={() => onCta?.(idx)} className="absolute bottom-16 left-1/2 -translate-x-1/2 rounded-lg px-4 py-2 text-sm font-semibold text-white" style={{ background: accent }} data-testid="player-cta">{cta.label || "Continue"}</a>
         )}

@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 import os
 import random
@@ -32,7 +33,20 @@ def models() -> list[str]:
     return [primary] + ([fallback] if fallback and fallback != primary else [])
 
 
+def _elevenlabs_config() -> tuple[str, str, str] | None:
+    """(api_key, voice_id, model) when ElevenLabs narration is configured."""
+    key = os.environ.get("ELEVENLABS_API_KEY", "")
+    if not key:
+        return None
+    return (key,
+            os.environ.get("ELEVENLABS_VOICE_ID", "21m00Tcm4TlvDq8ikWAM"),
+            os.environ.get("ELEVENLABS_MODEL", "eleven_v4"))
+
+
 def tts_key() -> tuple[str, str]:
+    cfg = _elevenlabs_config()
+    if cfg:
+        return cfg[0], f"ElevenLabs {cfg[2]}"
     return os.environ.get("OPENAI_API_KEY", ""), "OpenAI TTS HD"
 
 
@@ -190,3 +204,58 @@ async def repair_selector(step: dict, elements: list, session_id: str) -> dict:
 async def synthesize(text: str, voice: str) -> bytes:
     response = await _post("/audio/speech", {"model": "tts-1-hd", "voice": voice, "input": text[:4000]})
     return response.content
+
+
+def _words_from_alignment(alignment: dict) -> list[dict]:
+    """Group ElevenLabs character alignment into word timings (ms)."""
+    chars = alignment.get("characters") or []
+    starts = alignment.get("character_start_times_seconds") or []
+    ends = alignment.get("character_end_times_seconds") or []
+    words: list[dict] = []
+    cur: dict | None = None
+    for ch, st, en in zip(chars, starts, ends):
+        if not ch or ch.isspace():
+            if cur:
+                words.append(cur)
+                cur = None
+            continue
+        if cur is None:
+            cur = {"w": ch, "start_ms": int(float(st) * 1000), "end_ms": int(float(en) * 1000)}
+        else:
+            cur["w"] += ch
+            cur["end_ms"] = int(float(en) * 1000)
+    if cur:
+        words.append(cur)
+    return words
+
+
+async def synthesize_timed(text: str, voice: str) -> tuple[bytes, list[dict]]:
+    """(audio_mp3, word_timings) for one narration clip.
+
+    ElevenLabs (when ELEVENLABS_API_KEY is set) returns character-level
+    alignment, grouped here into words for karaoke captions and
+    narration-driven timing. OpenAI's speech API returns no timings, so
+    the fallback yields an empty word list and block captions as before.
+    Note: OpenAI tts-1-hd is deprecated (shutdown Jan 6, 2027).
+    """
+    cfg = _elevenlabs_config()
+    if not cfg:
+        return await synthesize(text, voice), []
+    key, voice_id, model = cfg
+    try:
+        async with httpx.AsyncClient(timeout=120) as client:
+            response = await client.post(
+                f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}/with-timestamps",
+                headers={"xi-api-key": key, "Content-Type": "application/json"},
+                json={"text": text[:4000], "model_id": model},
+            )
+    except httpx.HTTPError as exc:
+        raise AIUnavailable("Could not reach ElevenLabs. Check the network and retry.", "network") from exc
+    if response.status_code == 401:
+        raise AIUnavailable("The ElevenLabs API key is invalid or revoked. Update ELEVENLABS_API_KEY.", "invalid_key")
+    if response.status_code >= 400:
+        raise AIUnavailable(f"ElevenLabs rejected the request ({response.status_code}).", "upstream")
+    payload = response.json()
+    audio = base64.b64decode(payload["audio_base64"])
+    alignment = payload.get("alignment") or payload.get("normalized_alignment") or {}
+    return audio, _words_from_alignment(alignment)

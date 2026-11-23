@@ -37,6 +37,7 @@ import copy
 from core import (DB_BACKEND, FATAL_PREFIXES, DuplicateKeyError, config_problems, cors_origins, create_viewer_token, db, validate_config, decode_viewer_token, get_current_user, hash_password, new_id,
                   now, now_iso, verify_password)
 import cinematic
+import compositor
 import jobs
 import netpolicy
 from product import (VIEWPORTS, apply_track, environment_base, estimate_seconds, parse_playwright, prepare_step,
@@ -135,12 +136,17 @@ class Step(BaseModel):
     scene: dict = {}
     exit_trigger: Literal["timer", "continue", "submit"] = "timer"
     skippable: bool = False
+    # Video-first capture: (clip index into project.video_clips, ms window)
+    # plus per-word narration timings from timestamped TTS.
+    video: Optional[dict] = None
+    words: list[dict] = []
 
 
 SERVER_FIELDS = ("screenshot_path", "thumb_path", "audio_path", "audio_text", "audio_voice", "audio_duration_ms",
                  "hotspot", "status", "error", "attempts", "page_url", "resolved_selector", "regression",
                  "health_failed_path", "screenshot_mobile_path", "motion_paths", "visual_delta", "visual_change",
-                 "audio_spoken", "audio_path_alt", "audio_text_alt", "audio_spoken_alt", "audio_duration_alt")
+                 "audio_spoken", "audio_path_alt", "audio_text_alt", "audio_spoken_alt", "audio_duration_alt",
+                 "video", "words")
 
 
 class ProjectIn(BaseModel):
@@ -428,6 +434,7 @@ async def job_record(project: dict, run_id: str, only_idx: Optional[int], final:
     viewport_name = project.get("viewport") or "desktop"
     viewport = VIEWPORTS["mobile" if viewport_name == "mobile" else "desktop"]
     n = len(steps)
+    pending_video: dict[str, dict] = {}
     prev_done = {s["id"] for s in steps if s.get("status") == "done" and s.get("screenshot_path")}
     done_in_run = await jobs.completed_checkpoint_steps(run_id)
     if done_in_run and capture is None:
@@ -451,6 +458,8 @@ async def job_record(project: dict, run_id: str, only_idx: Optional[int], final:
             await run_log(run_id, f"Step {oi + 1}/{n}: {engine.describe(step)}...", current=oi + 1)
             return
         clean_err = vault.scrub(str(data.get("error")), secrets_to_scrub) if data.get("error") else None
+        if data.get("video"):
+            pending_video[step["id"]] = data["video"]
         upd = {"steps.$.status": state, "steps.$.error": clean_err, "steps.$.attempts": data.get("attempts", 1),
                "steps.$.page_url": data.get("url"), "steps.$.resolved_selector": data.get("resolved_selector"),
                "steps.$.regression": state == "failed" and step["id"] in prev_done}
@@ -510,9 +519,37 @@ async def job_record(project: dict, run_id: str, only_idx: Optional[int], final:
             await touch(pid, {"login": vault.seal_login(fresh_login, pid)})
 
         if prepared and (cap_rec is None or cap_rec):
-            await engine.run_steps(prepared, on_progress, capture_only=cap_rec, viewport=viewport,
-                                   login=None if storage else login, storage_state=storage,
-                                   on_storage=None if storage else remember)
+            result = await engine.run_steps(prepared, on_progress, capture_only=cap_rec, viewport=viewport,
+                                            login=None if storage else login, storage_state=storage,
+                                            on_storage=None if storage else remember)
+            # Upload the recorded session clips and point each captured step
+            # at its (clip, start_ms, end_ms) window — the edit decision list
+            # the player and exporter consume.
+            clip_blobs = (result or {}).get("video_clips") or []
+            if clip_blobs and pending_video:
+                fresh_proj = await db.projects.find_one({"id": pid}, {"_id": 0}) or {}
+                existing_clips = list(fresh_proj.get("video_clips") or [])
+                offset = len(existing_clips)
+                new_paths: list[str] = []
+                for blob in clip_blobs:
+                    if blob:
+                        new_paths.append(await put_object(
+                            f"{APP_NAME}/u/{project['user_id']}/{pid}/{pid}_clip{offset + len(new_paths)}_{new_id()}.mp4",
+                            blob, "video/mp4"))
+                    else:
+                        new_paths.append("")
+                await touch(pid, {"video_clips": existing_clips + new_paths})
+                for sid, vid in pending_video.items():
+                    local = vid.get("clip", 0)
+                    if 0 <= local < len(new_paths) and new_paths[local]:
+                        window = {"clip": offset + local,
+                                  "start_ms": vid.get("start_ms", 0),
+                                  "end_ms": vid.get("end_ms", 0)}
+                        if vid.get("action_ms") is not None:
+                            window["action_ms"] = vid["action_ms"]
+                        await db.projects.update_one(
+                            {"id": pid, "steps.id": sid},
+                            {"$set": {"steps.$.video": window}})
         if prepared and viewport_name == "both" and capture is None:
             mobile: list = []
 
@@ -523,7 +560,8 @@ async def job_record(project: dict, run_id: str, only_idx: Optional[int], final:
                     mobile.append((step["id"], data["screenshot"]))
 
             await engine.run_steps(prepared, collect, viewport=VIEWPORTS["mobile"],
-                                   login=None if storage else login, storage_state=storage)
+                                   login=None if storage else login, storage_state=storage,
+                                   record_video=False)
             for sid, blob in mobile:
                 path = await put_object(f"{APP_NAME}/u/{project['user_id']}/{pid}/{sid}_m_{new_id()}.jpg", blob, "image/jpeg")
                 await db.projects.update_one({"id": pid, "steps.id": sid}, {"$set": {"steps.$.screenshot_mobile_path": path}})
@@ -599,7 +637,7 @@ async def job_voiceover(project: dict, run_id: str, final: bool = True) -> str:
                 return "cancelled"
             label = s.get("voiceover_alt") if track == "alt" else s.get("voiceover")
             await run_log(run_id, f"Voiceover {i + 1}/{len(todo)}: \"{(label or '')[:50]}\"", current=i + 1)
-            audio = await ai.synthesize(spoken, clip_voice)
+            audio, words = await ai.synthesize_timed(spoken, clip_voice)
             path = await put_object(f"{APP_NAME}/u/{project['user_id']}/{pid}/{s['id']}_{track}_{new_id()}.mp3", audio, "audio/mpeg")
             dur = await asyncio.to_thread(render.audio_duration_ms, audio)
             if track == "alt":
@@ -607,7 +645,8 @@ async def job_voiceover(project: dict, run_id: str, final: bool = True) -> str:
                           "steps.$.audio_spoken_alt": spoken, "steps.$.audio_duration_alt": dur}
             else:
                 fields = {"steps.$.audio_path": path, "steps.$.audio_text": s.get("voiceover") or "",
-                          "steps.$.audio_voice": clip_voice, "steps.$.audio_duration_ms": dur, "steps.$.audio_spoken": spoken}
+                          "steps.$.audio_voice": clip_voice, "steps.$.audio_duration_ms": dur, "steps.$.audio_spoken": spoken,
+                          "steps.$.words": words}
             await db.projects.update_one({"id": pid, "steps.id": s["id"]}, {"$set": fields})
         msg = f"Voiceover ready ({len(todo)} clip(s) generated)"
         if final:
@@ -682,8 +721,9 @@ async def refresh_all(cron_run_id: str) -> None:
 
 def fingerprint(project: dict) -> str:
     keys = ("screenshot_path", "audio_path", "caption", "hotspot", "duration_ms", "transition", "transition_ms",
-            "audio_duration_ms", "annotations", "motion_paths", "scene_type", "scene", "exit_trigger", "skippable")
-    payload = [[s.get(k) for k in keys] for s in project["steps"]]
+            "audio_duration_ms", "annotations", "motion_paths", "scene_type", "scene", "exit_trigger", "skippable",
+            "video")
+    payload = [[s.get(k) for k in keys] for s in project["steps"]] + [project.get("video_clips") or []]
     raw = json.dumps([payload, project.get("narration_mode"), project.get("brand"), project.get("export_preset"),
                       project.get("active_track")], sort_keys=True, default=str)
     return hashlib.sha1(raw.encode()).hexdigest()
@@ -695,7 +735,10 @@ async def job_export(project: dict, run_id: str, fmt: str, preset: str = "standa
     project = {**fresh_proj, "export_preset": preset}
     if project.get("active_track") == "alt":
         project = {**project, "steps": apply_track(project["steps"], "alt")}
-    fp = fingerprint(project)
+    # The render engine is part of the export identity: a Remotion render
+    # must not reuse an ffmpeg cache entry (or vice versa).
+    engine = "remotion" if fmt == "mp4" and compositor.available() else "ffmpeg"
+    fp = f"{fingerprint(project)}:{engine}"
     cached = next((e for e in project.get("exports", []) if e.get("fingerprint") == fp and e["format"] == fmt), None)
     if cached:
         return await finish_run(run_id, pid, "completed", f"{fmt.upper()} unchanged — reused cached export", result=cached)
@@ -703,7 +746,15 @@ async def job_export(project: dict, run_id: str, fmt: str, preset: str = "standa
         if await jobs.is_cancelled(run_id):
             return await finish_run(run_id, pid, "cancelled", f"{fmt.upper()} export cancelled")
         await run_log(run_id, f"Composing {len(project['steps'])} frames with captions & hotspots...", current=1)
-        data = await render.render(project, fmt)
+        data = None
+        if engine == "remotion":
+            try:
+                data = await compositor.render_mp4(project)
+            except Exception as exc:
+                logger.warning("Remotion export failed, falling back to ffmpeg: %s", str(exc)[:300])
+                await run_log(run_id, "Remotion compositor unavailable — rendering with ffmpeg...", current=1)
+        if data is None:
+            data = await render.render(project, fmt)
         if await jobs.is_cancelled(run_id):
             return await finish_run(run_id, pid, "cancelled", f"{fmt.upper()} export cancelled")
         await run_log(run_id, f"Uploading {fmt.upper()} ({len(data) // 1024} KB)...", current=2)
@@ -1575,6 +1626,41 @@ async def step_motion(pid: str, sid: str, index: int, user: dict = Depends(get_c
     return Response(content=data, media_type="image/jpeg", headers={"Cache-Control": "private, max-age=86400"})
 
 
+async def _video_asset(p: dict, sid: str, cache_headers: dict | None = None,
+                       request: Request | None = None) -> Response:
+    step = next((s for s in p["steps"] if s["id"] == sid), None)
+    vid = (step or {}).get("video") or {}
+    clips = p.get("video_clips") or []
+    clip = vid.get("clip")
+    path = clips[clip] if isinstance(clip, int) and 0 <= clip < len(clips) else None
+    if not path:
+        raise HTTPException(404, "Video not found")
+    data, _ = await get_object(path)
+    headers = {"Accept-Ranges": "bytes", **(cache_headers or {"Cache-Control": "private, no-store"})}
+    # Browsers require Range support to seek: without it a seek past the
+    # buffered region restarts the element at 0 (the player seeks per step).
+    range_header = request.headers.get("range") if request is not None else None
+    if range_header:
+        m = re.match(r"bytes=(\d*)-(\d*)", range_header.strip())
+        if m:
+            total = len(data)
+            start = int(m.group(1)) if m.group(1) else 0
+            end = int(m.group(2)) if m.group(2) else total - 1
+            if start >= total:
+                return Response(status_code=416, headers={"Content-Range": f"bytes */{total}"})
+            end = min(end, total - 1)
+            headers["Content-Range"] = f"bytes {start}-{end}/{total}"
+            return Response(content=data[start:end + 1], status_code=206,
+                            media_type="video/mp4", headers=headers)
+    return Response(content=data, media_type="video/mp4", headers=headers)
+
+
+@api.get("/projects/{pid}/steps/{sid}/video")
+async def step_video(pid: str, sid: str, request: Request, user: dict = Depends(get_current_user)):
+    project = await get_project(pid, user)
+    return await _video_asset(project, sid, request=request)
+
+
 @api.get("/projects/{pid}/steps/{sid}/{kind}")
 async def step_asset(pid: str, sid: str, kind: Literal["screenshot", "thumb", "audio", "mobile"], user: dict = Depends(get_current_user),
                      track: Optional[Literal["primary", "alt"]] = None):
@@ -1709,7 +1795,8 @@ async def public_demo(share_id: str, request: Request, response: Response, track
     variables = p.get("variables") or {}
     source = apply_track(p["steps"], track or p.get("active_track") or "primary")
     keep = ("id", "action", "caption", "voiceover", "duration_ms", "transition", "transition_ms", "hotspot",
-            "audio_duration_ms", "chapter", "annotations", "scene_type", "exit_trigger", "skippable")
+            "audio_duration_ms", "chapter", "annotations", "scene_type", "exit_trigger", "skippable",
+            "video", "words")
     steps = []
     for s in source:
         item = {k: s.get(k) for k in keep}
@@ -1805,6 +1892,13 @@ async def public_motion(share_id: str, sid: str, index: int, request: Request):
     return Response(content=data, media_type="image/jpeg", headers=_share_cache_headers(raw))
 
 
+@api.get("/public/{share_id}/steps/{sid}/video")
+async def public_video(share_id: str, sid: str, request: Request):
+    raw = await _public_project(share_id, request)
+    project = _require_published(raw)
+    return await _video_asset(project, sid, cache_headers=_share_cache_headers(raw), request=request)
+
+
 @api.get("/public/{share_id}/steps/{sid}/{kind}")
 async def public_asset(share_id: str, sid: str, kind: Literal["screenshot", "thumb", "audio", "mobile"], request: Request,
                        track: Optional[Literal["primary", "alt"]] = None):
@@ -1831,6 +1925,7 @@ async def ready():
     checks = {"database": DB_BACKEND, "ai": bool(ai and ai.provider()[2]),
               "browserless": bool(engine and engine.is_configured()),
               "browser_driver_lib": bool(engine and engine._driver_lib_dir()),
+              "compositor": "remotion" if compositor.available() else "ffmpeg",
               "storage": st.get("mode"), "storage_ok": st.get("mode") in {"s3", "remote", "local"},
               "config_ok": not fatal, "config_problems": problems,
               "cors_origins": cors_origins(),
