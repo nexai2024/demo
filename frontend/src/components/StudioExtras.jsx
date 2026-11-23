@@ -69,7 +69,7 @@ export function StudioExtras({ project, meta, setMeta, onReload, onInsert }) {
           <p className="text-xs uppercase tracking-wider text-slate-500">Pronunciation</p>
           {glossary.map((item, i) => <p key={i} className="text-xs text-slate-300">{item.word} → {item.spoken}</p>)}
           <div className="flex gap-2">
-            <Input value={word} onChange={(e) => setWord(e.target.value)} placeholder="Flowcast" className="bg-slate-950 h-8 text-xs" data-testid="glossary-word-input" />
+            <Input value={word} onChange={(e) => setWord(e.target.value)} placeholder="appshowcase" className="bg-slate-950 h-8 text-xs" data-testid="glossary-word-input" />
             <Input value={spoken} onChange={(e) => setSpoken(e.target.value)} placeholder="flow cast" className="bg-slate-950 h-8 text-xs" data-testid="glossary-spoken-input" />
             <button className={btn} disabled={!word.trim() || !spoken.trim()} onClick={() => { setMeta({ glossary: [...glossary, { word: word.trim(), spoken: spoken.trim() }] }); setWord(""); setSpoken(""); }} data-testid="glossary-add-button">Add</button>
           </div>

@@ -19,7 +19,7 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-APP_NAME = "flowcast"
+APP_NAME = "appshowcase"
 LOCAL_ROOT = Path(__file__).parent / ".data" / "objects"
 
 

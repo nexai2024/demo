@@ -34,7 +34,7 @@ from auth_routes import router as auth_router, seed_admin
 from datetime import datetime, timedelta, timezone
 
 import copy
-from core import (DB_BACKEND, DuplicateKeyError, cors_origins, create_viewer_token, db, validate_config, decode_viewer_token, get_current_user, hash_password, new_id,
+from core import (DB_BACKEND, FATAL_PREFIXES, DuplicateKeyError, config_problems, cors_origins, create_viewer_token, db, validate_config, decode_viewer_token, get_current_user, hash_password, new_id,
                   now, now_iso, verify_password)
 import cinematic
 import jobs
@@ -1826,16 +1826,20 @@ async def health():
 async def ready():
     """Readiness: dependencies this instance needs are configured and reachable."""
     st = storage_status()
+    problems = config_problems()
+    fatal = [p for p in problems if p.startswith(FATAL_PREFIXES)]
     checks = {"database": DB_BACKEND, "ai": bool(ai and ai.provider()[2]),
               "browserless": bool(engine and engine.is_configured()),
-              "storage": st.get("mode"), "storage_ok": st.get("mode") in {"s3", "remote", "local"}}
+              "storage": st.get("mode"), "storage_ok": st.get("mode") in {"s3", "remote", "local"},
+              "config_ok": not fatal, "config_problems": problems,
+              "startup_error": getattr(app.state, "config_error", None)}
     try:
         await db.runs.find_one({"id": "__ready__"}, {"_id": 0})
         checks["database_ok"] = True
     except Exception as exc:
         checks["database_ok"] = False
         logger.warning("readiness db check failed: %s", exc)
-    ok = checks["database_ok"] and checks["storage_ok"]
+    ok = checks["database_ok"] and checks["storage_ok"] and checks["config_ok"]
     from fastapi.responses import JSONResponse
     return JSONResponse(status_code=200 if ok else 503, content=checks)
 
@@ -1894,10 +1898,25 @@ app.add_middleware(
 
 @app.on_event("startup")
 async def startup():
-    validate_config()
-    await asyncio.to_thread(init_storage)
+    # Never let a config/infra problem kill the whole function: on serverless
+    # hosts a raised startup turns every route into an opaque
+    # FUNCTION_INVOCATION_FAILED. Log it, remember it, and let /api/health
+    # and /api/ready report exactly what is wrong instead.
+    app.state.config_error = None
+    try:
+        validate_config()
+    except Exception as exc:
+        app.state.config_error = str(exc)
+        logger.error("configuration problem (see /api/ready): %s", exc)
+    try:
+        await asyncio.to_thread(init_storage)
+    except Exception as exc:
+        logger.error("Storage init failed: %s", exc)
     app.state.index_task = asyncio.create_task(ensure_indexes())
-    await seed_admin()
+    try:
+        await seed_admin()
+    except Exception as exc:
+        logger.error("Admin seed failed: %s", exc)
     embedded = os.environ.get("EMBEDDED_WORKER", "true").strip().lower() not in {"0", "false", "no"}
     app.state.worker_task = asyncio.create_task(worker_loop()) if embedded else None
 

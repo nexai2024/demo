@@ -458,7 +458,7 @@ def test_storage_forbids_local_fallback_in_production_and_retries_s3(monkeypatch
     with pytest.raises(storage.StorageError):
         storage.init_storage()
     with pytest.raises(storage.StorageError):
-        asyncio.run(storage.put_object("flowcast/a.jpg", b"123", "image/jpeg"))
+        asyncio.run(storage.put_object("appshowcase/a.jpg", b"123", "image/jpeg"))
 
     # Simulate shared S3 bucket across two replicas/restarts with 1 transient upload failure
     bucket_store: dict[str, tuple[bytes, str]] = {}
@@ -486,7 +486,7 @@ def test_storage_forbids_local_fallback_in_production_and_retries_s3(monkeypatch
     monkeypatch.setattr(storage, "_get_s3_client", lambda: FakeS3())
     monkeypatch.setattr(storage.time, "sleep", lambda _: None)
 
-    path = asyncio.run(storage.put_object("flowcast/u1/p1/s1.jpg", b"IMG", "image/jpeg"))
+    path = asyncio.run(storage.put_object("appshowcase/u1/p1/s1.jpg", b"IMG", "image/jpeg"))
     assert calls["put"] == 2  # retried transient error and succeeded
     # Simulate reading from a second replica / after restart
     storage.reset_client()

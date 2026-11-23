@@ -1,5 +1,5 @@
 {
-  "summary": "Iteration 1 full-stack test of Flowcast. Backend: 18 pytest cases (auth, projects CRUD/list step_count, duplicate/delete, cross-user isolation, history+restore, record/export/run guards, public share + events validation + analytics, settings, tts preview) -> 17/18 pass; brute-force lockout fails because the lockout key includes the rotating ingress pod IP. Frontend (Playwright, 1920x1080): register/logout/login, protected redirect, dashboard templates/search/duplicate/delete(confirm+cancel), Draft autosave + persistence, Timeline add/action select/selector/caption/voiceover/move/duplicate/delete/undo/redo + persistence, Advanced sliders/fallbacks/sensitive->password, Ctrl+K palette, Record/Export 400 toasts, Export & share toggle/share URL/embed, brand kit persist, /share (title, chapters, deep link ?step=2, prev/next, play/autoplay, watermark off), /embed (player only), private share error, Analytics views/completion, History restore, Settings usage/status/prefs save, browserless banner - all working. Bugs: fallback-selectors input cannot accept commas when typed; 502 error responses are replaced by Cloudflare HTML so AI-budget errors show a confusing Cloudflare message in toast; player keyboard shortcuts only work when the player frame itself is focused.",
+  "summary": "Iteration 1 full-stack test of appshowcase. Backend: 18 pytest cases (auth, projects CRUD/list step_count, duplicate/delete, cross-user isolation, history+restore, record/export/run guards, public share + events validation + analytics, settings, tts preview) -> 17/18 pass; brute-force lockout fails because the lockout key includes the rotating ingress pod IP. Frontend (Playwright, 1920x1080): register/logout/login, protected redirect, dashboard templates/search/duplicate/delete(confirm+cancel), Draft autosave + persistence, Timeline add/action select/selector/caption/voiceover/move/duplicate/delete/undo/redo + persistence, Advanced sliders/fallbacks/sensitive->password, Ctrl+K palette, Record/Export 400 toasts, Export & share toggle/share URL/embed, brand kit persist, /share (title, chapters, deep link ?step=2, prev/next, play/autoplay, watermark off), /embed (player only), private share error, Analytics views/completion, History restore, Settings usage/status/prefs save, browserless banner - all working. Bugs: fallback-selectors input cannot accept commas when typed; 502 error responses are replaced by Cloudflare HTML so AI-budget errors show a confusing Cloudflare message in toast; player keyboard shortcuts only work when the player frame itself is focused.",
   "backend_issues": {
     "critical": [
       {"endpoint": "POST /api/auth/login", "issue": "Brute-force lockout ineffective: identifier = request.client.host + email, but behind K8s ingress client.host rotates between pod IPs (observed 10.64.128.44 and 10.64.132.140), so 6+ wrong attempts never return 429 (counts split 3/3). Use X-Forwarded-For first IP (or email-only key).", "priority": "HIGH"},
@@ -28,7 +28,7 @@
       {"screen": "Studio sidebar", "issues": ["Banner says 'recording is disabled' but Record demo button is fully enabled (click yields 400 toast). Disable it or soften banner copy."]}
     ]
   },
-  "test_report_links": ["/app/backend/tests/test_flowcast_api.py", "/app/test_reports/pytest/pytest_results.xml"],
+  "test_report_links": ["/app/backend/tests/test_appshowcase_api.py", "/app/test_reports/pytest/pytest_results.xml"],
   "action_items": [
     "Fix login lockout key to use X-Forwarded-For (first hop) or email-only so lockout triggers after 5 failures",
     "Stop returning HTTP 502 from app routes (generate/rewrite/repair/test-browserless); use e.g. 424/422/503 so the JSON detail reaches the UI",
@@ -46,9 +46,9 @@
     "AnalyticsPanel fetches only on mount (ok because tabs unmount), no refresh button",
     "CORS_ORIGINS='*' with allow_credentials=True - Starlette echoes origin; acceptable in preview but restrict for prod"
   ],
-  "updated_files": ["/app/backend/tests/test_flowcast_api.py"],
+  "updated_files": ["/app/backend/tests/test_appshowcase_api.py"],
   "success_rate": {"backend": "94% (17/18)", "frontend": "~90% (all requested flows work; 2 functional bugs: fallback comma input, keyboard shortcuts focus)"},
-  "test_credentials": "admin@flowcast.app / admin123 (works). Test users created: test_*@example.com / pass1234 (no delete endpoint; left in users collection).",
+  "test_credentials": "admin@appshowcase.app / admin123 (works). Test users created: test_*@example.com / pass1234 (no delete endpoint; left in users collection).",
   "seed_data_creation": "TEST_ projects created by pytest and UI were deleted (soft delete) by id. Admin preferences were changed during tests and restored (voice nova, narration both). Some TEST_ registered users remain (no user deletion API).",
   "retest_needed": true,
   "should_main_agent_self_test": true,

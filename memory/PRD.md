@@ -1,4 +1,4 @@
-# Flowcast — AI Product Demo Builder (PRD)
+# appshowcase — AI Product Demo Builder (PRD)
 
 ## Original problem statement
 Build an AI Product Demo Builder that generates interactive/video product walkthroughs from a text draft, release notes or feature spec using Browserless. The AI turns drafts into browser actions (goto/click/type/scroll/hover/wait) with captions or AI voiceover. Browserless runs the actions and captures screenshots, with live progress ("Step 3/6: Navigating to settings..."). Studio timeline editor: edit steps, captions and voiceover, transition speeds, and re-record steps. Exports: GIF, MP4, embeddable interactive player. Project management: save, duplicate, history, share links. Robust error handling, secure key management.

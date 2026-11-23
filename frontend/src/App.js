@@ -35,20 +35,27 @@ function ActivityGate() {
   return <ActivityDock />;
 }
 
+// Per-route boundary: a crash (render error, failed lazy chunk) in one
+// screen shows that route's recoverable fallback instead of unmounting
+// the whole app. The root boundary in App() remains as the last resort.
+const guarded = (element, label) => (
+  <ErrorBoundary variant="route" label={label}>{element}</ErrorBoundary>
+);
+
 function AppRouter() {
   return (
     <Suspense fallback={<Splash />}>
     <Routes>
-      <Route path="/" element={<LandingPage />} />
-      <Route path="/login" element={<AuthPage />} />
-      <Route path="/share/:shareId" element={<SharePage />} />
-      <Route path="/p/:slug" element={<ProductPage />} />
-      <Route path="/review/:token" element={<ReviewPage />} />
-      <Route path="/help" element={<HelpPage />} />
-      <Route path="/embed/:shareId" element={<SharePage embed />} />
-      <Route path="/dashboard" element={<Protected><Dashboard /></Protected>} />
-      <Route path="/projects/:pid" element={<Protected><Studio /></Protected>} />
-      <Route path="/settings" element={<Protected><Settings /></Protected>} />
+      <Route path="/" element={guarded(<LandingPage />, "Home")} />
+      <Route path="/login" element={guarded(<AuthPage />, "Sign in")} />
+      <Route path="/share/:shareId" element={guarded(<SharePage />, "Shared demo")} />
+      <Route path="/p/:slug" element={guarded(<ProductPage />, "Product page")} />
+      <Route path="/review/:token" element={guarded(<ReviewPage />, "Review")} />
+      <Route path="/help" element={guarded(<HelpPage />, "Help")} />
+      <Route path="/embed/:shareId" element={guarded(<SharePage embed />, "Embedded demo")} />
+      <Route path="/dashboard" element={guarded(<Protected><Dashboard /></Protected>, "Dashboard")} />
+      <Route path="/projects/:pid" element={guarded(<Protected><Studio /></Protected>, "Studio")} />
+      <Route path="/settings" element={guarded(<Protected><Settings /></Protected>, "Settings")} />
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>
     </Suspense>
@@ -62,7 +69,9 @@ export default function App() {
         <ErrorBoundary>
           <AuthProvider>
             <AppRouter />
-            <ActivityGate />
+            <ErrorBoundary quiet label="Activity dock">
+              <ActivityGate />
+            </ErrorBoundary>
             <Toaster theme="dark" position="bottom-right" richColors closeButton />
           </AuthProvider>
         </ErrorBoundary>

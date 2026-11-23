@@ -1,4 +1,4 @@
-# Flowcast — Modernization Plan (30 items)
+# appshowcase — Modernization Plan (30 items)
 
 Legend: Effort / Impact = Low · Medium · High. Status: ✅ implemented in this iteration · ⏳ deferred (roadmap)
 

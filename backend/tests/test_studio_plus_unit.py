@@ -8,7 +8,7 @@ from render import frame_delta
 
 
 def test_glossary_replaces_whole_words():
-    text = speak("Open Flowcast, then flowcast settings", [{"word": "Flowcast", "spoken": "flow cast"}])
+    text = speak("Open appshowcase, then appshowcase settings", [{"word": "appshowcase", "spoken": "flow cast"}])
     assert text == "Open flow cast, then flow cast settings"
 
 

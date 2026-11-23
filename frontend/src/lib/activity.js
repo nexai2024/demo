@@ -13,7 +13,7 @@ export function recordActivity(entry) {
   };
   items = [item, ...items].slice(0, MAX);
   listeners.forEach((fn) => fn(items));
-  if (item.level === "error") console.error("[flowcast]", item.source, item.message);
+  if (item.level === "error") console.error("[appshowcase]", item.source, item.message);
   return item;
 }
 

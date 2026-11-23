@@ -6,10 +6,10 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).parent / ".env")
 
-# Flowcast rows live in the existing demo_projects table, marked tenant_id=flowcast.
+# appshowcase rows live in the existing demo_projects table, marked tenant_id=appshowcase.
 # This database has no API for creating tables, and that tenant is not used by the other app.
 TABLE = "demo_projects"
-TENANT = "flowcast"
+TENANT = "appshowcase"
 
 
 def cfg() -> dict:

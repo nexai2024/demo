@@ -1,7 +1,19 @@
 import axios from "axios";
 import { recordActivity } from "@/lib/activity";
 
-const configured = (process.env.REACT_APP_BACKEND_URL || "").replace(/\/$/, "");
+// Normalize REACT_APP_BACKEND_URL so common paste errors can't produce a
+// relative URL like "api.example.com/api/..." (which the browser resolves
+// against the frontend origin, yielding /api.example.com/api/...).
+// Accepts: "api.example.com", "https://api.example.com", either with a
+// mistaken trailing "/api" — all become "https://api.example.com".
+const normalizeBackend = (raw) => {
+  let v = (raw || "").trim().replace(/\/+$/, "");
+  if (!v) return "";
+  if (!/^(https?:)?\/\//i.test(v) && !v.startsWith("/")) v = `https://${v}`;
+  if (/\/api$/i.test(v)) v = v.slice(0, -4).replace(/\/+$/, "");
+  return v;
+};
+const configured = normalizeBackend(process.env.REACT_APP_BACKEND_URL);
 export const API = configured ? `${configured}/api` : "/api";
 
 export const api = axios.create({ baseURL: API, withCredentials: true });

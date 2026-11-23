@@ -16,7 +16,7 @@ from core import validate_config
 from storage import init_storage
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-logger = logging.getLogger("flowcast.worker")
+logger = logging.getLogger("AppShowcase.worker")
 
 
 async def run_worker() -> None:

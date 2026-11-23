@@ -32,7 +32,7 @@ def test_production_accepts_safe_config(monkeypatch):
     monkeypatch.setenv("JWT_SECRET", "k9X2pQ7mR4vL8nT1wZ5cB3jF6hD0yG9a")
     monkeypatch.setenv("VAULT_MASTER_KEY", "M3nP8qR2tV6wX1zC5bN7kJ4hF9gD0sA2")
     monkeypatch.setenv("CORS_ORIGINS", "https://app.example.com/")
-    monkeypatch.setenv("S3_BUCKET", "flowcast-prod-media")
+    monkeypatch.setenv("S3_BUCKET", "appshowcase-prod-media")
     monkeypatch.setattr(core, "DB_BACKEND", "mongodb")
     core.validate_config()
     assert core.cors_origins() == ["https://app.example.com"]
@@ -50,7 +50,7 @@ def test_production_rejects_wildcard_cors(monkeypatch):
     monkeypatch.setenv("JWT_SECRET", "k9X2pQ7mR4vL8nT1wZ5cB3jF6hD0yG9a")
     monkeypatch.setenv("VAULT_MASTER_KEY", "M3nP8qR2tV6wX1zC5bN7kJ4hF9gD0sA2")
     monkeypatch.setenv("CORS_ORIGINS", "*")
-    monkeypatch.setenv("S3_BUCKET", "flowcast-prod-media")
+    monkeypatch.setenv("S3_BUCKET", "appshowcase-prod-media")
     monkeypatch.setattr(core, "DB_BACKEND", "mongodb")
     with pytest.raises(RuntimeError):
         core.validate_config()

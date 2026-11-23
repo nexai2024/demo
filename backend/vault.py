@@ -43,7 +43,7 @@ def _key_bytes(value: str) -> bytes:
         pass
     if len(value) < 32:
         raise VaultError("Vault keys must be base64 of 32 bytes or at least 32 characters")
-    return HKDF(algorithm=hashes.SHA256(), length=32, salt=b"flowcast-vault-v1", info=b"aes-256-gcm").derive(value.encode())
+    return HKDF(algorithm=hashes.SHA256(), length=32, salt=b"appshowcase-vault-v1", info=b"aes-256-gcm").derive(value.encode())
 
 
 def _kid(key: bytes) -> str:

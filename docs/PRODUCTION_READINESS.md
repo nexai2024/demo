@@ -87,7 +87,7 @@ Four helper assertions passed directly. The configured pytest command could not 
 
 **Release check** · Create a CI gate on disposable test data for auth isolation, generation, capture, export, and publish. Fail when the integration fixture cannot log in. Verify mobile layouts, keyboard navigation, captions, and screen-reader announcements.
 
-[backend/tests/test_flowcast_api.py:8](/Users/solopreneursolutions/Documents/demo/backend/tests/test_flowcast_api.py:8) · [backend/pytest.ini](/Users/solopreneursolutions/Documents/demo/backend/pytest.ini) · [frontend/src/components/DemoPlayer.jsx:287](/Users/solopreneursolutions/Documents/demo/frontend/src/components/DemoPlayer.jsx:287)
+[backend/tests/test_appshowcase_api.py:8](/Users/solopreneursolutions/Documents/demo/backend/tests/test_appshowcase_api.py:8) · [backend/pytest.ini](/Users/solopreneursolutions/Documents/demo/backend/pytest.ini) · [frontend/src/components/DemoPlayer.jsx:287](/Users/solopreneursolutions/Documents/demo/frontend/src/components/DemoPlayer.jsx:287)
 
 ## Release sequence
 

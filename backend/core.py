@@ -18,12 +18,27 @@ logger = logging.getLogger(__name__)
 
 # Data store: a real MongoDB when MONGO_URL is set (recommended for production); otherwise the
 # NoCodeBackend adapter, which filters rows client-side and is only suited to small deployments.
-if os.environ.get("MONGO_URL"):
-    from motor.motor_asyncio import AsyncIOMotorClient
-    from pymongo.errors import DuplicateKeyError  # noqa: F401
-    DB_BACKEND = "mongodb"
-    db = AsyncIOMotorClient(os.environ["MONGO_URL"], serverSelectionTimeoutMS=5000)[os.environ.get("DB_NAME", "flowcast")]
-else:
+def _mongo_url() -> str:
+    """MONGO_URL, tolerating the classic paste error MONGO_URL=MONGODB_URI="mongodb+srv://..."."""
+    raw = (os.environ.get("MONGO_URL") or "").strip().strip('"').strip("'")
+    if raw and not raw.startswith(("mongodb://", "mongodb+srv://")) and "mongodb" in raw:
+        raw = raw[raw.index("mongodb"):].strip().strip('"').strip("'")
+    return raw
+
+
+_MONGO_URL = _mongo_url()
+_db_client = None
+if _MONGO_URL:
+    try:
+        from motor.motor_asyncio import AsyncIOMotorClient
+        from pymongo.errors import DuplicateKeyError  # noqa: F401
+        _db_client = AsyncIOMotorClient(_MONGO_URL, serverSelectionTimeoutMS=5000)
+        DB_BACKEND = "mongodb"
+        db = _db_client[os.environ.get("DB_NAME", "appshowcase")]
+    except Exception as exc:  # an invalid URI must not crash the whole API at import
+        logger.error("MONGO_URL is set but unusable (%s); falling back to NoCodeBackend store", exc)
+        _db_client = None
+if _db_client is None:
     from ncb_store import DuplicateKeyError, db  # noqa: F401
     DB_BACKEND = "nocodebackend"
 

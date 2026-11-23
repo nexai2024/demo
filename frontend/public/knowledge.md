@@ -110,7 +110,7 @@ The draft is the spec the model reads. Write the path a person would take: where
 
 ### Developer notes {#new-demo-dev}
 
-`POST /api/projects` inserts a document in the `projects` collection. Rows live in NoCodeBackend table `demo_projects` with `tenant_id` `flowcast`. The document is JSON in `brief`. `status` on the row is the collection name, not the project status.
+`POST /api/projects` inserts a document in the `projects` collection. Rows live in NoCodeBackend table `demo_projects` with `tenant_id` `appshowcase`. The document is JSON in `brief`. `status` on the row is the collection name, not the project status.
 
 ## Script only {#generate-script}
 
@@ -361,13 +361,13 @@ Captions on the share page are the step voiceover, or the caption when there is 
 ### Where to look when a job fails
 
 1. Studio **Automation console**, then `GET /api/runs/{id}`.
-2. API log `/tmp/flowcast-api.log` on this machine.
+2. API log `/tmp/appshowcase-api.log` on this machine.
 3. Step `error` on the card. `resolved_selector` shows which fallback worked.
 4. Settings for Browserless, the model, and file storage.
 
 ### Data
 
-Projects, profiles, runs, history, and analytics events are collections in `backend/ncb_store.py`. They share one NoCodeBackend table. Do not write another product’s rows with `tenant_id` `flowcast`.
+Projects, profiles, runs, history, and analytics events are collections in `backend/ncb_store.py`. They share one NoCodeBackend table. Do not write another product’s rows with `tenant_id` `appshowcase`.
 
 Datetimes in the JSON may be ISO strings. Columns `created_at` and `updated_at` are MySQL `YYYY-MM-DD HH:MM:SS`.
 

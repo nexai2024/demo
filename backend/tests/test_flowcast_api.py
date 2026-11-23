@@ -1,4 +1,4 @@
-# Flowcast backend regression tests: auth, projects CRUD, steps, history, sharing/public, analytics, settings, guards
+# appshowcase backend regression tests: auth, projects CRUD, steps, history, sharing/public, analytics, settings, guards
 import os
 import uuid
 
@@ -6,7 +6,7 @@ import pytest
 import requests
 
 BASE_URL = os.environ.get("REACT_APP_BACKEND_URL").rstrip("/")
-ADMIN = {"email": "admin@flowcast.app", "password": "admin123"}
+ADMIN = {"email": "admin@appshowcase.app", "password": "admin123"}
 
 
 def _session(creds=ADMIN):

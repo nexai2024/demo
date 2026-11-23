@@ -125,7 +125,7 @@ def _row(collection: str, doc: dict) -> dict:
     return {
         "tenant_id": TENANT,
         "owner_user_id": str(doc.get("user_id") or TENANT),
-        "owner_name": "Flowcast",
+        "owner_name": "appshowcase",
         "user_id": str(doc.get("user_id") or TENANT),
         "title": _key(doc)[:180],
         "status": collection,

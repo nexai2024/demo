@@ -4,6 +4,7 @@ import { Copy, Film, MoreHorizontal, Plus, Search, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 import { formatDistanceToNow } from "date-fns";
 import { AppHeader } from "@/components/AppHeader";
+import { BackendHealthBanner } from "@/components/BackendHealthBanner";
 import { NewProjectDialog } from "@/components/NewProjectDialog";
 import { StatusBadge } from "@/components/StatusBadge";
 import { Input } from "@/components/ui/input";
@@ -74,16 +75,16 @@ export default function Dashboard() {
 
   const load = () => {
     setLoadError("");
-    api.get("/projects", { params: { view } }).then(({ data }) => setProjects(data)).catch((e) => {
+    api.get("/projects", { params: { view } }).then(({ data }) => setProjects(Array.isArray(data) ? data : [])).catch((e) => {
       setLoadError(errMsg(e));
       setProjects((current) => current || []);
     });
   };
   useEffect(() => { load(); }, [view]); // eslint-disable-line react-hooks/exhaustive-deps
-  useEffect(() => { api.get("/notifications").then((r) => setNotes(r.data.filter((n) => !n.read))).catch(() => {}); }, []);
+  useEffect(() => { api.get("/notifications").then((r) => setNotes((Array.isArray(r.data) ? r.data : []).filter((n) => !n.read))).catch(() => {}); }, []);
 
-  const hosts = useMemo(() => [...new Set((projects || []).map((p) => { try { return new URL(p.target_url).host; } catch { return ""; } }).filter(Boolean))], [projects]);
-  const shown = useMemo(() => (projects || []).filter((p) => {
+  const hosts = useMemo(() => [...new Set((Array.isArray(projects) ? projects : []).map((p) => { try { return new URL(p.target_url).host; } catch { return ""; } }).filter(Boolean))], [projects]);
+  const shown = useMemo(() => (Array.isArray(projects) ? projects : []).filter((p) => {
     if (q && !`${p.name} ${p.target_url || ""} ${p.search_text || ""}`.toLowerCase().includes(q.toLowerCase())) return false;
     if (status !== "all" && p.status !== status) return false;
     if (brokenOnly && !(p.health?.broken?.length > 0)) return false;
@@ -115,6 +116,7 @@ export default function Dashboard() {
     <div className="min-h-screen relative z-10">
       <AppHeader />
       <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-10">
+        <BackendHealthBanner />
         <section className="flex flex-col sm:flex-row sm:items-end justify-between gap-6 mb-8">
           <div>
             <p className="eyebrow mb-3">Studio · {user?.name}</p>
