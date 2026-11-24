@@ -71,8 +71,9 @@ def _get_s3_client():
 
 def reset_client() -> None:
     """For tests and credential reloads."""
-    global _S3_CLIENT
+    global _S3_CLIENT, _S3_DOWN_UNTIL
     _S3_CLIENT = None
+    _S3_DOWN_UNTIL = 0.0
 
 
 def _s3_key(path: str) -> str:
@@ -207,13 +208,19 @@ def _put_ncb(path: str, data: bytes, content_type: str, attempts: int = 3) -> st
                     headers={"Authorization": f"Bearer {conf['secret']}", "X-Database-Instance": conf["instance"]},
                     files={"file": (name, data, content_type)},
                 )
-            raw = response.json() if response.content else {}
+            try:
+                raw = response.json() if response.content else {}
+            except ValueError:
+                raw = {}
             if response.status_code < 400 and raw.get("status") != "failed" and "R2 Storage is not configured" not in response.text:
                 payload = raw.get("data") if isinstance(raw.get("data"), dict) else raw
                 return str(payload.get("url") or payload.get("path") or payload.get("key") or path)
             last = StorageError(f"Remote storage rejected upload ({response.status_code}): {response.text[:160]}")
-            if response.status_code == 404 or "R2 Storage is not configured" in response.text:
-                break  # misconfigured backend: retrying cannot fix it
+            if response.status_code >= 400 or not raw:
+                # A healthy files API answers with JSON; a 4xx or a
+                # non-JSON body means the backend is misconfigured
+                # (e.g. no R2 bucket) and retrying cannot fix it.
+                break
         except Exception as exc:
             last = exc
         if attempt < attempts - 1:
@@ -221,9 +228,28 @@ def _put_ncb(path: str, data: bytes, content_type: str, attempts: int = 3) -> st
     raise StorageError(f"Remote upload failed for '{path}': {last}") from last
 
 
+_S3_DOWN_UNTIL = 0.0
+
+
+def _trip_s3_breaker() -> None:
+    """In dev, one failed S3 op parks the bucket for 5 minutes so every
+    file doesn't pay connect retries before falling back to local disk."""
+    global _S3_DOWN_UNTIL
+    _S3_DOWN_UNTIL = time.monotonic() + 300
+
+
 def _put(path: str, data: bytes, content_type: str) -> str:
-    if _s3_config():
-        return _put_s3(path, data, content_type)
+    if _s3_config() and time.monotonic() >= _S3_DOWN_UNTIL:
+        try:
+            return _put_s3(path, data, content_type)
+        except StorageError:
+            if not _allow_local_fallback():
+                raise
+            # Dev must keep working while an S3/R2 config is being set up;
+            # production still fails loudly. /api/ready keeps reporting
+            # the broken bucket, so this never masks it silently.
+            _trip_s3_breaker()
+            logger.warning("S3 upload failed in dev; falling back to local disk for %s", path)
     if _allow_local_fallback():
         # Dev: local disk IS the store. Trying the remote first made every
         # file pay several failed uploads (plus backoff) before landing here.
@@ -237,8 +263,14 @@ def _put(path: str, data: bytes, content_type: str) -> str:
 
 
 def _get(path: str) -> tuple[bytes, str]:
-    if _s3_config():
-        return _get_s3(path)
+    if _s3_config() and time.monotonic() >= _S3_DOWN_UNTIL:
+        try:
+            return _get_s3(path)
+        except (StorageError, FileNotFoundError):
+            if not _allow_local_fallback():
+                raise
+            _trip_s3_breaker()
+            logger.warning("S3 read failed in dev; trying local disk for %s", path)
     if path.startswith(("http://", "https://")):
         with httpx.Client(timeout=60) as client:
             response = client.get(path)

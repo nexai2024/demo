@@ -30,6 +30,28 @@ def test_dev_put_and_get_never_touch_remote(dev_env, monkeypatch):
     assert data == b"IMG" and media == "image/jpeg"
 
 
+def test_broken_s3_falls_back_to_local_in_dev_only(dev_env, monkeypatch):
+    calls = {"put": 0}
+
+    def broken_put(*a, **k):
+        calls["put"] += 1
+        raise storage.StorageError("bucket unreachable")
+
+    monkeypatch.setattr(storage, "_S3_DOWN_UNTIL", 0.0)
+    monkeypatch.setattr(storage, "_s3_config", lambda: {"bucket": "demo-app-dir", "prefix": ""})
+    monkeypatch.setattr(storage, "_put_s3", broken_put)
+    path = asyncio.run(storage.put_object("appshowcase/u/p/s1.jpg", b"IMG", "image/jpeg"))
+    assert (dev_env / path).read_bytes() == b"IMG"
+    # The breaker parks S3 after the first failure: no per-file retry tax.
+    asyncio.run(storage.put_object("appshowcase/u/p/s2.jpg", b"IMG", "image/jpeg"))
+    assert calls["put"] == 1
+
+    monkeypatch.setattr(storage, "_S3_DOWN_UNTIL", 0.0)
+    monkeypatch.setenv("APP_ENV", "production")
+    with pytest.raises(storage.StorageError, match="bucket unreachable"):
+        asyncio.run(storage.put_object("appshowcase/u/p/s3.jpg", b"IMG", "image/jpeg"))
+
+
 def test_ncb_upload_fails_fast_on_misconfiguration(dev_env, monkeypatch):
     calls = {"post": 0}
 
@@ -57,6 +79,40 @@ def test_ncb_upload_fails_fast_on_misconfiguration(dev_env, monkeypatch):
 
     monkeypatch.setattr(storage.httpx, "Client", FakeClient)
     monkeypatch.setattr(storage.time, "sleep", lambda _: None)
-    with pytest.raises(storage.StorageError):
+    with pytest.raises(storage.StorageError, match="rejected upload \\(404\\)"):
         storage._put_ncb("appshowcase/u/p/s1.jpg", b"IMG", "image/jpeg")
     assert calls["post"] == 1  # no pointless retries against a 404 backend
+
+
+def test_ncb_non_json_body_is_a_clean_rejection(dev_env, monkeypatch):
+    """NCB answering 404 with an empty/HTML body must surface as a storage
+    rejection, not a raw JSONDecodeError ('Expecting value...')."""
+    calls = {"post": 0}
+
+    class FakeResponse:
+        status_code = 404
+        content = b"<html>not found</html>"
+        text = "<html>not found</html>"
+
+        def json(self):
+            raise ValueError("Expecting value: line 1 column 1 (char 0)")
+
+    class FakeClient:
+        def __init__(self, *a, **k):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def post(self, *a, **k):
+            calls["post"] += 1
+            return FakeResponse()
+
+    monkeypatch.setattr(storage.httpx, "Client", FakeClient)
+    monkeypatch.setattr(storage.time, "sleep", lambda _: None)
+    with pytest.raises(storage.StorageError, match="rejected upload \\(404\\)"):
+        storage._put_ncb("appshowcase/u/p/s1.jpg", b"IMG", "image/jpeg")
+    assert calls["post"] == 1
