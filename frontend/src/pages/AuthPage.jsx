@@ -1,5 +1,7 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Link, Navigate, useNavigate, useSearchParams } from "react-router-dom";
+import { SignIn, SignUp } from "@clerk/react";
+import { CLERK_APPEARANCE, clerkEnabled } from "@/lib/clerk";
 import { Loader2, Clapperboard } from "lucide-react";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -39,7 +41,7 @@ function Showcase() {
 }
 
 export default function AuthPage() {
-  const { user, setUser } = useAuth();
+  const { user, setUser, clerkSignedIn, authError, logout, checkAuth } = useAuth();
   const navigate = useNavigate();
   const [params] = useSearchParams();
   const [mode, setMode] = useState(params.get("mode") === "register" ? "register" : "login");
@@ -47,7 +49,28 @@ export default function AuthPage() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
 
+  useEffect(() => {
+    setMode(params.get("mode") === "register" ? "register" : "login");
+  }, [params]);
+
   if (user) return <Navigate to="/dashboard" replace />;
+
+  // Clerk already has a session but the app profile hasn't loaded (or failed).
+  // Never mount <SignIn /> here — it would force-redirect to /dashboard and loop.
+  if (clerkSignedIn) {
+    return (
+      <div className="min-h-screen grid place-items-center px-6" data-testid="auth-clerk-pending">
+        <div className="surface max-w-md p-6 space-y-4 text-center">
+          <h1 className="text-xl font-bold">{authError ? "Couldn’t finish signing you in" : "Signing you in…"}</h1>
+          {authError ? <p className="text-sm text-slate-400">{authError}</p> : null}
+          <div className="flex justify-center gap-2">
+            <button type="button" className="btn-primary" onClick={() => checkAuth()}>Retry</button>
+            <button type="button" className="h-10 px-4 rounded-lg border border-slate-700 hover:bg-slate-800" onClick={logout}>Sign out</button>
+          </div>
+        </div>
+      </div>
+    );
+  }
   const set = (k) => (e) => setForm({ ...form, [k]: e.target.value });
 
   const submit = async (e) => {
@@ -79,6 +102,25 @@ export default function AuthPage() {
               <TabsTrigger value="register" data-testid="auth-tab-register">Create account</TabsTrigger>
             </TabsList>
           </Tabs>
+          {clerkEnabled ? (
+            <div className="flex justify-center" data-testid="clerk-auth-widget">
+              {mode === "login" ? (
+                <SignIn
+                  routing="hash"
+                  appearance={CLERK_APPEARANCE}
+                  signUpUrl="/login?mode=register"
+                  fallbackRedirectUrl="/dashboard"
+                />
+              ) : (
+                <SignUp
+                  routing="hash"
+                  appearance={CLERK_APPEARANCE}
+                  signInUrl="/login"
+                  fallbackRedirectUrl="/dashboard"
+                />
+              )}
+            </div>
+          ) : (
           <form onSubmit={submit} className="space-y-4">
             {mode === "register" && (
               <div className="space-y-1.5"><Label htmlFor="name">Name</Label>
@@ -93,6 +135,7 @@ export default function AuthPage() {
               {busy && <Loader2 className="h-4 w-4 animate-spin" />}{mode === "login" ? "Sign in" : "Create account"}
             </button>
           </form>
+          )}
         </div>
       </div>
     </div>

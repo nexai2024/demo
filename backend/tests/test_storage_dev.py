@@ -52,6 +52,66 @@ def test_broken_s3_falls_back_to_local_in_dev_only(dev_env, monkeypatch):
         asyncio.run(storage.put_object("appshowcase/u/p/s3.jpg", b"IMG", "image/jpeg"))
 
 
+def test_probe_reports_broken_s3_with_local_fallback(dev_env, monkeypatch):
+    def broken(*a, **k):
+        raise storage.StorageError("Could not connect to the endpoint URL")
+
+    monkeypatch.setattr(storage, "_S3_DOWN_UNTIL", 0.0)
+    monkeypatch.setattr(storage, "_s3_config",
+                        lambda: {"bucket": "demo-app-dir", "endpoint": None, "region": "auto", "prefix": ""})
+    monkeypatch.setattr(storage, "_put_s3", broken)
+    result = storage.probe()
+    assert result["configured"] == "s3" and result["bucket"] == "demo-app-dir"
+    assert result["ok"] is True and result["served_by"] == "local" and result["fallback_used"] is True
+    assert "endpoint URL" in result["error"]
+    assert result["latency_ms"] is not None
+
+
+def test_probe_reports_healthy_s3(dev_env, monkeypatch):
+    store = {}
+
+    class FakeS3:
+        def delete_object(self, Bucket, Key):
+            store.pop(Key, None)
+
+    monkeypatch.setattr(storage, "_s3_config",
+                        lambda: {"bucket": "b", "endpoint": None, "region": "us-east-1", "prefix": ""})
+    monkeypatch.setattr(storage, "_put_s3", lambda path, data, ct: store.update({path: data}) or path)
+    monkeypatch.setattr(storage, "_get_s3", lambda path: (store[path], "text/plain"))
+    monkeypatch.setattr(storage, "_get_s3_client", lambda: FakeS3())
+    result = storage.probe()
+    assert result["ok"] is True and result["served_by"] == "s3" and result["fallback_used"] is False
+    assert result["error"] is None and store == {}  # probe object cleaned up
+
+
+def test_probe_fails_loudly_in_production(dev_env, monkeypatch):
+    def broken(*a, **k):
+        raise storage.StorageError("bucket unreachable")
+
+    monkeypatch.setenv("APP_ENV", "production")
+    monkeypatch.setattr(storage, "_S3_DOWN_UNTIL", 0.0)
+    monkeypatch.setattr(storage, "_s3_config",
+                        lambda: {"bucket": "b", "endpoint": None, "region": "auto", "prefix": ""})
+    monkeypatch.setattr(storage, "_put_s3", broken)
+    result = storage.probe()
+    assert result["ok"] is False and result["served_by"] is None
+    assert "bucket unreachable" in result["error"]
+
+
+def test_config_problems_explain_broken_s3_combos(monkeypatch):
+    monkeypatch.setenv("S3_BUCKET", "demo-app-dir")
+    monkeypatch.setenv("AWS_REGION", "auto")
+    monkeypatch.setenv("S3_PREFIX", "appshowcase")
+    monkeypatch.delenv("S3_ENDPOINT_URL", raising=False)
+    problems = storage.config_problems()
+    assert any("S3_ENDPOINT_URL" in p for p in problems)
+    assert any("S3_PREFIX" in p for p in problems)
+
+    monkeypatch.setenv("S3_ENDPOINT_URL", "https://acc123.r2.cloudflarestorage.com")
+    monkeypatch.delenv("S3_PREFIX", raising=False)
+    assert storage.config_problems() == []
+
+
 def test_ncb_upload_fails_fast_on_misconfiguration(dev_env, monkeypatch):
     calls = {"post": 0}
 

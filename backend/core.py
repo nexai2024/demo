@@ -193,7 +193,7 @@ def cors_origins() -> list[str]:
     return [] if is_production() else ["http://localhost:3000", "http://127.0.0.1:3000"]
 
 
-FATAL_PREFIXES = ("JWT_SECRET", "VAULT_MASTER_KEY", "CORS_ORIGINS", "MONGO_URL", "STORAGE")
+FATAL_PREFIXES = ("JWT_SECRET", "VAULT_MASTER_KEY", "CORS_ORIGINS", "MONGO_URL", "STORAGE", "CLERK")
 
 
 def config_problems() -> list[str]:
@@ -217,6 +217,13 @@ def config_problems() -> list[str]:
         problems.append("MONGO_URL is required in production: job leases, quotas and releases need atomic updates")
     import storage
     problems.extend(storage.config_problems())
+    if os.environ.get("AUTH_PROVIDER", "").strip().lower() == "clerk":
+        if not os.environ.get("CLERK_SECRET_KEY"):
+            problems.append("CLERK_SECRET_KEY is not set (required when AUTH_PROVIDER=clerk)")
+        if not (os.environ.get("CLERK_PUBLISHABLE_KEY") or os.environ.get("VITE_CLERK_PUBLISHABLE_KEY")):
+            problems.append("CLERK_PUBLISHABLE_KEY is not set (required when AUTH_PROVIDER=clerk)")
+        if not os.environ.get("CLERK_WEBHOOK_SIGNING_SECRET"):
+            problems.append("Clerk webhooks are not configured (CLERK_WEBHOOK_SIGNING_SECRET); user and billing sync will be stale")
     if not os.environ.get("OPENAI_API_KEY"):
         problems.append("OPENAI_API_KEY is not set (AI features disabled)")
     if not os.environ.get("WEBHOOK_CRON_SECRET"):
@@ -240,6 +247,17 @@ _USER_TTL = 8.0
 
 
 async def get_current_user(request: Request) -> dict:
+    authorization = request.headers.get("authorization") or ""
+    import clerk_service
+    if clerk_service.clerk_enabled():
+        # Clerk mode is exclusive: never fall through to legacy cookie sessions,
+        # which silently mask a broken Bearer token as a different user.
+        if not authorization.lower().startswith("bearer "):
+            raise HTTPException(status_code=401, detail="Not authenticated")
+        claims = await clerk_service.verify_token(authorization[7:].strip())
+        return await clerk_service.profile_for_claims(claims)
+    if authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Not authenticated")
     cookie = request.headers.get("cookie") or ""
     if not cookie:
         raise HTTPException(status_code=401, detail="Not authenticated")
@@ -251,6 +269,8 @@ async def get_current_user(request: Request) -> dict:
         _USER_CACHE.pop(cookie, None)
         raise HTTPException(status_code=401, detail="Not authenticated")
     profile = await db.users.find_one({"user_id": session["id"]}) or {}
+    if profile.get("status") in {"suspended", "banned", "deleted"}:
+        raise HTTPException(status_code=403, detail="Account suspended. Contact support.")
     user = {
         "user_id": session["id"],
         "email": str(session["email"]).lower(),
@@ -258,6 +278,10 @@ async def get_current_user(request: Request) -> dict:
         "picture": session.get("image"),
         "auth_provider": "nocodebackend",
         "preferences": profile.get("preferences") or DEFAULT_PREFS,
+        "role": profile.get("role") or "user",
+        "status": profile.get("status") or "active",
+        "plan": profile.get("plan_override") or profile.get("plan") or "free",
+        "billing_status": profile.get("billing_status") or "free",
     }
     _USER_CACHE[cookie] = (time.monotonic(), user)
     if len(_USER_CACHE) > 40:

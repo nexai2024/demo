@@ -73,8 +73,11 @@ async def _profile(user: dict) -> dict:
     found = await db.users.find_one({"user_id": user["id"]})
     if not found:
         found = {"user_id": user["id"], "email": user["email"].lower(), "name": user.get("name") or user["email"],
-                 "preferences": DEFAULT_PREFS, "created_at": now().isoformat()}
+                 "preferences": DEFAULT_PREFS, "created_at": now().isoformat(), "role": "user", "status": "active",
+                 "plan": "free", "billing_status": "free"}
         await db.users.insert_one(dict(found))
+    if found.get("status") in {"suspended", "banned", "deleted"}:
+        raise HTTPException(403, "Account suspended. Contact support.")
     return {
         "user_id": user["id"],
         "email": user["email"].lower(),
@@ -82,6 +85,10 @@ async def _profile(user: dict) -> dict:
         "picture": user.get("image"),
         "auth_provider": "nocodebackend",
         "preferences": found.get("preferences") or DEFAULT_PREFS,
+        "role": found.get("role") or "user",
+        "status": found.get("status") or "active",
+        "plan": found.get("plan_override") or found.get("plan") or "free",
+        "billing_status": found.get("billing_status") or "free",
     }
 
 

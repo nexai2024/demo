@@ -87,4 +87,7 @@ backend/.data/
 
 # Remotion compositor caches (browser downloads, webpack bundle)
 .remotion/
-compositor/.bundle/
+compositor/.bundle/.env.local
+
+.env.local
+**/.env.local

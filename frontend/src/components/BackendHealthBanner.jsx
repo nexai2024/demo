@@ -28,7 +28,7 @@ export function BackendHealthBanner() {
         setHealth({
           kind: "misrouted",
           problems: [
-            `The API at ${API} returned a web page instead of JSON. Check REACT_APP_BACKEND_URL (it must include https://) or the /api rewrite.`,
+            `The API at ${API} returned a web page instead of JSON. Check VITE_BACKEND_URL (it must include https://) or the /api rewrite.`,
           ],
         });
         return;
@@ -48,8 +48,17 @@ export function BackendHealthBanner() {
       if (data.storage_ok === false && !problems.some((p) => /STORAGE|S3/i.test(p))) {
         problems.push(`Object storage is not ready (mode: ${data.storage || "unknown"}). Configure S3 or the remote store.`);
       }
+      // A recorded probe (startup/nightly/manual) that failed is a live
+      // storage breakage even when static config looks fine.
+      const probe = data.storage_probe;
+      const probeFailed = !!probe && probe.ok === false;
+      if (probeFailed) {
+        problems.push(
+          `Storage probe failed${probe.source ? ` (${probe.source})` : ""}${probe.at ? ` at ${probe.at}` : ""}: ${probe.error || "the put/get round-trip did not complete"}`,
+        );
+      }
       const notReady =
-        res.status !== 200 || data.config_ok === false || data.database_ok === false || data.storage_ok === false;
+        res.status !== 200 || data.config_ok === false || data.database_ok === false || data.storage_ok === false || probeFailed;
       setHealth(
         notReady
           ? { kind: data.config_ok === false ? "config" : "degraded", problems: [...new Set(problems)] }

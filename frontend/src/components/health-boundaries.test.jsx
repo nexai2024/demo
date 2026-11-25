@@ -1,15 +1,16 @@
 import React, { act } from "react";
 import { createRoot } from "react-dom/client";
+import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { ErrorBoundary } from "./ErrorBoundary";
 import { BackendHealthBanner } from "./BackendHealthBanner";
 import axios from "axios";
 
-jest.mock("axios", () => ({
+vi.mock("axios", () => ({
   __esModule: true,
-  default: { get: jest.fn() },
+  default: { get: vi.fn() },
 }));
-jest.mock("@/lib/activity", () => ({ recordActivity: jest.fn() }), { virtual: true });
-jest.mock("@/lib/api", () => ({ API: "/api" }), { virtual: true });
+vi.mock("@/lib/activity", () => ({ recordActivity: vi.fn() }));
+vi.mock("@/lib/api", () => ({ API: "/api" }));
 
 globalThis.IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -20,8 +21,8 @@ const Boom = () => {
 let container;
 let root;
 beforeEach(() => {
-  jest.clearAllMocks();
-  jest.spyOn(console, "error").mockImplementation(() => {});
+  vi.clearAllMocks();
+  vi.spyOn(console, "error").mockImplementation(() => {});
   container = document.createElement("div");
   document.body.appendChild(container);
   root = createRoot(container);
@@ -29,7 +30,7 @@ beforeEach(() => {
 afterEach(async () => {
   await act(async () => root.unmount());
   container.remove();
-  jest.restoreAllMocks();
+  vi.restoreAllMocks();
 });
 const renderUI = async (ui) => {
   await act(async () => root.render(ui));

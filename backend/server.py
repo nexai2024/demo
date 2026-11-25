@@ -36,13 +36,15 @@ from datetime import datetime, timedelta, timezone
 import copy
 from core import (DB_BACKEND, FATAL_PREFIXES, DuplicateKeyError, config_problems, cors_origins, create_viewer_token, db, validate_config, decode_viewer_token, get_current_user, hash_password, new_id,
                   now, now_iso, verify_password)
+import billing
 import cinematic
+import clerk_service
 import compositor
 import jobs
 import netpolicy
 from product import (VIEWPORTS, apply_track, environment_base, estimate_seconds, parse_playwright, prepare_step,
                      public_view, publish_diff, speak, substitute, transcript)
-from storage import APP_NAME, StorageError, get_object, init_storage, put_object, status as storage_status
+from storage import APP_NAME, StorageError, get_object, init_storage, probe as storage_probe, put_object, status as storage_status
 import vault
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
@@ -57,10 +59,16 @@ async def ensure_indexes() -> None:
     await db.runs.create_index([("status", 1), ("started_at", 1)])
     await db.runs.create_index([("project_id", 1), ("started_at", -1)])
     await db.cron_runs.create_index("run_id", unique=True)
+    await db.storage_probes.create_index([("at", -1)])
     await db.analytics_events.create_index([("project_id", 1), ("created_at", -1)])
     await db.login_attempts.create_index("identifier", unique=True)
     await db["quota_counters"].create_index("id", unique=True)
     await db["quota_reservations"].create_index("id", unique=True)
+    await db.users.create_index("user_id", unique=True)
+    await db.admin_audit.create_index([("at", -1)])
+    await db.webhook_events.create_index("event_id", unique=True)
+    await db.organizations.create_index("id", unique=True)
+    await db.organization_memberships.create_index([("user_id", 1), ("organization_id", 1)])
 
 
 app = FastAPI()
@@ -277,6 +285,13 @@ class CommentIn(BaseModel):
 class PrefsIn(BaseModel):
     voice: Literal["alloy", "ash", "coral", "echo", "fable", "nova", "onyx", "sage", "shimmer"]
     narration_mode: Literal["captions", "voiceover", "both"]
+
+
+class AdminUserPatch(BaseModel):
+    role: Optional[Literal["user", "admin"]] = None
+    status: Optional[Literal["active", "suspended"]] = None
+    plan_override: Optional[str] = Field(None, max_length=40)
+    monthly_limit_override: Optional[int] = Field(None, ge=0, le=100000)
 
 
 # ---------- helpers ----------
@@ -1089,6 +1104,34 @@ async def usage_seconds(user: dict) -> int:
     return seconds
 
 
+async def plan_and_limits(user: dict) -> tuple[str, int, int]:
+    """Effective plan = highest of the user's Clerk plan, an admin override,
+    and any entitled organization plan they belong to."""
+    doc = await db.users.find_one({"user_id": user["user_id"]}, {"_id": 0}) or {}
+    candidates: list[str | None] = []
+    if billing.billing_is_entitled(doc.get("billing_status")):
+        candidates.append(doc.get("plan"))
+    elif not doc.get("billing_status") or doc.get("billing_status") == "free":
+        # Legacy/local profiles have no subscription record; only their
+        # explicit free tier is implied. A canceled/expired Clerk plan must
+        # not keep conferring its old paid limits.
+        candidates.append("free")
+    memberships = await db.organization_memberships.find(
+        {"user_id": user["user_id"]}, {"_id": 0}).to_list(100)
+    for membership in memberships:
+        org = await db.organizations.find_one({"id": membership.get("organization_id")}, {"_id": 0}) or {}
+        if billing.billing_is_entitled(org.get("billing_status")):
+            candidates.append(org.get("plan"))
+    plan = doc.get("plan_override") or billing.highest_plan(candidates)
+    recordings, seconds = billing.limits_for(plan, doc.get("monthly_limit_override"))
+    return plan, recordings, seconds
+
+
+async def monthly_limit_for(user: dict) -> int:
+    _, recordings, _ = await plan_and_limits(user)
+    return recordings
+
+
 def _require_browserless() -> None:
     if engine is None or not engine.is_configured():
         raise HTTPException(400, "Browserless is not connected yet. Add your Browserless API key in Settings.")
@@ -1106,7 +1149,7 @@ async def autopilot(pid: str, user: dict = Depends(get_current_user)):
     if seconds > 120:
         note = "One-click run continues in parts because it is longer than a 120s browser session"
     run = await jobs.enqueue_run(
-        p, "autopilot", 3, note, {"action": "autopilot"}, seconds=seconds, monthly_limit=MONTHLY_LIMIT
+        p, "autopilot", 3, note, {"action": "autopilot"}, seconds=seconds, monthly_limit=await monthly_limit_for(user)
     )
     await touch(pid, {"status": "recording"})
     return run
@@ -1163,6 +1206,21 @@ async def cron_refresh_demos(request: Request):
     return {"ok": True}
 
 
+@api.post("/cron/storage-probe")
+async def cron_storage_probe(request: Request):
+    """Nightly storage check (same Bearer-secret auth as the demo refresh).
+    Records the result; the dashboard banner surfaces a failure via
+    /api/ready's storage_probe field before users hit it mid-recording."""
+    auth = request.headers.get("Authorization", "")
+    cron_secret = os.environ.get("WEBHOOK_CRON_SECRET", "")
+    if not cron_secret:
+        raise HTTPException(503, "Scheduled probe is not configured")
+    if not auth.startswith("Bearer ") or not hmac.compare_digest(auth[7:], cron_secret):
+        raise HTTPException(401, "Unauthorized")
+    result = await record_storage_probe("nightly")
+    return {"ok": result["ok"], "served_by": result["served_by"], "error": result["error"]}
+
+
 @api.post("/projects/{pid}/record")
 async def record(pid: str, user: dict = Depends(get_current_user)):
     p = await get_project(pid, user)
@@ -1176,7 +1234,7 @@ async def record(pid: str, user: dict = Depends(get_current_user)):
     run = await jobs.enqueue_run(
         p, "record", len(p["steps"]), note,
         {"action": "record", "only_idx": None, "health": False, "only": None},
-        seconds=seconds, monthly_limit=MONTHLY_LIMIT,
+        seconds=seconds, monthly_limit=await monthly_limit_for(user),
     )
     await db.projects.update_one({"id": pid}, {"$set": {"steps.$[].status": "pending", "steps.$[].error": None,
                                                        "status": "recording"}})
@@ -1196,7 +1254,7 @@ async def rerecord(pid: str, sid: str, user: dict = Depends(get_current_user)):
     return await jobs.enqueue_run(
         p, "rerecord", idx + 1, f"Re-recording step {idx + 1} (replaying previous steps first)...",
         {"action": "record", "only_idx": idx, "health": False, "only": None},
-        seconds=seconds, monthly_limit=MONTHLY_LIMIT,
+        seconds=seconds, monthly_limit=await monthly_limit_for(user),
     )
 
 
@@ -1317,7 +1375,7 @@ async def rerecord_failed(pid: str, user: dict = Depends(get_current_user)):
     return await jobs.enqueue_run(
         p, "rerecord", max(failed) + 1, f"Re-recording {len(failed)} failed step(s)...",
         {"action": "record", "only_idx": None, "health": False, "only": failed},
-        seconds=seconds, monthly_limit=MONTHLY_LIMIT,
+        seconds=seconds, monthly_limit=await monthly_limit_for(user),
     )
 
 
@@ -1932,6 +1990,8 @@ async def ready():
               "browser_driver_lib": bool(engine and engine._driver_lib_dir()),
               "compositor": "remotion" if compositor.available() else "ffmpeg",
               "storage": st.get("mode"), "storage_ok": st.get("mode") in {"s3", "remote", "local"},
+              "auth_provider": "clerk" if clerk_service.clerk_enabled() else "legacy",
+              "clerk_configured": clerk_service.clerk_enabled(),
               "config_ok": not fatal, "config_problems": problems,
               "cors_origins": cors_origins(),
               "startup_error": getattr(app.state, "config_error", None)}
@@ -1941,22 +2001,373 @@ async def ready():
     except Exception as exc:
         checks["database_ok"] = False
         logger.warning("readiness db check failed: %s", exc)
+    # Latest recorded storage probe (startup/nightly/manual). Informational
+    # only — it never changes the readiness status code, but the dashboard
+    # banner turns a failed probe into a visible warning.
+    try:
+        latest_probe = await db.storage_probes.find_one({}, {"_id": 0}, sort=[("at", -1)])
+    except Exception:
+        latest_probe = None
+    probe_result = (latest_probe or {}).get("result") or {}
+    checks["storage_probe"] = (
+        {"ok": probe_result.get("ok"), "at": latest_probe.get("at"), "source": latest_probe.get("source"),
+         "served_by": probe_result.get("served_by"),
+         "error": (probe_result.get("error") or "")[:240] or None}
+        if latest_probe else None)
     ok = checks["database_ok"] and checks["storage_ok"] and checks["config_ok"]
     from fastapi.responses import JSONResponse
     return JSONResponse(status_code=200 if ok else 503, content=checks)
 
 
+async def record_storage_probe(source: str) -> dict:
+    """Run the storage probe and persist the result (latest 60 kept) so a
+    breakage found at startup, overnight, or from Settings is visible on
+    the dashboard banner before a user's recording hits it."""
+    result = await asyncio.to_thread(storage_probe)
+    try:
+        await db.storage_probes.insert_one(
+            {"id": new_id("prb_"), "source": source, "at": now_iso(), "result": result})
+        rows = await db.storage_probes.find({}, {"id": 1}).sort("at", -1).to_list(200)
+        for stale in rows[60:]:
+            await db.storage_probes.delete_one({"id": stale["id"]})
+    except Exception:
+        logger.warning("Could not record storage probe", exc_info=True)
+    if not result.get("ok"):
+        logger.warning("Storage probe (%s) failed: %s", source, result.get("error"))
+    return result
+
+
+# ---------- admin: users, utilization, audit ----------
+async def require_admin(user: dict = Depends(get_current_user)) -> dict:
+    if (user.get("role") or "user") != "admin":
+        raise HTTPException(403, "Admin access required")
+    return user
+
+
+async def _admin_audit(actor: dict, action: str, target_user_id: str, details: dict | None = None) -> None:
+    try:
+        await db.admin_audit.insert_one({
+            "id": new_id("aud_"), "at": now_iso(), "actor_id": actor.get("user_id"),
+            "actor_email": actor.get("email"), "action": action,
+            "target_user_id": target_user_id, "details": details or {},
+        })
+    except Exception:
+        logger.warning("Could not write admin audit entry", exc_info=True)
+
+
+async def _admin_target(uid: str) -> dict:
+    doc = await db.users.find_one({"user_id": uid}, {"_id": 0})
+    if doc:
+        return doc
+    remote = await clerk_service.fetch_user(uid, force=True) if clerk_service.clerk_enabled() else None
+    if not remote:
+        raise HTTPException(404, "User not found")
+    doc = {"user_id": uid, "clerk_id": uid, "email": remote.get("email"), "name": remote.get("name"),
+           "picture": remote.get("picture"), "auth_provider": "clerk", "role": remote.get("role") or "user",
+           "status": "suspended" if remote.get("banned") else "active", "plan": "free",
+           "billing_status": "free", "preferences": {"voice": "nova", "narration_mode": "both"},
+           "created_at": now_iso()}
+    await db.users.insert_one(dict(doc))
+    return doc
+
+
+async def _usage_map() -> dict[str, dict]:
+    users = await db.users.find({}, {"_id": 0}).to_list(10000)
+    projects = await db.projects.find({}, {"_id": 0}).to_list(20000)
+    runs = await db.runs.find({}, {"_id": 0}).to_list(20000)
+    usage: dict[str, dict] = {}
+    for doc in users:
+        count, seconds = await jobs.usage_summary(doc["user_id"])
+        usage[doc["user_id"]] = {"projects": 0, "runs": 0, "active_runs": 0, "completed_runs": 0,
+                                 "failed_runs": 0, "recordings_this_month": count,
+                                 "seconds_this_month": seconds, "last_run_at": None}
+    for project in projects:
+        row = usage.setdefault(project.get("user_id"), {"projects": 0, "runs": 0, "active_runs": 0,
+                                                        "completed_runs": 0, "failed_runs": 0,
+                                                        "recordings_this_month": 0, "seconds_this_month": 0,
+                                                        "last_run_at": None})
+        if not project.get("is_deleted"):
+            row["projects"] += 1
+    for run in runs:
+        row = usage.setdefault(run.get("user_id"), {"projects": 0, "runs": 0, "active_runs": 0,
+                                                    "completed_runs": 0, "failed_runs": 0,
+                                                    "recordings_this_month": 0, "seconds_this_month": 0,
+                                                    "last_run_at": None})
+        row["runs"] += 1
+        if run.get("status") in {"queued", "running"}:
+            row["active_runs"] += 1
+        if run.get("status") in {"done", "completed", "success"}:
+            row["completed_runs"] += 1
+        if run.get("status") in {"failed", "error", "cancelled"}:
+            row["failed_runs"] += 1
+        started = run.get("started_at") or run.get("created_at")
+        if started and (not row["last_run_at"] or str(started) > str(row["last_run_at"])):
+            row["last_run_at"] = started
+    return usage
+
+
+def _admin_user_row(doc: dict, usage: dict) -> dict:
+    plan = doc.get("plan_override") or doc.get("plan") or "free"
+    limit, seconds_limit = billing.limits_for(plan, doc.get("monthly_limit_override"))
+    return {
+        "user_id": doc.get("user_id"), "clerk_id": doc.get("clerk_id"),
+        "email": doc.get("email"), "name": doc.get("name"), "picture": doc.get("picture"),
+        "auth_provider": doc.get("auth_provider") or "legacy",
+        "role": doc.get("role") or "user", "status": doc.get("status") or "active",
+        "plan": plan, "plan_name": billing.plan_info(plan)["name"],
+        "billing_status": doc.get("billing_status") or "free",
+        "billing_current_period_end": doc.get("billing_current_period_end"),
+        "created_at": doc.get("created_at"), "last_seen_at": doc.get("last_seen_at"),
+        "usage": {**usage, "limit": limit, "seconds_limit": seconds_limit},
+    }
+
+
+@api.get("/admin/summary")
+async def admin_summary(admin: dict = Depends(require_admin)):
+    users = await db.users.find({}, {"_id": 0}).to_list(10000)
+    usage = await _usage_map()
+    return {
+        "users": len(users),
+        "active_users": sum(1 for u in users if (u.get("status") or "active") == "active"),
+        "suspended_users": sum(1 for u in users if (u.get("status") or "active") != "active"),
+        "admins": sum(1 for u in users if u.get("role") == "admin"),
+        "projects": sum(v["projects"] for v in usage.values()),
+        "runs": sum(v["runs"] for v in usage.values()),
+        "active_runs": sum(v["active_runs"] for v in usage.values()),
+        "recordings_this_month": sum(v["recordings_this_month"] for v in usage.values()),
+        "seconds_this_month": sum(v["seconds_this_month"] for v in usage.values()),
+        "plans": {slug: sum(1 for u in users if billing.normalize_plan(u.get("plan_override") or u.get("plan")) == slug)
+                  for slug in billing.PLANS},
+    }
+
+
+@api.get("/admin/users")
+async def admin_users(query: str = "", limit: int = 50, offset: int = 0,
+                      admin: dict = Depends(require_admin)):
+    docs = await db.users.find({}, {"_id": 0}).to_list(10000)
+    by_id = {doc.get("user_id"): doc for doc in docs}
+    if clerk_service.clerk_enabled():
+        try:
+            remote_users = await clerk_service.list_users(limit=limit, offset=offset, query=query)
+        except HTTPException:
+            remote_users = []
+        for remote in remote_users:
+            uid = remote.get("id")
+            if uid and uid not in by_id:
+                by_id[uid] = {"user_id": uid, "clerk_id": uid, "email": remote.get("email"),
+                              "name": remote.get("name"), "picture": remote.get("picture"),
+                              "auth_provider": "clerk", "role": remote.get("role") or "user",
+                              "status": "suspended" if remote.get("banned") else "active",
+                              "plan": "free", "billing_status": "free", "created_at": None}
+    rows = list(by_id.values())
+    needle = query.strip().lower()
+    if needle:
+        rows = [doc for doc in rows if needle in str(doc.get("email") or "").lower()
+                or needle in str(doc.get("name") or "").lower() or needle == str(doc.get("user_id"))]
+    rows.sort(key=lambda doc: str(doc.get("created_at") or ""), reverse=True)
+    usage = await _usage_map()
+    total = len(rows)
+    page = rows[max(offset, 0): max(offset, 0) + min(max(limit, 1), 100)]
+    return {"total": total, "users": [_admin_user_row(doc, usage.get(doc.get("user_id"), {
+        "projects": 0, "runs": 0, "active_runs": 0, "completed_runs": 0, "failed_runs": 0,
+        "recordings_this_month": 0, "seconds_this_month": 0, "last_run_at": None})) for doc in page]}
+
+
+@api.get("/admin/users/{uid}")
+async def admin_user_detail(uid: str, admin: dict = Depends(require_admin)):
+    doc = await _admin_target(uid)
+    usage = (await _usage_map()).get(uid, {"projects": 0, "runs": 0, "active_runs": 0, "completed_runs": 0,
+                                           "failed_runs": 0, "recordings_this_month": 0,
+                                           "seconds_this_month": 0, "last_run_at": None})
+    projects = await db.projects.find({"user_id": uid, "is_deleted": False}, {"_id": 0}).sort("updated_at", -1).to_list(20)
+    audit = await db.admin_audit.find({"target_user_id": uid}, {"_id": 0}).sort("at", -1).to_list(50)
+    memberships = await db.organization_memberships.find({"user_id": uid}, {"_id": 0}).to_list(100)
+    return {"user": _admin_user_row(doc, usage), "projects": projects, "audit": audit,
+            "organizations": memberships}
+
+
+@api.patch("/admin/users/{uid}")
+async def admin_patch_user(uid: str, body: AdminUserPatch, admin: dict = Depends(require_admin)):
+    doc = await _admin_target(uid)
+    fields = {key: value for key, value in body.model_dump().items() if value is not None}
+    if "plan_override" in fields and fields["plan_override"] == "":
+        fields["plan_override"] = None
+    if fields:
+        await db.users.update_one({"user_id": uid}, {"$set": fields})
+    if clerk_service.clerk_enabled() and doc.get("auth_provider") == "clerk":
+        if "role" in fields:
+            await clerk_service.update_user_metadata(uid, {"role": fields["role"]})
+        if fields.get("status") == "suspended":
+            await clerk_service.ban_user(uid)
+        elif fields.get("status") == "active":
+            await clerk_service.unban_user(uid)
+            await clerk_service.unlock_user(uid)
+    await _admin_audit(admin, "user.update", uid, fields)
+    return {"ok": True, "user": _admin_user_row({**doc, **fields}, (await _usage_map()).get(uid, {}))}
+
+
+async def _admin_action(uid: str, admin: dict, action: str) -> dict:
+    doc = await _admin_target(uid)
+    is_clerk_user = clerk_service.clerk_enabled() and (doc.get("auth_provider") == "clerk" or str(uid).startswith("user_"))
+    details: dict = {}
+    if action == "suspend":
+        if is_clerk_user:
+            await clerk_service.ban_user(uid)
+        await db.users.update_one({"user_id": uid}, {"$set": {"status": "suspended", "suspended_at": now_iso()}})
+    elif action == "reactivate":
+        if is_clerk_user:
+            await clerk_service.unban_user(uid)
+            await clerk_service.unlock_user(uid)
+        await db.users.update_one({"user_id": uid}, {"$set": {"status": "active", "suspended_at": None}})
+    elif action == "revoke_sessions":
+        details["revoked_sessions"] = await clerk_service.revoke_user_sessions(uid) if is_clerk_user else 0
+    elif action == "cancel":
+        if is_clerk_user:
+            await clerk_service.delete_user(uid)
+        await db.users.update_one({"user_id": uid}, {"$set": {"status": "deleted", "deleted_at": now_iso()}})
+    else:
+        raise HTTPException(404, "Unknown admin action")
+    await _admin_audit(admin, f"user.{action}", uid, details)
+    return {"ok": True, "action": action, **details}
+
+
+@api.post("/admin/users/{uid}/suspend")
+async def admin_suspend_user(uid: str, admin: dict = Depends(require_admin)):
+    return await _admin_action(uid, admin, "suspend")
+
+
+@api.post("/admin/users/{uid}/reactivate")
+async def admin_reactivate_user(uid: str, admin: dict = Depends(require_admin)):
+    return await _admin_action(uid, admin, "reactivate")
+
+
+@api.post("/admin/users/{uid}/revoke-sessions")
+async def admin_revoke_user_sessions(uid: str, admin: dict = Depends(require_admin)):
+    return await _admin_action(uid, admin, "revoke_sessions")
+
+
+@api.post("/admin/users/{uid}/cancel")
+async def admin_cancel_user(uid: str, admin: dict = Depends(require_admin)):
+    return await _admin_action(uid, admin, "cancel")
+
+
+@api.get("/admin/audit")
+async def admin_audit(limit: int = 100, admin: dict = Depends(require_admin)):
+    rows = await db.admin_audit.find({}, {"_id": 0}).sort("at", -1).to_list(min(max(limit, 1), 500))
+    return {"entries": rows}
+
+
+# ---------- Clerk webhooks: identity, organizations, billing sync ----------
+@api.post("/webhooks/clerk")
+async def clerk_webhook(request: Request):
+    raw = await request.body()
+    event = clerk_service.verify_webhook(raw, dict(request.headers))
+    event_id = request.headers.get("svix-id")
+    if event_id and await db.webhook_events.find_one({"event_id": event_id}, {"_id": 0}):
+        return {"ok": True, "duplicate": True}
+    event_type = str(event.get("type") or "")
+    data = event.get("data") or {}
+    try:
+        await db.webhook_events.insert_one({"event_id": event_id, "type": event_type, "at": now_iso()})
+    except Exception:
+        pass
+
+    if event_type in {"user.created", "user.updated", "user.deleted"}:
+        remote = clerk_service.normalize_user(data)
+        uid = remote.get("id")
+        if uid:
+            if event_type == "user.deleted":
+                await db.users.update_one({"user_id": uid}, {"$set": {"status": "deleted", "deleted_at": now_iso()}})
+            else:
+                doc = await db.users.find_one({"user_id": uid}, {"_id": 0})
+                fields = {"user_id": uid, "clerk_id": uid, "email": remote.get("email"), "name": remote.get("name"),
+                          "picture": remote.get("picture"), "auth_provider": "clerk",
+                          "role": (doc or {}).get("role") or remote.get("role") or "user",
+                          "status": "suspended" if remote.get("banned") else ((doc or {}).get("status") or "active"),
+                          "updated_at": now_iso()}
+                if doc:
+                    await db.users.update_one({"user_id": uid}, {"$set": fields})
+                else:
+                    await db.users.insert_one({**fields, "preferences": {"voice": "nova", "narration_mode": "both"},
+                                               "plan": "free", "billing_status": "free", "created_at": now_iso()})
+    elif event_type in {"organization.created", "organization.updated", "organization.deleted"}:
+        oid = data.get("id")
+        if oid:
+            if event_type == "organization.deleted":
+                await db.organizations.update_one({"id": oid}, {"$set": {"status": "deleted", "updated_at": now_iso()}})
+            else:
+                fields = {"id": oid, "name": data.get("name"), "slug": data.get("slug"),
+                          "picture": data.get("image_url"), "status": "active", "updated_at": now_iso()}
+                if await db.organizations.find_one({"id": oid}, {"_id": 0}):
+                    await db.organizations.update_one({"id": oid}, {"$set": fields})
+                else:
+                    await db.organizations.insert_one({**fields, "plan": "free", "billing_status": "free",
+                                                       "created_at": now_iso()})
+    elif event_type.startswith("organizationMembership."):
+        org = data.get("organization") or {}
+        public_user = data.get("public_user_data") or {}
+        oid, uid = org.get("id"), public_user.get("user_id")
+        if oid and uid:
+            filt = {"organization_id": oid, "user_id": uid}
+            if event_type == "organizationMembership.deleted":
+                await db.organization_memberships.delete_one(filt)
+            else:
+                fields = {**filt, "role": str(data.get("role") or "org:member").removeprefix("org:"),
+                          "updated_at": now_iso()}
+                if await db.organization_memberships.find_one(filt, {"_id": 0}):
+                    await db.organization_memberships.update_one(filt, {"$set": fields})
+                else:
+                    await db.organization_memberships.insert_one({**fields, "created_at": now_iso()})
+    elif event_type.startswith(("subscription", "paymentAttempt")):
+        payer = data.get("payer") or {}
+        items = data.get("items") or []
+        item = items[0] if items else data
+        plan_slug = ((item.get("plan") or {}).get("slug") if isinstance(item, dict) else None)
+        status = data.get("status") or (item.get("status") if isinstance(item, dict) else None) or event_type.rsplit(".", 1)[-1]
+        fields = {"billing_status": str(status), "billing_updated_at": now_iso(),
+                  "billing_subscription_id": data.get("id")}
+        if plan_slug:
+            fields["plan"] = billing.normalize_plan(plan_slug)
+        if payer.get("organization_id"):
+            await db.organizations.update_one({"id": payer["organization_id"]}, {"$set": fields})
+        elif payer.get("user_id"):
+            await db.users.update_one({"user_id": payer["user_id"]}, {"$set": fields})
+    return {"ok": True}
+
+
 @api.get("/settings")
 async def get_settings(user: dict = Depends(get_current_user)):
-    return {"browserless_configured": bool(engine and engine.is_configured()),
+    plan, limit, seconds_limit = await plan_and_limits(user)
+    count, seconds_used = await jobs.usage_summary(user["user_id"])
+    is_admin = (user.get("role") or "user") == "admin"
+    payload = {
+        "preferences": user.get("preferences") or {"voice": "nova", "narration_mode": "both"},
+        "auth": {"provider": user.get("auth_provider"), "role": user.get("role") or "user",
+                 "clerk_configured": clerk_service.clerk_enabled()},
+        "usage": {"recordings_this_month": count, "limit": limit, "plan": billing.plan_info(plan)["name"],
+                  "plan_slug": plan, "billing_status": user.get("billing_status") or "free",
+                  "seconds_this_month": seconds_used, "seconds_limit": seconds_limit,
+                  "session_cap": 120},
+        # Coarse readiness flags remain available so the studio can disable
+        # record when Browserless is down; region/model/storage detail is admin-only.
+        "browserless_configured": bool(engine and engine.is_configured()),
+        "llm_configured": bool(ai and ai.provider()[2]),
+    }
+    if is_admin:
+        payload.update({
             "browserless_region": engine.ws_base() if engine else "",
-            "llm_configured": bool(ai and ai.provider()[2]), "ai_model": ai.provider()[3] if ai else "Not installed",
+            "ai_model": ai.provider()[3] if ai else "Not installed",
             "tts_model": ai.tts_key()[1] if ai else "Not installed",
-            "preferences": user.get("preferences") or {"voice": "nova", "narration_mode": "both"},
             "storage": storage_status(),
-            "usage": {"recordings_this_month": await usage_count(user), "limit": MONTHLY_LIMIT, "plan": "Free",
-                      "seconds_this_month": await usage_seconds(user), "seconds_limit": MONTHLY_LIMIT * 120,
-                      "session_cap": 120}}
+        })
+    else:
+        payload.update({
+            "browserless_region": "",
+            "ai_model": "",
+            "tts_model": "",
+            "storage": {"mode": "hidden", "detail": "System storage is managed by admins."},
+        })
+    return payload
 
 
 @api.put("/settings")
@@ -1966,13 +2377,20 @@ async def put_settings(body: PrefsIn, user: dict = Depends(get_current_user)):
 
 
 @api.post("/settings/test-browserless")
-async def test_browserless(user: dict = Depends(get_current_user)):
+async def test_browserless(user: dict = Depends(require_admin)):
     _require_browserless()
     try:
         await engine.test_connection()
     except Exception as exc:
         raise HTTPException(424, f"Could not connect to Browserless: {str(exc)[:1000]}")
     return {"ok": True}
+
+
+@api.post("/settings/test-storage")
+async def test_storage(user: dict = Depends(require_admin)):
+    """Put/get round-trip probe: configured backend, resolved endpoint,
+    and the exact error when it's broken (see storage.probe)."""
+    return await record_storage_probe("manual")
 
 
 @api.post("/tts/preview")
@@ -2022,11 +2440,23 @@ async def startup():
         logger.error("Admin seed failed: %s", exc)
     embedded = os.environ.get("EMBEDDED_WORKER", "true").strip().lower() not in {"0", "false", "no"}
     app.state.worker_task = asyncio.create_task(worker_loop()) if embedded else None
+    app.state.probe_task = asyncio.create_task(_startup_storage_probe())
+
+
+async def _startup_storage_probe() -> None:
+    """Self-check storage shortly after boot and record the result, so a
+    dead bucket is on the dashboard before the first recording hits it."""
+    try:
+        await asyncio.sleep(2)
+        await record_storage_probe("startup")
+    except Exception:
+        logger.warning("Startup storage probe failed", exc_info=True)
 
 
 @app.on_event("shutdown")
 async def shutdown():
-    for task in (getattr(app.state, "index_task", None), getattr(app.state, "worker_task", None)):
+    for task in (getattr(app.state, "index_task", None), getattr(app.state, "worker_task", None),
+                 getattr(app.state, "probe_task", None)):
         if task is None:
             continue
         task.cancel()

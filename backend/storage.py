@@ -35,10 +35,14 @@ def _s3_config() -> dict | None:
     bucket = os.environ.get("S3_BUCKET", "").strip()
     if not bucket:
         return None
+    endpoint = os.environ.get("S3_ENDPOINT_URL", "").strip() or None
+    # 'auto' is the R2 region and only valid with a custom endpoint; plain
+    # AWS with no region configured means the default AWS region.
+    region = os.environ.get("AWS_REGION", "").strip() or ("auto" if endpoint else "us-east-1")
     return {
         "bucket": bucket,
-        "endpoint": os.environ.get("S3_ENDPOINT_URL", "").strip() or None,
-        "region": os.environ.get("AWS_REGION", "").strip() or "auto",
+        "endpoint": endpoint,
+        "region": region,
         "access_key": os.environ.get("AWS_ACCESS_KEY_ID", "").strip() or None,
         "secret_key": os.environ.get("AWS_SECRET_ACCESS_KEY", "").strip() or None,
         "prefix": os.environ.get("S3_PREFIX", "").strip().strip("/"),
@@ -95,8 +99,23 @@ def _allow_local_fallback() -> bool:
 
 def config_problems() -> list[str]:
     """Return production configuration problems for object storage."""
-    if _s3_config():
-        return []
+    conf = _s3_config()
+    if conf:
+        problems = []
+        if conf["region"] == "auto" and not conf["endpoint"]:
+            # boto3 would build <bucket>.s3.auto.amazonaws.com, which
+            # does not exist: 'auto' is only valid with an R2 endpoint.
+            problems.append(
+                "STORAGE: AWS_REGION=auto requires S3_ENDPOINT_URL "
+                "(Cloudflare R2: https://<account-id>.r2.cloudflarestorage.com); "
+                "for AWS S3 set AWS_REGION to the bucket's real region (e.g. us-east-1)")
+        if conf["prefix"]:
+            # Warning-grade (no STORAGE: prefix): storage still works,
+            # keys just gain a redundant folder.
+            problems.append(
+                "Storage note: S3_PREFIX duplicates the folder already in object paths "
+                f"('appshowcase/...' becomes '{conf['prefix']}/appshowcase/...'); clear S3_PREFIX")
+        return problems
     if _ncb_configured() and os.environ.get("STORAGE_BACKEND", "").strip().lower() == "ncb":
         return []
     return ["STORAGE: S3_BUCKET is not set; durable shared object storage is required in production"]
@@ -127,6 +146,79 @@ def status() -> dict:
     if _allow_local_fallback():
         return {"mode": "local", "detail": "Development local disk storage (not shared across replicas)."}
     return {"mode": "unconfigured", "detail": "Shared object storage is not configured."}
+
+
+def probe() -> dict:
+    """Live storage diagnostic for the Settings page.
+
+    Tries the CONFIGURED backend directly (no dev fallback) so a broken
+    S3/R2/NCB config shows its real error, then the app-effective put/get
+    round-trip to show what uploads actually experience.
+    """
+    import uuid
+
+    conf = _s3_config()
+    configured = "s3" if conf else ("ncb" if _ncb_configured() else "local")
+    result = {
+        "configured": configured,
+        "bucket": conf["bucket"] if conf else None,
+        "endpoint": conf["endpoint"] if conf else None,
+        "region": conf["region"] if conf else None,
+        "prefix": conf["prefix"] if conf else "",
+        "ok": False,
+        "served_by": None,
+        "fallback_used": False,
+        "latency_ms": None,
+        "error": None,
+        "problems": config_problems(),
+    }
+    payload = f"appshowcase storage probe {uuid.uuid4().hex[:8]}".encode()
+    path = f"appshowcase/_probe/{uuid.uuid4().hex}.txt"
+
+    direct_error = None
+    if configured == "s3":
+        try:
+            _put_s3(path, payload, "text/plain")
+            data, _ = _get_s3(path)
+            if data != payload:
+                raise StorageError("Round-trip mismatch: read back different bytes")
+        except Exception as exc:
+            direct_error = f"{type(exc).__name__}: {str(exc)[:280]}"
+    elif configured == "ncb":
+        try:
+            _put_ncb(path, payload, "text/plain")
+        except Exception as exc:
+            direct_error = f"{type(exc).__name__}: {str(exc)[:280]}"
+
+    started = time.monotonic()
+    try:
+        stored_path = _put(path, payload, "text/plain")
+        data, _ = _get(stored_path)
+        if data != payload:
+            raise StorageError("Round-trip mismatch: read back different bytes")
+        result["ok"] = True
+        result["served_by"] = configured if direct_error is None else "local"
+        result["fallback_used"] = direct_error is not None and result["served_by"] == "local"
+        _probe_cleanup(stored_path, result["served_by"])
+    except Exception as exc:
+        result["error"] = f"{type(exc).__name__}: {str(exc)[:280]}"
+    result["latency_ms"] = round((time.monotonic() - started) * 1000)
+    if direct_error:
+        # Surface the remote failure even when the dev fallback saved us.
+        result["error"] = direct_error
+    return result
+
+
+def _probe_cleanup(path: str, served_by: str | None) -> None:
+    try:
+        if served_by == "s3":
+            conf = _s3_config()
+            if conf:
+                _get_s3_client().delete_object(Bucket=conf["bucket"], Key=_s3_key(path))
+        elif served_by == "local":
+            (LOCAL_ROOT / path).unlink(missing_ok=True)
+    except Exception:
+        pass
 
 
 def init_storage(force: bool = False) -> str:

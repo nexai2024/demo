@@ -166,7 +166,7 @@ export default function Dashboard() {
             <h2 className="font-semibold">Make the first demo</h2>
             <ol className="mt-3 space-y-1 text-sm text-slate-300 list-decimal pl-5">
               <li>Create a demo from the TodoMVC example.</li>
-              <li>Open Settings and confirm Browserless says Connected.</li>
+              <li>If recording is disabled, ask an admin to confirm Browserless in System integrations.</li>
               <li>Generate the script, then Record demo.</li>
               <li>Publish freeze so the share link stays on that version.</li>
             </ol>

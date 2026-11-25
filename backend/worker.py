@@ -23,6 +23,10 @@ async def run_worker() -> None:
     validate_config()
     await asyncio.to_thread(init_storage)
     await server.ensure_indexes()
+    try:
+        await server.record_storage_probe("startup")
+    except Exception:
+        logger.warning("Startup storage probe failed", exc_info=True)
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):

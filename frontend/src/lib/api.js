@@ -1,7 +1,7 @@
 import axios from "axios";
 import { recordActivity } from "@/lib/activity";
 
-// Normalize REACT_APP_BACKEND_URL so common paste errors can't produce a
+// Normalize VITE_BACKEND_URL so common paste errors can't produce a
 // relative URL like "api.example.com/api/..." (which the browser resolves
 // against the frontend origin, yielding /api.example.com/api/...).
 // Accepts: "api.example.com", "https://api.example.com", either with a
@@ -13,16 +13,42 @@ const normalizeBackend = (raw) => {
   if (/\/api$/i.test(v)) v = v.slice(0, -4).replace(/\/+$/, "");
   return v;
 };
-const configured = normalizeBackend(process.env.REACT_APP_BACKEND_URL);
+const configured = normalizeBackend(import.meta.env.VITE_BACKEND_URL);
 export const API = configured ? `${configured}/api` : "/api";
 
 export const api = axios.create({ baseURL: API, withCredentials: true });
+
+let authTokenGetter = null;
+export const setAuthTokenGetter = (getter) => {
+  authTokenGetter = getter;
+};
+
+api.interceptors.request.use(async (config) => {
+  if (authTokenGetter && !config.headers?.Authorization && !config.headers?.authorization) {
+    try {
+      const token = await authTokenGetter();
+      if (token) config.headers.Authorization = `Bearer ${token}`;
+    } catch (_) {
+      /* Clerk will surface session errors through /auth/me. */
+    }
+  }
+  return config;
+});
 
 api.interceptors.response.use(
   (r) => r,
   async (err) => {
     const cfg = err.config || {};
-    if (err.response?.status === 401 && !cfg._retry && !String(cfg.url).includes("/auth/")) {
+    const hasBearer = Boolean(cfg.headers?.Authorization || cfg.headers?.authorization);
+    // Clerk mode attaches a Bearer via authTokenGetter — never fall back to the
+    // legacy NoCodeBackend cookie refresh, which races with Clerk and confuses /auth/me.
+    if (
+      err.response?.status === 401 &&
+      !hasBearer &&
+      !authTokenGetter &&
+      !cfg._retry &&
+      !String(cfg.url).includes("/auth/")
+    ) {
       cfg._retry = true;
       try {
         await axios.post(`${API}/auth/refresh`, {}, { withCredentials: true });

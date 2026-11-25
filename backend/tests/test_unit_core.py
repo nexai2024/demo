@@ -35,6 +35,10 @@ def test_production_accepts_safe_config(monkeypatch):
     monkeypatch.setenv("VAULT_MASTER_KEY", "M3nP8qR2tV6wX1zC5bN7kJ4hF9gD0sA2")
     monkeypatch.setenv("CORS_ORIGINS", "https://app.example.com/")
     monkeypatch.setenv("S3_BUCKET", "appshowcase-prod-media")
+    # Isolate from the developer's real .env storage settings.
+    monkeypatch.delenv("AWS_REGION", raising=False)
+    monkeypatch.delenv("S3_ENDPOINT_URL", raising=False)
+    monkeypatch.delenv("S3_PREFIX", raising=False)
     monkeypatch.setattr(core, "DB_BACKEND", "mongodb")
     core.validate_config()
     assert core.cors_origins() == ["https://app.example.com"]
