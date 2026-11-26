@@ -112,6 +112,21 @@ def test_config_problems_explain_broken_s3_combos(monkeypatch):
     assert storage.config_problems() == []
 
 
+def test_access_point_arn_in_endpoint_is_normalized(monkeypatch):
+    monkeypatch.setenv("S3_BUCKET", "demo-xxxx-s3alias")
+    monkeypatch.setenv(
+        "S3_ENDPOINT_URL",
+        "s3://arn:aws:s3:us-east-1:123456789012:accesspoint/demo",
+    )
+    monkeypatch.setenv("AWS_REGION", "auto")
+    storage.reset_client()
+    conf = storage._s3_config()
+    assert conf["bucket"] == "arn:aws:s3:us-east-1:123456789012:accesspoint/demo"
+    assert conf["endpoint"] is None
+    assert conf["region"] == "us-east-1"
+    assert any("Access Point ARN" in p for p in storage.config_problems())
+
+
 def test_ncb_upload_fails_fast_on_misconfiguration(dev_env, monkeypatch):
     calls = {"post": 0}
 

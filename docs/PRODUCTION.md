@@ -20,5 +20,5 @@
 - Cancellation is persisted (`cancel_requested=true`) in MongoDB. Crashed workers' expired leases are reclaimed and resumed from per-step checkpoints without double-charging quotas or duplicating export artifacts.
 
 ## 5. Durable shared object storage & backup rehearsal
-- Set `S3_BUCKET` (with `S3_ENDPOINT_URL` for Cloudflare R2/MinIO). Local disk fallback is disabled in production; upload failures retry and raise `503 storage_unavailable`.
+- Set `S3_BUCKET` (with `S3_ENDPOINT_URL` for Cloudflare R2/MinIO). For AWS Access Points put the ARN or `*-s3alias` in `S3_BUCKET` and leave `S3_ENDPOINT_URL` empty — never `s3://arn:…`. Local disk fallback is disabled in production; upload failures retry and raise `503 storage_unavailable`.
 - Enable bucket versioning and lifecycle rules, and schedule MongoDB + bucket restore rehearsals before launch.

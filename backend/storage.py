@@ -31,6 +31,49 @@ def _is_production() -> bool:
     return os.environ.get("APP_ENV", "development").strip().lower() in {"production", "prod"}
 
 
+def _access_point_arn(value: str) -> str | None:
+    """Return a bare Access Point ARN if ``value`` is one (optionally ``s3://``-prefixed)."""
+    text = (value or "").strip()
+    if text.startswith("s3://arn:"):
+        text = text[len("s3://"):]
+    if text.startswith("arn:aws:s3:") and ":accesspoint/" in text:
+        return text
+    return None
+
+
+def _normalize_s3_binding(bucket: str, endpoint: str | None, region: str) -> tuple[str, str | None, str]:
+    """Fix the common Access-Point-ARN-as-endpoint mistake.
+
+    boto3 wants either:
+      * ``S3_BUCKET=<bucket|alias|accesspoint-arn>`` and empty ``S3_ENDPOINT_URL`` for AWS, or
+      * ``S3_ENDPOINT_URL=https://...`` for R2/MinIO.
+
+    Putting ``s3://arn:aws:s3:region:acct:accesspoint/name`` in ``S3_ENDPOINT_URL``
+    makes botocore raise "Custom endpoint ... was not a valid URI".
+    """
+    for candidate in (endpoint or "", bucket):
+        arn = _access_point_arn(candidate)
+        if not arn:
+            continue
+        parts = arn.split(":")
+        # arn:aws:s3:REGION:ACCOUNT:accesspoint/NAME
+        arn_region = parts[3] if len(parts) > 3 else ""
+        if not region or region == "auto":
+            region = arn_region or "us-east-1"
+        if endpoint and _access_point_arn(endpoint):
+            logger.warning(
+                "S3_ENDPOINT_URL is an Access Point ARN; using it as S3_BUCKET and clearing the custom endpoint")
+            endpoint = None
+        bucket = arn
+        break
+    if endpoint and not endpoint.startswith(("http://", "https://")):
+        raise StorageError(
+            f"S3_ENDPOINT_URL must be an http(s) URL (R2/MinIO), not {endpoint!r}. "
+            "For an AWS Access Point, put the ARN or *-s3alias name in S3_BUCKET and leave "
+            "S3_ENDPOINT_URL empty.")
+    return bucket, endpoint, region
+
+
 def _s3_config() -> dict | None:
     bucket = os.environ.get("S3_BUCKET", "").strip()
     if not bucket:
@@ -39,6 +82,7 @@ def _s3_config() -> dict | None:
     # 'auto' is the R2 region and only valid with a custom endpoint; plain
     # AWS with no region configured means the default AWS region.
     region = os.environ.get("AWS_REGION", "").strip() or ("auto" if endpoint else "us-east-1")
+    bucket, endpoint, region = _normalize_s3_binding(bucket, endpoint, region)
     return {
         "bucket": bucket,
         "endpoint": endpoint,
@@ -99,9 +143,20 @@ def _allow_local_fallback() -> bool:
 
 def config_problems() -> list[str]:
     """Return production configuration problems for object storage."""
-    conf = _s3_config()
+    raw_endpoint = os.environ.get("S3_ENDPOINT_URL", "").strip()
+    if raw_endpoint and _access_point_arn(raw_endpoint):
+        # Still report so operators clean up env vars even though we normalize at runtime.
+        problems_pre = [
+            "STORAGE: S3_ENDPOINT_URL looks like an Access Point ARN — move it to S3_BUCKET "
+            "and clear S3_ENDPOINT_URL (http(s) only for R2/MinIO)"]
+    else:
+        problems_pre = []
+    try:
+        conf = _s3_config()
+    except StorageError as exc:
+        return problems_pre + [f"STORAGE: {exc}"]
     if conf:
-        problems = []
+        problems = list(problems_pre)
         if conf["region"] == "auto" and not conf["endpoint"]:
             # boto3 would build <bucket>.s3.auto.amazonaws.com, which
             # does not exist: 'auto' is only valid with an R2 endpoint.
@@ -117,8 +172,8 @@ def config_problems() -> list[str]:
                 f"('appshowcase/...' becomes '{conf['prefix']}/appshowcase/...'); clear S3_PREFIX")
         return problems
     if _ncb_configured() and os.environ.get("STORAGE_BACKEND", "").strip().lower() == "ncb":
-        return []
-    return ["STORAGE: S3_BUCKET is not set; durable shared object storage is required in production"]
+        return problems_pre
+    return problems_pre + ["STORAGE: S3_BUCKET is not set; durable shared object storage is required in production"]
 
 
 def status() -> dict:
