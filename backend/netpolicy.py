@@ -131,6 +131,31 @@ async def validate_url(url: str) -> Destination:
     return Destination(text, parts.scheme, host, port, _check_ips(host, list(ips)))
 
 
+def validate_href_sync(url: str) -> Destination:
+    """Shape check for links the server never fetches (player CTAs, share buttons).
+
+    Blocks credentials, non-http(s), blocked host suffixes, and literal private IPs.
+    Does **not** resolve DNS — the viewer's browser opens the link, and drafts may
+    point at hosts the API cannot resolve (or incomplete placeholders).
+    """
+    text, parts, host, port = _parse(url)
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return Destination(text, parts.scheme, host, port, [])
+    _check_ips(host, [str(ip)])
+    return Destination(text, parts.scheme, host, port, [str(ip)])
+
+
+def incomplete_href(url: str | None) -> bool:
+    """True for blank or scheme-only drafts like ``https://``."""
+    text = (url or "").strip()
+    if not text:
+        return True
+    parts = urlsplit(text)
+    return parts.scheme in ("http", "https") and not (parts.hostname or "").strip()
+
+
 @dataclass
 class SafeResponse:
     status_code: int

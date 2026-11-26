@@ -32,7 +32,7 @@ const SCENE_DEFAULTS = {
   credits: { scene: { title: "Thanks for watching", subtitle: "Made with AppShowcase.", button_label: "Book a demo", cta_url: "" }, exit_trigger: "timer", duration_ms: 5000 },
   email: { scene: { title: "Get the full walkthrough", subtitle: "Drop your email and the demo continues right where it left off.", button_label: "Continue", placeholder: "you@company.com", success_title: "You're in", success_body: "Continuing the demo…" }, exit_trigger: "submit", duration_ms: 6000 },
   waitlist: { scene: { title: "Join the waitlist", subtitle: "Be first to know when this launches.", button_label: "Join the waitlist", placeholder: "you@company.com", collect_name: true, success_title: "You're on the list", success_body: "We'll be in touch. Continuing the demo…" }, exit_trigger: "submit", duration_ms: 6000 },
-  cta: { scene: { title: "See it on your own data", subtitle: "", button_label: "Start free", cta_url: "https://" }, exit_trigger: "continue", duration_ms: 6000 },
+  cta: { scene: { title: "See it on your own data", subtitle: "", button_label: "Start free", cta_url: "" }, exit_trigger: "continue", duration_ms: 6000 },
 };
 
 export const newScene = (type) => {

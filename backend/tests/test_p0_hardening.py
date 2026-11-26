@@ -157,6 +157,16 @@ def test_outbound_policy_blocks_protected_destinations(fake_dns, bad_url):
         netpolicy.validate_url_sync(bad_url)
 
 
+def test_href_policy_skips_dns_but_blocks_private_ips(fake_dns):
+    # Player CTAs are opened by the viewer — unresolved public hostnames are fine.
+    assert netpolicy.validate_href_sync("https://unresolved.example/cta").host == "unresolved.example"
+    assert netpolicy.incomplete_href("https://") is True
+    with pytest.raises(netpolicy.DestinationBlocked):
+        netpolicy.validate_href_sync("http://127.0.0.1/internal")
+    with pytest.raises(netpolicy.DestinationBlocked):
+        netpolicy.validate_href_sync("https://localhost/x")
+
+
 def test_outbound_policy_pins_ip_and_refuses_redirects(fake_dns):
     seen = {}
 

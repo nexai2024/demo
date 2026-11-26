@@ -915,6 +915,23 @@ def _validate_customer_url(url: str | None, label: str = "URL") -> str:
         raise HTTPException(400, f"Invalid {label}: {exc}")
 
 
+def _optional_public_href(url: str | None, label: str = "URL") -> str:
+    """Validate a link the server never fetches (scene / share CTAs).
+
+    Incomplete placeholders like ``https://`` clear to empty so drafts and
+    republish are not blocked. DNS is not required — only shape + SSRF guards.
+    """
+    text = (url or "").strip()
+    if not text or netpolicy.incomplete_href(text):
+        return ""
+    if "{{" in text:
+        return text
+    try:
+        return netpolicy.validate_href_sync(text).url
+    except netpolicy.DestinationBlocked as exc:
+        raise HTTPException(400, f"Invalid {label}: {exc}")
+
+
 @api.post("/projects")
 async def create_project(body: ProjectIn, user: dict = Depends(get_current_user)):
     target = _validate_customer_url(body.target_url, "target URL") if body.target_url.strip() else ""
@@ -956,7 +973,7 @@ async def update_project(pid: str, body: ProjectUpdate, user: dict = Depends(get
         if body.cta_label is not None:
             cta["label"] = body.cta_label
         if body.cta_url is not None:
-            cta["url"] = body.cta_url
+            cta["url"] = _optional_public_href(body.cta_url, "CTA URL")
         fields["cta"] = cta
     if body.clear_login or body.login_url is not None or body.login_username is not None or body.login_password:
         login = {} if body.clear_login else dict(raw.get("login") or {})
@@ -996,8 +1013,9 @@ async def update_project(pid: str, body: ProjectUpdate, user: dict = Depends(get
                 cfg = d.get("scene") or {}
                 if cfg.get("webhook_url") and str(cfg["webhook_url"]).strip():
                     cfg["webhook_url"] = _validate_customer_url(str(cfg["webhook_url"]), "scene webhook URL")
-                if cfg.get("cta_url") and str(cfg["cta_url"]).strip() and "{{" not in str(cfg["cta_url"]):
-                    cfg["cta_url"] = _validate_customer_url(str(cfg["cta_url"]), "scene link URL")
+                if "cta_url" in cfg:
+                    # Player opens this in the viewer's browser — no server fetch / no DNS.
+                    cfg["cta_url"] = _optional_public_href(cfg.get("cta_url"), "scene link URL")
                 d["scene"] = cfg
                 d["status"] = "done"  # scenes are rendered, never recorded
             fields["steps"].append(d)
