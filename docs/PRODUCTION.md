@@ -8,7 +8,7 @@
 ## 2. Managed signing keys & credential vault
 - Provision `JWT_SECRET` and `VAULT_MASTER_KEY` as distinct 32+ byte random secrets from your secret manager (AWS Secrets Manager, GCP Secret Manager, Vault).
 - **Zero-downtime rotation**: Set the new value in `JWT_SECRET` / `VAULT_MASTER_KEY` and place the retiring value in `JWT_SECRET_PREVIOUS` / `VAULT_MASTER_KEY_PREVIOUS` until existing tokens expire and records are re-sealed.
-- Target passwords expire after `CREDENTIAL_TTL_DAYS` (default 30d); captured browser `storage_state` expires after `STORAGE_STATE_TTL_HOURS` (default 12h).
+- Target passwords expire after `CREDENTIAL_TTL_DAYS` (default 30d); captured browser `storage_state` expires after `STORAGE_STATE_TTL_HOURS` (default 12h). Operator guide: `docs/AUTH_SESSIONS.md`.
 
 ## 3. Share access & CDN caching
 - Draft projects never appear on `/api/public/*`. Publishing creates an immutable snapshot (`published.release_id`) with all sensitive step text redacted.

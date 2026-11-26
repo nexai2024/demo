@@ -23,6 +23,77 @@ export const setAuthTokenGetter = (getter) => {
   authTokenGetter = getter;
 };
 
+export async function getAuthToken() {
+  if (!authTokenGetter) return null;
+  try {
+    return (await authTokenGetter()) || null;
+  } catch {
+    return null;
+  }
+}
+
+/** Fetch that always attaches the Clerk Bearer when one is available. */
+export async function authFetch(url, init = {}) {
+  const headers = new Headers(init.headers || {});
+  if (!headers.has("Authorization")) {
+    const token = await getAuthToken();
+    if (token) headers.set("Authorization", `Bearer ${token}`);
+  }
+  return fetch(url, { ...init, headers, credentials: init.credentials ?? "include" });
+}
+
+// Protected media (screenshots, thumbs, audio, video) cannot put an
+// Authorization header on <img>/<audio>/<video>. Resolve once through
+// axios (which does) and cache a blob: URL for the element to use.
+const blobCache = new Map();
+
+const isPublicMedia = (url) =>
+  /\/(public|review)\//.test(url) || url.startsWith("blob:") || url.startsWith("data:");
+
+/** Turn an absolute media URL (/api/projects/...) into an axios path (/projects/...). */
+const toApiPath = (url) => {
+  if (!url) return url;
+  if (/^https?:\/\//i.test(url)) {
+    try {
+      const parsed = new URL(url);
+      const path = `${parsed.pathname}${parsed.search}`;
+      if (path === API || path.startsWith(`${API}/`)) return path.slice(API.length) || "/";
+      return path;
+    } catch {
+      return url;
+    }
+  }
+  if (url === API || url.startsWith(`${API}/`)) return url.slice(API.length) || "/";
+  return url;
+};
+
+export async function resolveAuthUrl(url) {
+  if (!url || isPublicMedia(url)) return url;
+  const hit = blobCache.get(url);
+  if (hit?.blobUrl) return hit.blobUrl;
+  if (hit?.promise) return hit.promise;
+  // stepAsset() returns `${API}/projects/...`. axios already has baseURL=API,
+  // so we must strip the prefix or requests become /api/api/projects/... (404).
+  const path = toApiPath(url);
+  const promise = api
+    .get(path, { responseType: "blob" })
+    .then(({ data }) => {
+      // Axios may treat error JSON as a blob when responseType is blob.
+      if (data?.type && data.type.includes("application/json")) {
+        throw new Error("Media request failed");
+      }
+      const blobUrl = URL.createObjectURL(data);
+      blobCache.set(url, { blobUrl });
+      return blobUrl;
+    })
+    .catch((err) => {
+      blobCache.delete(url);
+      throw err;
+    });
+  blobCache.set(url, { promise });
+  return promise;
+}
+
 api.interceptors.request.use(async (config) => {
   if (authTokenGetter && !config.headers?.Authorization && !config.headers?.authorization) {
     try {
@@ -58,7 +129,7 @@ api.interceptors.response.use(
       }
     }
     const url = String(cfg.url || "");
-    if (!url.includes("/live/frame") && err.response?.status !== 401) {
+    if (!url.includes("/live/frame") && !url.includes("/preview") && err.response?.status !== 401) {
       recordActivity({ level: "error", source: `${(cfg.method || "get").toUpperCase()} ${url}`, message: errMsg(err) });
     }
     throw err;
@@ -67,7 +138,13 @@ api.interceptors.response.use(
 
 export function errMsg(e) {
   const detail = e?.response?.data?.detail;
-  if (detail == null) return e?.message || "Something went wrong. Please try again.";
+  if (detail == null) {
+    // Blob responses (authenticated media) don't expose JSON detail.
+    if (typeof Blob !== "undefined" && e?.response?.data instanceof Blob) {
+      return e?.response?.status === 401 ? "Not authenticated" : "Request failed";
+    }
+    return e?.message || "Something went wrong. Please try again.";
+  }
   if (typeof detail === "string") return detail;
   if (Array.isArray(detail)) return detail.map((d) => d?.msg || JSON.stringify(d)).join(" ");
   return detail.msg || String(detail);

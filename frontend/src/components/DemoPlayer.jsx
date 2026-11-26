@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { motion } from "framer-motion";
+import { resolveAuthUrl } from "@/lib/api";
 import { ChevronLeft, ChevronRight, Link2, Maximize, MousePointerClick, Pause, Play, Volume2, VolumeX } from "lucide-react";
 
 const ACTION_LABEL = { goto: "Navigate", click: "Click", type: "Type", hover: "Hover", scroll: "Scroll", press: "Key press", wait: "Wait", assert: "Check" };
@@ -112,18 +113,26 @@ function Hotspot({ box, onClick, accent }) {
   );
 }
 
-function SceneFrame({ step, src, shot, playing }) {
+function SceneFrame({ step, src, shot, playing, onMediaError }) {
   const count = step.action === "scroll" ? motionCount(step) : 0;
   const [frame, setFrame] = useState(count);
-  const [shown, setShown] = useState(shot);
+  const [shown, setShown] = useState("");
   const [under, setUnder] = useState("");
-  const shownRef = useRef(shot);
+  const shownRef = useRef("");
   useEffect(() => {
     if (count < 1) return;
-    for (let i = 0; i < count; i += 1) {
-      const pic = new Image();
-      pic.src = src(step, "motion", i);
-    }
+    let cancel = false;
+    (async () => {
+      for (let i = 0; i < count; i += 1) {
+        try {
+          const url = await resolveAuthUrl(src(step, "motion", i));
+          if (cancel || !url) return;
+          const pic = new Image();
+          pic.src = url;
+        } catch { /* prefetch best-effort */ }
+      }
+    })();
+    return () => { cancel = true; };
   }, [step, count, src]);
   useEffect(() => {
     if (!playing || count < 1) { setFrame(count); return; }
@@ -142,18 +151,28 @@ function SceneFrame({ step, src, shot, playing }) {
   useEffect(() => {
     if (!image || image === shownRef.current) return;
     let cancel = false;
-    const reveal = () => {
-      if (cancel || image === shownRef.current) return;
+    const reveal = (url) => {
+      if (cancel || url === shownRef.current) return;
       setUnder(shownRef.current);
-      shownRef.current = image;
-      setShown(image);
+      shownRef.current = url;
+      setShown(url);
     };
-    const pic = new Image();
-    pic.onload = reveal;
-    pic.src = image;
-    if (pic.complete) reveal();
+    (async () => {
+      try {
+        const url = await resolveAuthUrl(image);
+        if (cancel) return;
+        if (!url) { onMediaError?.(); return; }
+        const pic = new Image();
+        pic.onload = () => reveal(url);
+        pic.onerror = () => { if (!cancel) onMediaError?.(); };
+        pic.src = url;
+        if (pic.complete) reveal(url);
+      } catch {
+        if (!cancel) onMediaError?.();
+      }
+    })();
     return () => { cancel = true; };
-  }, [image]);
+  }, [image, onMediaError]);
   useEffect(() => {
     if (!under) return undefined;
     const timer = setTimeout(() => setUnder(""), 260);
@@ -162,13 +181,17 @@ function SceneFrame({ step, src, shot, playing }) {
   return (
     <>
       {under && <img src={under} alt="" className="absolute inset-0 h-full w-full object-cover object-top" />}
-      <img src={shown} alt={step.caption || "Demo step"} data-testid="player-frame"
-        className={`absolute inset-0 h-full w-full object-cover object-top ${under ? "player-dissolve" : ""}`} />
+      {shown ? (
+        <img src={shown} alt={step.caption || "Demo step"} data-testid="player-frame"
+          className={`absolute inset-0 h-full w-full object-cover object-top ${under ? "player-dissolve" : ""}`} />
+      ) : (
+        <div className="absolute inset-0 bg-slate-950" data-testid="player-frame-loading" />
+      )}
     </>
   );
 }
 
-function Stage({ step, mobile, fade, playing, src }) {
+function Stage({ step, mobile, fade, playing, src, onMediaError }) {
   const [layers, setLayers] = useState([step]);
   useEffect(() => {
     setLayers((list) => {
@@ -190,7 +213,7 @@ function Stage({ step, mobile, fade, playing, src }) {
         initial={{ opacity: dissolve ? 0 : 1 }} animate={{ opacity: 1 }}
         transition={{ duration: dissolve ? Math.min(fade, 0.45) : 0, ease: "easeInOut" }}>
         {hasShot(item) ? (
-          <SceneFrame step={item} src={src} playing={playing && onTop} shot={shotFor(item)} />
+          <SceneFrame step={item} src={src} playing={playing && onTop} shot={shotFor(item)} onMediaError={onTop ? onMediaError : undefined} />
         ) : (
           <div className="absolute inset-0 grid place-items-center grid-bg">
             <div className="text-center px-6 mt-32">
@@ -224,8 +247,10 @@ function Caption({ text, accent, top, words, audioT }) {
   );
 }
 
-function VideoStage({ step, src, playing, rate, poster, holdMs }) {
+function VideoStage({ step, src, playing, rate, poster, holdMs, onMediaError }) {
   const ref = useRef(null);
+  const [media, setMedia] = useState({ src: "", poster: "" });
+  const [failed, setFailed] = useState(false);
   const v = step.video || {};
   const start = (v.start_ms || 0) / 1000;
   const end = Math.max(start + 0.1, (v.end_ms || 0) / 1000);
@@ -234,6 +259,33 @@ function VideoStage({ step, src, playing, rate, poster, holdMs }) {
   const windowS = end - start;
   const fit = holdMs ? Math.min(Math.max((windowS * rate * 1000) / holdMs, rate), 4) : rate;
   useEffect(() => {
+    let cancel = false;
+    setFailed(false);
+    (async () => {
+      try {
+        const [videoUrl, posterUrl] = await Promise.all([
+          resolveAuthUrl(src(step, "video")),
+          poster ? resolveAuthUrl(poster) : Promise.resolve(""),
+        ]);
+        if (cancel) return;
+        if (!videoUrl) {
+          setFailed(true);
+          onMediaError?.();
+          setMedia({ src: "", poster: "" });
+          return;
+        }
+        setMedia({ src: videoUrl, poster: posterUrl || "" });
+      } catch {
+        if (!cancel) {
+          setFailed(true);
+          onMediaError?.();
+          setMedia({ src: "", poster: "" });
+        }
+      }
+    })();
+    return () => { cancel = true; };
+  }, [step, src, poster, onMediaError]);
+  useEffect(() => {
     const el = ref.current;
     if (!el) return;
     const seek = () => { if (el.currentTime < start || el.currentTime >= end) { try { el.currentTime = start; } catch { /* not ready */ } } };
@@ -241,10 +293,10 @@ function VideoStage({ step, src, playing, rate, poster, holdMs }) {
     el.addEventListener("loadedmetadata", seek);
     return () => el.removeEventListener("loadedmetadata", seek);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [step.id]);
+  }, [step.id, media.src]);
   useEffect(() => {
     const el = ref.current;
-    if (!el) return;
+    if (!el || !media.src) return;
     el.playbackRate = fit || 1;
     if (playing) {
       if (el.currentTime >= end - 0.03 || el.currentTime < start) { try { el.currentTime = start; } catch { /* noop */ } }
@@ -253,7 +305,7 @@ function VideoStage({ step, src, playing, rate, poster, holdMs }) {
       el.pause();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [playing, fit, step.id]);
+  }, [playing, fit, step.id, media.src]);
   useEffect(() => {
     const el = ref.current;
     if (!el) return undefined;
@@ -264,8 +316,14 @@ function VideoStage({ step, src, playing, rate, poster, holdMs }) {
     return () => clearInterval(iv);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [step.id]);
+  if (failed) {
+    return <div className="absolute inset-0 bg-slate-950" data-testid="player-video-failed" />;
+  }
+  if (!media.src) {
+    return <div className="absolute inset-0 grid place-items-center bg-slate-950" data-testid="player-video-loading" />;
+  }
   return (
-    <video ref={ref} src={src(step, "video")} poster={poster} muted playsInline preload="auto"
+    <video ref={ref} src={media.src} poster={media.poster || undefined} muted playsInline preload="auto"
       className="absolute inset-0 h-full w-full object-cover object-top" data-testid="player-video" />
   );
 }
@@ -294,7 +352,9 @@ export const DemoPlayer = ({ steps, src, narrationMode = "both", brand = {}, ini
     : (guided && step?.hotspot && ["click", "hover", "type"].includes(step?.action)) || choices.length > 0;
   const [mobile, setMobile] = useState(false);
   const [audioT, setAudioT] = useState(0);
+  const [mediaError, setMediaError] = useState(false);
   const entered = useRef(Date.now());
+  const reportMediaError = useCallback(() => setMediaError(true), []);
 
   useEffect(() => {
     const a = audioRef.current;
@@ -315,6 +375,7 @@ export const DemoPlayer = ({ steps, src, narrationMode = "both", brand = {}, ini
   useEffect(() => { if (autoplay) setPlaying(true); }, [autoplay]);
   useEffect(() => { try { sessionStorage.setItem("fc_muted", muted ? "1" : "0"); } catch { /* private mode */ } }, [muted]);
   useEffect(() => { try { sessionStorage.setItem("fc_cc", captionsOn ? "1" : "0"); } catch { /* private mode */ } }, [captionsOn]);
+  useEffect(() => { setMediaError(false); }, [step?.id]);
 
   useEffect(() => {
     entered.current = Date.now();
@@ -324,24 +385,32 @@ export const DemoPlayer = ({ steps, src, narrationMode = "both", brand = {}, ini
   useEffect(() => {
     if (!playing || !step) return;
     const audio = audioRef.current;
-    if (withAudio && hasAudio(step) && audio && !muted) {
-      audio.src = src(step, "audio");
-      audio.playbackRate = rate;
-      audio.play().catch(() => {});
-    }
-    if (hold) return () => { audio?.pause(); };
+    let cancel = false;
+    (async () => {
+      if (!(withAudio && hasAudio(step) && audio && !muted)) return;
+      try {
+        const url = await resolveAuthUrl(src(step, "audio"));
+        if (cancel || !url) return;
+        audio.src = url;
+        audio.playbackRate = rate;
+        await audio.play().catch(() => {});
+      } catch {
+        if (!cancel) setMediaError(true);
+      }
+    })();
+    if (hold) return () => { cancel = true; audio?.pause(); };
     const t = setTimeout(() => {
       if (idx < visible.length - 1) go(idx + 1);
       else { setPlaying(false); onEvent?.("complete", idx); }
     }, sceneMs(step, withAudio && hasAudio(step)) / rate);
-    return () => { clearTimeout(t); audio?.pause(); };
+    return () => { cancel = true; clearTimeout(t); audio?.pause(); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [playing, idx, muted, rate, hold, visible.length]);
 
   useEffect(() => {
     const next = visible[idx + 1];
-    if (next && hasShot(next)) new Image().src = src(next, "screenshot");
-    if (next && withAudio && hasAudio(next)) { const a = new Audio(); a.preload = "auto"; a.src = src(next, "audio"); }
+    if (next && hasShot(next)) resolveAuthUrl(src(next, "screenshot")).then((url) => { if (url) { const pic = new Image(); pic.src = url; } }).catch(() => {});
+    if (next && withAudio && hasAudio(next)) resolveAuthUrl(src(next, "audio")).then((url) => { if (url) { const a = new Audio(); a.preload = "auto"; a.src = url; } }).catch(() => {});
     if (step) onEvent?.("step", idx);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [idx, visible]);
@@ -392,9 +461,10 @@ export const DemoPlayer = ({ steps, src, narrationMode = "both", brand = {}, ini
         ) : step.video?.end_ms ? (
           <VideoStage key={step.id} step={step} src={src} playing={playing} rate={rate}
             holdMs={hold ? 0 : sceneMs(step, withAudio && hasAudio(step))}
-            poster={hasShot(step) ? src(step, "screenshot") : undefined} />
+            poster={hasShot(step) ? src(step, "screenshot") : undefined}
+            onMediaError={reportMediaError} />
         ) : (
-          <Stage step={step} mobile={mobile} fade={fadeSec(step)} playing={playing} src={src} />
+          <Stage step={step} mobile={mobile} fade={fadeSec(step)} playing={playing} src={src} onMediaError={reportMediaError} />
         )}
         {!isScene && hasShot(step) && ["click", "hover", "type"].includes(step.action) && <Hotspot box={step.hotspot} accent={accent} onClick={() => go(idx + 1)} />}
         {choices.length > 0 && (
@@ -412,6 +482,15 @@ export const DemoPlayer = ({ steps, src, narrationMode = "both", brand = {}, ini
         {!isScene && showCaption && <Caption text={step.caption} accent={accent} top={brand.caption_position === "top"} words={step.words} audioT={audioT} />}
         {cta?.url && idx === visible.length - 1 && choices.length === 0 && (
           <a href={cta.url} onClick={() => onCta?.(idx)} className="absolute bottom-16 left-1/2 -translate-x-1/2 rounded-lg px-4 py-2 text-sm font-semibold text-white" style={{ background: accent }} data-testid="player-cta">{cta.label || "Continue"}</a>
+        )}
+        {mediaError && (
+          <div
+            role="alert"
+            data-testid="player-media-error"
+            className="absolute inset-x-3 top-3 z-20 rounded-lg border border-amber-400/40 bg-slate-950/90 px-3 py-2 text-center text-sm text-amber-100 shadow-lg backdrop-blur"
+          >
+            Couldn’t load step media
+          </div>
         )}
         {brand.watermark !== false && (
           <span className="absolute top-3 right-3 rounded-md bg-slate-950/70 backdrop-blur px-2 py-1 text-[10px] font-mono text-slate-300" data-testid="player-watermark">Made with AppShowcase</span>

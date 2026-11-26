@@ -120,6 +120,7 @@ class _Session:
     def __init__(self):
         self.playwright = None
         self.browser = None
+        self.context = None
         self.page = None
         self.frame = b""
         self.url = ""
@@ -131,6 +132,7 @@ class _Session:
         self.opened = 0.0
         self.start_url = ""
         self.login = None
+        self.storage_state = None
         self.steps: list = []
         self.renewing = False
         self.failures = 0
@@ -218,6 +220,7 @@ async def _drop_browser(session: _Session) -> None:
         except Exception:
             pass
     session.browser = None
+    session.context = None
     session.playwright = None
     session.page = None
 
@@ -236,15 +239,21 @@ async def _connect(session: _Session) -> None:
             if cap.tail():
                 raise _with_driver_stderr(exc, cap) from exc
             raise
-    context = await session.browser.new_context(viewport=VIEWPORT, device_scale_factor=1)
+    kwargs = {"viewport": VIEWPORT, "device_scale_factor": 1}
+    if session.storage_state:
+        kwargs["storage_state"] = session.storage_state
+    context = await session.browser.new_context(**kwargs)
     await netpolicy.install_browser_guard(context)
+    session.context = context
     session.page = await context.new_page()
     session.opened = time.monotonic()
 
 
 async def _replay(session: _Session) -> str:
     page = session.page
-    await _sign_in(page, session.login)
+    # Cookies/localStorage from a saved auth profile skip the login recipe.
+    if not session.storage_state:
+        await _sign_in(page, session.login)
     await page.goto(session.start_url, wait_until="domcontentloaded", timeout=30000)
     for i, step in enumerate(session.steps):
         try:
@@ -261,12 +270,40 @@ async def _replay(session: _Session) -> str:
 
 
 async def _renew(session: _Session) -> None:
+    """Reconnect the Browserless session without dumping the user back to the landing page.
+
+    Prefer: snapshot cookies + current URL, open a fresh CDP context with that
+    storage_state, then goto the same URL. Full login+step replay is only the
+    fallback when we have no usable mid-session position.
+    """
     session.renewing = True
     try:
+        current_url = ""
+        try:
+            if session.page is not None:
+                current_url = session.page.url or session.url or ""
+            elif session.url:
+                current_url = session.url
+        except Exception:
+            current_url = session.url or ""
+        try:
+            if session.context is not None:
+                session.storage_state = await session.context.storage_state()
+        except Exception:
+            pass
         await _drop_browser(session)
         await _connect(session)
         session.error = ""
-        session.warning = await _replay(session)
+        if current_url and current_url.startswith(("http://", "https://")):
+            import netpolicy
+            try:
+                await netpolicy.validate_url(current_url)
+                await session.page.goto(current_url, wait_until="domcontentloaded", timeout=30000)
+                session.warning = ""
+            except Exception:
+                session.warning = await _replay(session)
+        else:
+            session.warning = await _replay(session)
         await _shot(session)
         session.failures = 0
     except Exception as exc:
@@ -322,12 +359,14 @@ async def _pump(session: _Session) -> None:
         await asyncio.sleep(0.22)
 
 
-async def open_session(pid: str, start_url: str, steps: list, login: dict | None, user_id: str) -> dict:
+async def open_session(pid: str, start_url: str, steps: list, login: dict | None, user_id: str,
+                      storage_state: dict | None = None) -> dict:
     await close_session(pid)
     session = _Session()
     session.user_id = user_id
     session.start_url = start_url
     session.login = login
+    session.storage_state = storage_state
     session.steps = [dict(step) for step in steps]
     _SESSIONS[pid] = session
     try:
@@ -431,6 +470,30 @@ async def scroll(pid: str, amount: int) -> dict:
         }
 
     return await _run(session, work)
+
+
+async def export_storage(pid: str) -> dict:
+    """Snapshot cookies/localStorage from the open live browser for reuse on later runs."""
+    session = _require(pid)
+
+    async def work():
+        if session.context is None:
+            raise RuntimeError("Live browser has no context")
+        state = await session.context.storage_state()
+        session.storage_state = state
+        return state
+
+    return await _run(session, work)
+
+
+def snapshot(pid: str) -> dict:
+    session = _SESSIONS.get(pid)
+    if not session or session.closed:
+        raise RuntimeError("Live browser is not open")
+    return {
+        "url": session.url or (session.page.url if session.page else ""),
+        "has_storage": bool(session.storage_state),
+    }
 
 
 def _require(pid: str) -> _Session:

@@ -58,6 +58,17 @@ def make_thumb(shot: bytes) -> bytes:
     return buf.getvalue()
 
 
+def make_preview(shot: bytes, max_width: int = 640) -> bytes:
+    """Low-res JPEG for live studio preview during an active record run."""
+    img = Image.open(io.BytesIO(shot)).convert("RGB")
+    if img.width > max_width:
+        ratio = max_width / float(img.width)
+        img = img.resize((max_width, max(1, int(img.height * ratio))))
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=42, optimize=True)
+    return buf.getvalue()
+
+
 def frame_delta(before: bytes, after: bytes) -> float:
     """Share of pixels that moved, from 0 (same picture) to 1 (different picture)."""
     size = (64, 40)

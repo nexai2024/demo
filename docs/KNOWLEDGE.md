@@ -162,28 +162,33 @@ A file with none of those calls returns 400: `No page.goto, click, or fill calls
 
 Open **Login, environments, and variables** on Draft.
 
-- **Login page URL**, **Username**, and **Password** run before the first step during Record. The password is not returned to the browser after it is saved. The field then says “Password saved — type to replace”. The share page never receives it.
+Prefer **Live browser → Save signed-in session** (or **Start demo from here**) so Record reuses cookies. The password field is the fallback when you do not have a saved browser session.
+
+- **Login page URL**, **Username**, and **Password** run before the first step during Record when no signed-in session is stored. After autosave, the password field clears and says “Password saved — type to replace”, and a **Password vaulted** chip appears. The share page never receives it.
+- If the chip says **Password expired**, type the password again (default retention is 30 days).
+- **Signed-in browser saved** means cookies from Live are vaulted (default 12 hours). When that expires, re-save from Live.
 - **Production host** uses Target app URL. **Staging host** and **Local host** replace that host on `goto` steps when you select them. Other sites in the script stay unchanged.
 - **Desktop and phone** records a second pass at 390×844 and stores `screenshot_mobile_path`. The player then shows a Desktop / Phone toggle.
 
-The password is stored in the project JSON. Treat project exports and database dumps as secret.
+Passwords and browser state are encrypted in the project document (`VAULT_MASTER_KEY`). Treat database dumps as secret. Full architecture: `docs/AUTH_SESSIONS.md`.
 
 ### Developer notes {#login-and-environments-dev}
 
-`PUT /api/projects/{id}` accepts `login_url`, `login_username`, `login_password`, `clear_login`, `environments`, `active_environment`, and `viewport`. Recording reloads the stored login inside `job_record`, because the GET used by the studio strips `login.password`. `prepare_step` applies `{{variables}}` and the host swap before Browserless runs.
+`PUT /api/projects/{id}` accepts `login_url`, `login_username`, `login_password`, `clear_login`, `environments`, `active_environment`, and `viewport`. Saving a password sets `credentials_saved_at`. Recording reloads the stored login inside `job_record` via `vault.open_login`, because the GET used by the studio strips `login.password` and `login.storage_state`. Flags on GET: `has_login`, `has_storage`, `credential_expired`, `storage_expired`. `prepare_step` applies `{{variables}}` and the host swap before Browserless runs.
 
-Sign-in uses `input[type=email], input[name=email], input[type=text]`, then `input[type=password]`, then `button[type=submit]` or a button whose text is “Sign in”. A custom widget needs those selectors changed in `engine._sign_in`.
+Sign-in uses `input[type=email], input[name=email], input[type=text]`, then `input[type=password]`, then `button[type=submit]` or a button whose text is “Sign in”. A custom widget needs a login recipe or those selectors changed in `engine._sign_in`. When a fresh `storage_state` exists, `_sign_in` is skipped.
 
 ## Live browser {#live-browser}
 
 **Live browser** opens the target page in a pane on the right side of the studio. Clicks and typing in that pane are performed in Browserless and appended to the timeline.
 
 - A click on a link or button adds a Click step, using the element’s test id, id, name, label, or visible text. A mark appears at the press immediately. The remote page follows about half a second later.
-- Click a field, then type. The keystrokes stay in one Type step. Backspace updates that step. A password field is marked sensitive.
+- Click a field, then type. Keystrokes are batched (~100ms) into one Type step. Backspace updates that step. A password field is marked sensitive.
 - Enter, Tab, Escape, and the arrow keys add a Press step.
 - Scroll inside the pane. The page follows the wheel right away, and the movement becomes one Scroll step. Another scroll on that step adds to the same distance. The slow glide, and the pause to read, happen when you play or export the demo.
+- **Save signed-in session** stores cookies so later Record stays signed in. **Start demo from here** does the same and sets this page as the opening step.
 - The pane replays the steps already on the timeline, then waits. Close it when you are done. Leaving the project closes it too.
-- Browserless closes a connection after about two minutes. Shortly before that, the pane opens a fresh connection and replays the steps captured in the session, so the walkthrough continues on the same page. The picture stays on the last frame while that happens, and the address line says “Continuing this session…”.
+- Browserless closes a connection after about two minutes. Shortly before that, the pane opens a fresh connection, restores cookies, and returns to the **same URL** (not a full replay from the landing page). The picture stays on the last frame while that happens, and the address line says “Continuing this session…”.
 - A Google, Cloudflare, or CAPTCHA page stops the pane. It does not try to get past that page.
 
 The session is separate from the monthly recording count. **Record demo** is still what saves the screenshots. A scroll step recorded after this glide stores the in-between frames, and the player moves through them before it holds the scene.
@@ -193,17 +198,18 @@ The session is separate from the monthly recording count. **Record demo** is sti
 | Piece | Where |
 | --- | --- |
 | Button | `data-testid="live-start-button"`, `data-help="live-browser"` |
-| Pane | `frontend/src/components/LivePane.jsx`. A click paints `data-testid="live-click-mark"` before the request returns |
+| Pane | `frontend/src/components/LivePane.jsx`. A click paints `data-testid="live-click-mark"` before the request returns. Type coalesces ~100ms of keys |
 | Session | `backend/live.py`. One session per project, in memory, closed on stop |
-| Start | `POST /api/projects/{id}/live/start` with `{ "after": n }` replays n steps, then returns the page URL |
+| Start | `POST /api/projects/{id}/live/start` with `{ "after": n }` replays n steps, then returns the page URL. Reuses vaulted `storage_state` when present |
+| Save session | `POST /live/save-session` and `POST /live/start-from-here` |
 | Picture | `GET /api/projects/{id}/live/frame` is a JPEG. The pane requests a new one several times a second |
 | Click | `POST /live/click` with viewport coordinates. 1280×800 maps onto the pane |
 | Type and keys | `POST /live/type` and `POST /live/key` |
 | Scroll | `POST /live/scroll` moves the page immediately. The step coalesces with the previous scroll. The slow glide is in the recording, not in this pane |
-| Continue | About 95 seconds in, `live.py` reconnects and replays `session.steps`. `LIVE_RENEW_SECONDS` can lower that for a test, between 20 and 110 |
+| Continue | About 95 seconds in, `live.py` reconnects with cookies and the current URL. Full step replay is fallback only. `LIVE_RENEW_SECONDS` can lower that for a test, between 20 and 110 |
 | Stop | `POST /live/stop` |
 
-The step is added in the browser’s timeline state and saved with the normal autosave. The live routes do not write the step list themselves.
+The step is added in the browser’s timeline state and saved with the normal autosave. The live routes do not write the step list themselves. See `docs/AUTH_SESSIONS.md`.
 
 ## Record {#record-demo}
 

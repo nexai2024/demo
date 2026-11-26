@@ -15,6 +15,8 @@ import { SceneCard } from "@/components/SceneCard";
 import { StudioExtras } from "@/components/StudioExtras";
 import { HelpLink } from "@/components/HelpLink";
 import { LivePane } from "@/components/LivePane";
+import { RunPreview } from "@/components/RunPreview";
+import { AuthedImg } from "@/components/AuthedImg";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { api, API, errMsg, stepAsset } from "@/lib/api";
 import { useOnline, useRun, useUndoable } from "@/hooks/useStudio";
@@ -27,6 +29,7 @@ const pickMeta = (p) => ({
   viewport: p.viewport || "desktop", webhook_url: p.webhook_url || "", product_slug: p.product_slug || "",
   review_status: p.review_status || "draft", cta_label: p.cta?.label || "", cta_url: p.cta?.url || "",
   login_url: p.login?.url || "", login_username: p.login?.username || "", has_login: p.has_login,
+  has_storage: !!p.has_storage, credential_expired: !!p.credential_expired, storage_expired: !!p.storage_expired,
   variable_email: (p.variables || {}).email || "",
   glossary: p.glossary || [], login_recipe: p.login?.recipe || [], guided: !!p.guided,
   notify_url: p.notify_url || "", active_track: p.active_track || "primary", tour_order: p.tour_order || 0,
@@ -100,15 +103,25 @@ export default function Studio() {
 
   const save = useCallback(async () => {
     if (!meta || snapshot === savedRef.current) return;
-    const sent = snapshot;
     setSaveState("saving");
-    const { playwright_source, variable_email, has_login, login_password, ...rest } = meta;
+    const {
+      playwright_source, variable_email, has_login, has_storage, credential_expired, storage_expired,
+      login_password, ...rest
+    } = meta;
     const body = { ...rest, steps: steps.value };
     if (login_password) body.login_password = login_password;
     try {
       const { data } = await api.put(`/projects/${pid}`, body);
+      // Sync flags from the server and clear the typed password so the field
+      // shows “Password saved — type to replace” instead of looking unsaved.
+      const nextMeta = {
+        ...pickMeta(data),
+        login_password: "",
+        playwright_source: playwright_source || "",
+      };
       setProject(data);
-      savedRef.current = sent;
+      setMetaState(nextMeta);
+      savedRef.current = JSON.stringify({ meta: nextMeta, steps: steps.value });
       setSaveState("saved");
     } catch (e) {
       setSaveState("error");
@@ -174,6 +187,7 @@ export default function Studio() {
     const { data } = await api.post(`/projects/${pid}/live/start`, { after: steps.value.length });
     setLive(true);
     setTab("timeline");
+    if (data.has_storage) toast.message("Reusing the saved signed-in session");
     if (data.warning) toast.message(data.warning);
   });
   const stopLive = () => {
@@ -381,7 +395,25 @@ export default function Studio() {
               <HelpLink topic="live-browser" label="Live browser" />
             </div>
           )}
-          {live ? <LivePane pid={pid} onEvent={applyLive} onClose={stopLive} /> : (
+          {running && run?.id && ["record", "rerecord", "autopilot", "health"].includes(run.kind) ? (
+            <RunPreview rid={run.id} message={run.message} pageUrl={run.preview_url || ""} />
+          ) : live ? (
+            <LivePane
+              pid={pid}
+              onEvent={applyLive}
+              onClose={stopLive}
+              hasStorage={!!project?.has_storage}
+              onProject={(data) => {
+                if (data) {
+                  applyServer(data, "set");
+                  toast.success("Signed-in session saved. This page is now the demo start — click Record demo when ready.");
+                } else {
+                  refetch("replace");
+                  toast.success("Signed-in session saved for later recordings");
+                }
+              }}
+            />
+          ) : (
             <DemoPlayer steps={playerSteps} src={(s, k, i) => stepAsset(pid, s, k, i)} narrationMode={meta.narration_mode} brand={meta.brand} cta={{ label: meta.cta_label, url: meta.cta_url }}
               guided={!!meta.guided} initialStep={selected} onStepChange={setSelected} />
           )}
@@ -424,7 +456,7 @@ export default function Studio() {
               {list.map((s, i) => s.screenshot_path && (
                 <motion.button key={s.id + s.screenshot_path} layout initial={{ opacity: 0, scale: 0.8 }} animate={{ opacity: 1, scale: 1 }} onClick={() => setSelected(i)}
                   className={`shrink-0 h-14 w-24 rounded-md overflow-hidden border ${i === selected ? "border-indigo-500" : "border-slate-800"}`} aria-label={`Show step ${i + 1}`} data-testid={`filmstrip-${i}`}>
-                  <img src={stepAsset(pid, { ...s, screenshot_path: s.thumb_path || s.screenshot_path }, s.thumb_path ? "thumb" : "screenshot")} alt="" loading="lazy" className="h-full w-full object-cover object-top" />
+                  <AuthedImg src={stepAsset(pid, { ...s, screenshot_path: s.thumb_path || s.screenshot_path }, s.thumb_path ? "thumb" : "screenshot")} alt="" loading="lazy" className="h-full w-full object-cover object-top" />
                 </motion.button>
               ))}
             </div>

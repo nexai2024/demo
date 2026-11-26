@@ -518,16 +518,18 @@ async def _connect_page(playwright, viewport: dict | None, storage_state: dict |
 
 
 ProgressFn = Callable[[int, dict, str, dict], Awaitable[None]]
+PreviewFn = Callable[[bytes, str], Awaitable[None]]
 
 
 async def run_steps(steps: list, on_progress: ProgressFn, capture_only: set | None = None, retries: int = 1,
                     viewport: dict | None = None, login: dict | None = None, storage_state: dict | None = None,
-                    on_storage=None, record_video: bool = True, on_phase=None):
+                    on_storage=None, record_video: bool = True, on_phase=None, on_preview: PreviewFn | None = None):
     """Record steps. A Browserless session ends at 120s, so a long script reconnects and replays."""
     budget = 90
     recorder = _VideoRecorder(enabled=record_video)
     async with _driver() as (p, cap):
         browser = None
+        preview_task = None
         try:
             browser, context, page = await _connect_page(p, viewport, storage_state)
             cap.stop()
@@ -559,6 +561,24 @@ async def run_steps(steps: list, on_progress: ProgressFn, capture_only: set | No
                     except Exception:
                         break
 
+            async def preview_loop() -> None:
+                # Cheap JPEG stream for the studio player while the worker drives the page.
+                while True:
+                    await asyncio.sleep(0.4)
+                    current = page
+                    if on_preview is None or current is None:
+                        continue
+                    try:
+                        shot = await current.screenshot(type="jpeg", quality=28)
+                        await on_preview(shot, current.url or "")
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        pass
+
+            if on_preview is not None:
+                preview_task = asyncio.create_task(preview_loop())
+
             for i, step in enumerate(steps):
                 if i and time.monotonic() - started > budget:
                     await renew(i)
@@ -584,6 +604,11 @@ async def run_steps(steps: list, on_progress: ProgressFn, capture_only: set | No
                         shot = await page.screenshot(type="jpeg", quality=85)
                     except Exception:
                         shot = None
+                if on_preview is not None and shot:
+                    try:
+                        await on_preview(shot, page.url or "")
+                    except Exception:
+                        pass
                 await on_progress(i, step, "failed" if err else "done", {
                     "screenshot": shot if capture else None, "hotspot": box, "error": err,
                     "attempts": attempts, "url": page.url, "captured": capture,
@@ -604,6 +629,10 @@ async def run_steps(steps: list, on_progress: ProgressFn, capture_only: set | No
                     clips = []
             return {"video_clips": clips}
         finally:
+            if preview_task is not None:
+                preview_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await preview_task
             recorder.cleanup()
             if browser is not None:
                 await browser.close()

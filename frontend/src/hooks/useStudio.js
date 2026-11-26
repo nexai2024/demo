@@ -1,7 +1,35 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api, API } from "@/lib/api";
+import { api, API, authFetch } from "@/lib/api";
 
 const ACTIVE_RUN = ["queued", "running"];
+
+async function readRunStream(rid, onData, signal) {
+  // EventSource cannot set Authorization; fetch + SSE parse works with Clerk.
+  const response = await authFetch(`${API}/runs/${rid}/stream`, {
+    headers: { Accept: "text/event-stream" },
+    signal,
+  });
+  if (!response.ok || !response.body) throw new Error(`stream ${response.status}`);
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const chunks = buffer.split("\n\n");
+    buffer = chunks.pop() || "";
+    for (const chunk of chunks) {
+      const line = chunk.split("\n").find((l) => l.startsWith("data:"));
+      if (!line) continue;
+      try {
+        onData(JSON.parse(line.slice(5).trim()));
+      } catch {
+        /* ignore malformed */
+      }
+    }
+  }
+}
 
 export function useRun({ onUpdate, onDone } = {}) {
   const [run, setRun] = useState(null);
@@ -12,12 +40,12 @@ export function useRun({ onUpdate, onDone } = {}) {
     // Runs are created "queued" and claimed by the worker moments later;
     // subscribing only to "running" runs stranded the UI on "Queued".
     if (!run?.id || !ACTIVE_RUN.includes(run.status)) return;
-    let es;
     let timer;
     let closed = false;
+    const controller = new AbortController();
     const cleanup = () => {
       closed = true;
-      es?.close();
+      controller.abort();
       clearTimeout(timer);
     };
     const handle = (data) => {
@@ -38,12 +66,9 @@ export function useRun({ onUpdate, onDone } = {}) {
       }
       if (!closed) timer = setTimeout(poll, 1200);
     };
-    es = new EventSource(`${API}/runs/${run.id}/stream`, { withCredentials: true });
-    es.onmessage = (e) => handle(JSON.parse(e.data));
-    es.onerror = () => {
-      es.close();
+    readRunStream(run.id, handle, controller.signal).catch(() => {
       if (!closed) poll();
-    };
+    });
     return cleanup;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [run?.id]);

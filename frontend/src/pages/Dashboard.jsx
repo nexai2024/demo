@@ -4,6 +4,7 @@ import { Copy, Film, MoreHorizontal, Plus, Search, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 import { formatDistanceToNow } from "date-fns";
 import { AppHeader } from "@/components/AppHeader";
+import { AuthedImg } from "@/components/AuthedImg";
 import { BackendHealthBanner } from "@/components/BackendHealthBanner";
 import { NewProjectDialog } from "@/components/NewProjectDialog";
 import { StatusBadge } from "@/components/StatusBadge";
@@ -21,7 +22,7 @@ function ProjectCard({ p, onDuplicate, onDelete, onArchive, onRestore, i }) {
       <Link to={`/projects/${p.id}`} className="block" data-testid={`project-open-${p.id}`}>
         <div className="aspect-[16/10] bg-slate-950 grid-bg border-b border-slate-800 overflow-hidden">
           {p.thumbnail_path ? (
-            <img src={`${API}/projects/${p.id}/thumbnail?v=${p.thumbnail_path.slice(-12)}`} alt="" loading="lazy" decoding="async" className="h-full w-full object-cover object-top group-hover:scale-[1.03] transition-transform duration-500" />
+            <AuthedImg src={`${API}/projects/${p.id}/thumbnail?v=${p.thumbnail_path.slice(-12)}`} alt="" loading="lazy" decoding="async" className="h-full w-full object-cover object-top group-hover:scale-[1.03] transition-transform duration-500" />
           ) : (
             <div className="h-full grid place-items-center text-slate-600"><Film className="h-8 w-8" /></div>
           )}

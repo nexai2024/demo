@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { Reorder, useDragControls } from "framer-motion";
+import { AuthedImg } from "@/components/AuthedImg";
 import { AlertTriangle, ArrowDown, ArrowUp, ChevronDown, Copy, GripVertical, Loader2, RotateCcw, Trash2, Wand2 } from "lucide-react";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
@@ -107,8 +108,8 @@ export const StepCard = ({ s, i, total, thumb, failedThumb, active, locked, busy
           <button type="button" onPointerDown={(e) => drag.start(e)} aria-label="Drag to reorder" className="cursor-grab text-slate-600 hover:text-slate-300 touch-none"><GripVertical className="h-4 w-4" /></button>
           <span className="font-mono text-xs text-slate-500 w-6">{String(i + 1).padStart(2, "0")}</span>
           <div className={`hidden sm:flex h-10 ${failedThumb ? "w-32" : "w-16"} rounded-md overflow-hidden bg-slate-950 border border-slate-800 shrink-0`}>
-            {thumb && <img src={thumb} alt="" loading="lazy" decoding="async" className={`h-full ${failedThumb ? "w-1/2" : "w-full"} object-cover object-top`} />}
-            {failedThumb && <img src={failedThumb} alt="Frame from the failed health check" className="h-full w-1/2 object-cover object-top border-l border-red-500/50" data-testid={`step-health-diff-${s.id}`} />}
+            {thumb && <AuthedImg src={thumb} alt="" loading="lazy" decoding="async" className={`h-full ${failedThumb ? "w-1/2" : "w-full"} object-cover object-top`} />}
+            {failedThumb && <AuthedImg src={failedThumb} alt="Frame from the failed health check" className="h-full w-1/2 object-cover object-top border-l border-red-500/50" data-testid={`step-health-diff-${s.id}`} />}
           </div>
           <Select value={s.action} onValueChange={(v) => set({ action: v })}>
             <SelectTrigger className="w-28 h-9 bg-slate-950 font-mono text-xs" data-testid={`step-action-select-${s.id}`}><SelectValue /></SelectTrigger>

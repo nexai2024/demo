@@ -538,9 +538,35 @@ async def job_record(project: dict, run_id: str, only_idx: Optional[int], final:
                 if name == "encoding":
                     await run_log(run_id, "Encoding recorded video…", current=n)
 
+            preview_path = f"{APP_NAME}/u/{project['user_id']}/runs/{run_id}/preview.jpg"
+            preview_last = 0.0
+
+            async def on_preview(shot: bytes, url: str = "") -> None:
+                nonlocal preview_last
+                import time as _time
+                now = _time.monotonic()
+                # Throttle storage writes so we stay near ~2–3 fps without flooding S3/disk.
+                if now - preview_last < 0.35:
+                    return
+                preview_last = now
+                try:
+                    jpeg = await asyncio.to_thread(render.make_preview, shot)
+                    await put_object(preview_path, jpeg, "image/jpeg")
+                    await db.runs.update_one(
+                        {"id": run_id},
+                        {"$set": {
+                            "preview_path": preview_path,
+                            "preview_url": url or "",
+                            "preview_at": now_iso(),
+                        }},
+                    )
+                except Exception:
+                    logger.debug("run preview publish failed for %s", run_id, exc_info=True)
+
             result = await engine.run_steps(prepared, on_progress, capture_only=cap_rec, viewport=viewport,
                                             login=None if storage else login, storage_state=storage,
-                                            on_storage=None if storage else remember, on_phase=_phase)
+                                            on_storage=None if storage else remember, on_phase=_phase,
+                                            on_preview=on_preview)
             # Upload the recorded session clips and point each captured step
             # at its (clip, start_ms, end_ms) window — the edit decision list
             # the player and exporter consume.
@@ -1310,6 +1336,25 @@ async def stream_run(rid: str, request: Request, user: dict = Depends(get_curren
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
+@api.get("/runs/{rid}/preview")
+async def run_preview(rid: str, user: dict = Depends(get_current_user)):
+    """Latest low-res JPEG from the recording worker for the studio live view."""
+    run = await db.runs.find_one({"id": rid, "user_id": user["user_id"]}, {"_id": 0})
+    if not run:
+        raise HTTPException(404, "Run not found")
+    path = run.get("preview_path")
+    if not path:
+        raise HTTPException(404, "No preview yet")
+    try:
+        data, ctype = await get_object(path)
+    except Exception:
+        raise HTTPException(404, "No preview yet")
+    if not data:
+        raise HTTPException(404, "No preview yet")
+    return Response(content=data, media_type=ctype or "image/jpeg",
+                    headers={"Cache-Control": "no-store", "X-Preview-Url": (run.get("preview_url") or "")[:500]})
+
+
 @api.post("/runs/{rid}/cancel")
 async def cancel_run(rid: str, user: dict = Depends(get_current_user)):
     return await jobs.request_cancel(rid, user["user_id"])
@@ -1496,11 +1541,23 @@ async def live_start(pid: str, body: LiveStartIn, user: dict = Depends(get_curre
     if body.after > len(project["steps"]):
         raise HTTPException(400, "There are not that many steps to replay")
     prepared = [prepare_step(step, project) for step in project["steps"][:body.after]]
+    login = project.get("login") or {}
+    storage = login.get("storage_state")
     try:
-        found = await live_browser.open_session(pid, start, prepared, project.get("login"), user["user_id"])
+        found = await live_browser.open_session(
+            pid, start, prepared,
+            None if storage else login,
+            user["user_id"],
+            storage_state=storage,
+        )
     except Exception as exc:
         raise HTTPException(424, f"Could not open the live browser: {str(exc)[:700]}")
-    return {"url": found["url"], "after": body.after}
+    return {
+        "url": found["url"],
+        "after": body.after,
+        "has_storage": bool(storage),
+        "warning": found.get("warning") or "",
+    }
 
 
 def _own_live(pid: str, user: dict) -> None:
@@ -1566,6 +1623,77 @@ async def live_stop(pid: str, user: dict = Depends(get_current_user)):
     if live_browser:
         await live_browser.close_session(pid)
     return {"ok": True}
+
+
+@api.post("/projects/{pid}/live/save-session")
+async def live_save_session(pid: str, user: dict = Depends(get_current_user)):
+    """Persist cookies/localStorage from the open live browser as the project auth profile."""
+    await get_project(pid, user)
+    _own_live(pid, user)
+    try:
+        state = await live_browser.export_storage(pid)
+    except Exception as exc:
+        raise HTTPException(424, f"Could not save the session: {str(exc)[:180]}")
+    raw = await db.projects.find_one({"id": pid}, {"_id": 0}) or {}
+    raw_login = dict(raw.get("login") or {})
+    raw_login["storage_state"] = state
+    raw_login["storage_saved_at"] = now_iso()
+    await touch(pid, {"login": vault.seal_login(raw_login, pid)})
+    snap = live_browser.snapshot(pid)
+    return {"has_storage": True, "saved_at": raw_login["storage_saved_at"], "url": snap.get("url") or ""}
+
+
+@api.post("/projects/{pid}/live/start-from-here")
+async def live_start_from_here(pid: str, user: dict = Depends(get_current_user)):
+    """Save the live session and make the current page the demo starting point.
+
+    Keeps timeline steps after the first go-to (if any), replaces the opening
+    navigation with the live URL, and stores cookies so Record demo skips login.
+    """
+    await get_project(pid, user)
+    _own_live(pid, user)
+    try:
+        state = await live_browser.export_storage(pid)
+        snap = live_browser.snapshot(pid)
+    except Exception as exc:
+        raise HTTPException(424, f"Could not capture the live page: {str(exc)[:180]}")
+    url = (snap.get("url") or "").strip()
+    if not url.startswith(("http://", "https://")):
+        raise HTTPException(400, "The live browser is not on a usable page yet")
+    url = _validate_customer_url(url, "live page URL")
+
+    raw = await db.projects.find_one({"id": pid}, {"_id": 0}) or {}
+    raw_login = dict(raw.get("login") or {})
+    raw_login["storage_state"] = state
+    raw_login["storage_saved_at"] = now_iso()
+
+    steps = list(raw.get("steps") or [])
+    # Drop leading goto steps — the live URL becomes the new entry point.
+    while steps and steps[0].get("action") == "goto":
+        steps.pop(0)
+    entry = {
+        "id": new_id("st_"),
+        "action": "goto",
+        "url": url,
+        "selector": "",
+        "text": None,
+        "caption": f"Open {url}",
+        "voiceover": "",
+        "status": "pending",
+        "wait_ms": 800,
+        "duration_ms": 3000,
+        "transition": "fade",
+        "transition_ms": 800,
+        "attempts": 0,
+    }
+    steps = [entry] + steps
+    await touch(pid, {
+        "login": vault.seal_login(raw_login, pid),
+        "target_url": url,
+        "steps": steps,
+        "status": "scripted",
+    })
+    return await get_project(pid, user)
 
 
 @api.post("/projects/{pid}/steps/{sid}/comments")

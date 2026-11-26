@@ -99,7 +99,7 @@ export const DraftTab = ({ meta, setMeta, onGenerate, onAutopilot, onChangelog, 
       <div className="grid sm:grid-cols-2 gap-3 mt-4">
         <Input value={meta.login_url || ""} onChange={(e) => setMeta({ login_url: e.target.value })} placeholder="Login page URL" className="bg-slate-950 text-xs" data-testid="login-url-input" />
         <Input value={meta.login_username || ""} onChange={(e) => setMeta({ login_username: e.target.value })} placeholder="Username" className="bg-slate-950 text-xs" data-testid="login-username-input" />
-        <Input type="password" value={meta.login_password || ""} onChange={(e) => setMeta({ login_password: e.target.value })} placeholder={meta.has_login ? "Password saved — type to replace" : "Password"} className="bg-slate-950 text-xs" data-testid="login-password-input" />
+        <Input type="password" value={meta.login_password || ""} onChange={(e) => setMeta({ login_password: e.target.value })} placeholder={meta.has_login && !meta.credential_expired ? "Password saved — type to replace" : "Password"} className="bg-slate-950 text-xs" data-testid="login-password-input" autoComplete="new-password" />
         <Select value={meta.active_environment || "production"} onValueChange={(v) => setMeta({ active_environment: v })}>
           <SelectTrigger className="bg-slate-950 h-9" data-testid="environment-select"><SelectValue /></SelectTrigger>
           <SelectContent>
@@ -120,7 +120,21 @@ export const DraftTab = ({ meta, setMeta, onGenerate, onAutopilot, onChangelog, 
           </SelectContent>
         </Select>
       </div>
-      <p className="text-xs text-slate-500 mt-3">Typed steps can use {"{{email}}"}. The active host replaces the target URL’s host on go-to steps. A saved login runs before the first step and is not shown on the share page.</p>
+      <div className="mt-3 flex flex-wrap gap-2 text-[11px]" data-testid="auth-profile-status">
+        {meta.has_login && !meta.credential_expired ? (
+          <span className="rounded-md border border-emerald-500/30 bg-emerald-500/10 px-2 py-1 text-emerald-200">Password vaulted</span>
+        ) : null}
+        {meta.credential_expired ? (
+          <span className="rounded-md border border-amber-500/40 bg-amber-500/10 px-2 py-1 text-amber-200">Password expired — type it again</span>
+        ) : null}
+        {meta.has_storage && !meta.storage_expired ? (
+          <span className="rounded-md border border-cyan-500/30 bg-cyan-500/10 px-2 py-1 text-cyan-200">Signed-in browser saved</span>
+        ) : null}
+        {meta.storage_expired ? (
+          <span className="rounded-md border border-amber-500/40 bg-amber-500/10 px-2 py-1 text-amber-200">Signed-in browser expired — re-save from Live</span>
+        ) : null}
+      </div>
+      <p className="text-xs text-slate-500 mt-3">Typed steps can use {"{{email}}"}. The active host replaces the target URL’s host on go-to steps. Prefer Live browser → <span className="text-slate-300">Save signed-in session</span> (or <span className="text-slate-300">Start demo from here</span>) so Record demo reuses cookies. The password field is a fallback login recipe when no session is saved; it never appears on the share page. See docs/AUTH_SESSIONS.md.</p>
       <div className="mt-3 flex gap-2">
         <Input value={meta.playwright_source || ""} onChange={(e) => setMeta({ playwright_source: e.target.value })} placeholder="Paste a Playwright test" className="bg-slate-950 text-xs" data-testid="playwright-source-input" />
         <span className="inline-flex items-center shrink-0">

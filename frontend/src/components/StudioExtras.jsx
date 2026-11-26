@@ -51,7 +51,7 @@ export function StudioExtras({ project, meta, setMeta, onReload, onInsert }) {
         </section>
         <section className="space-y-2" data-testid="login-recipe">
           <p className="text-xs uppercase tracking-wider text-slate-500">Login recipe</p>
-          <p className="text-xs text-slate-500">Runs before the script when no signed-in browser is saved. A password in a type step stays in the project.</p>
+          <p className="text-xs text-slate-500">Fallback when no signed-in browser is saved. Tip: open Live browser, sign in once, then Save signed-in session — cookies are reused on Record demo. A password in a type step stays in the project.</p>
           {recipe.map((step, i) => (
             <div key={i} className="flex gap-2">
               <Input value={step.action} onChange={(e) => setMeta({ login_recipe: recipe.map((row, j) => j === i ? { ...row, action: e.target.value } : row) })} className="bg-slate-950 h-8 text-xs w-20" data-testid={`recipe-action-${i}`} />
