@@ -128,7 +128,21 @@ def _s3_key(path: str) -> str:
     conf = _s3_config()
     prefix = conf["prefix"] if conf else ""
     clean = path.lstrip("/")
+    if prefix and (clean == prefix or clean.startswith(prefix + "/")):
+        # Path already includes S3_PREFIX — don't double it.
+        return clean
     return f"{prefix}/{clean}" if prefix else clean
+
+
+def _s3_key_candidates(path: str) -> list[str]:
+    """Keys to try on read: prefixed first, then bare (legacy / cleared PREFIX)."""
+    primary = _s3_key(path)
+    bare = path.lstrip("/")
+    out: list[str] = []
+    for key in (primary, bare):
+        if key and key not in out:
+            out.append(key)
+    return out
 
 
 def _ncb_configured() -> bool:
@@ -265,7 +279,7 @@ def probe() -> dict:
     if configured == "s3":
         try:
             _put_s3(path, payload, "text/plain")
-            data, _ = _get_s3(path)
+            data, _, _ = _get_s3(path)
             if data != payload:
                 raise StorageError("Round-trip mismatch: read back different bytes")
         except Exception as exc:
@@ -359,19 +373,44 @@ def _put_s3(path: str, data: bytes, content_type: str, attempts: int = 3) -> str
     raise StorageError(f"Failed to upload '{path}' to S3 after {attempts} attempts: {last}") from last
 
 
-def _get_s3(path: str) -> tuple[bytes, str]:
+def _get_s3(path: str, *, byte_range: str | None = None) -> tuple[bytes, str, dict]:
+    """Fetch an object. Returns (body, content_type, response_meta).
+
+    ``byte_range`` is an HTTP Range value like ``bytes=0-1023`` (S3 GetObject Range).
+    Tries prefixed and bare keys so clearing/changing S3_PREFIX does not 500 media.
+    """
     conf = _s3_config()
     client = _get_s3_client()
-    key = _s3_key(path)
-    try:
-        obj = client.get_object(Bucket=conf["bucket"], Key=key)
-        body = obj["Body"].read()
-        return body, obj.get("ContentType") or _guess_media(path)
-    except Exception as exc:
-        code = getattr(exc, "response", {}).get("Error", {}).get("Code", "")
-        if code in {"NoSuchKey", "404", "NotFound"}:
-            raise FileNotFoundError(path) from exc
-        raise StorageError(f"Failed to read '{path}' from S3: {exc}") from exc
+    last_miss: Exception | None = None
+    last_err: Exception | None = None
+    for key in _s3_key_candidates(path):
+        try:
+            kwargs = {"Bucket": conf["bucket"], "Key": key}
+            if byte_range:
+                kwargs["Range"] = byte_range
+            obj = client.get_object(**kwargs)
+            body = obj["Body"].read()
+            meta = {
+                "content_length": obj.get("ContentLength"),
+                "content_range": obj.get("ContentRange"),
+                "accept_ranges": obj.get("AcceptRanges") or "bytes",
+                "status": 206 if byte_range else 200,
+                "key": key,
+            }
+            return body, obj.get("ContentType") or _guess_media(path), meta
+        except Exception as exc:
+            code = getattr(exc, "response", {}).get("Error", {}).get("Code", "")
+            if code in {"NoSuchKey", "404", "NotFound"}:
+                last_miss = exc
+                continue
+            if code in {"InvalidRange", "RequestedRangeNotSatisfiable"}:
+                raise
+            last_err = exc
+            # Permission / transient errors: don't keep trying alternate keys.
+            break
+    if last_miss is not None and last_err is None:
+        raise FileNotFoundError(path) from last_miss
+    raise StorageError(f"Failed to read '{path}' from S3: {last_err or last_miss}") from (last_err or last_miss)
 
 
 def _put_ncb(path: str, data: bytes, content_type: str, attempts: int = 3) -> str:
@@ -442,24 +481,37 @@ def _put(path: str, data: bytes, content_type: str) -> str:
     raise StorageError("Shared object storage is required in production (set S3_BUCKET)")
 
 
-def _get(path: str) -> tuple[bytes, str]:
+def _get(path: str, *, byte_range: str | None = None) -> tuple[bytes, str]:
     if _s3_config() and time.monotonic() >= _S3_DOWN_UNTIL:
         try:
-            return _get_s3(path)
+            body, ctype, _meta = _get_s3(path, byte_range=byte_range)
+            return body, ctype
         except (StorageError, FileNotFoundError):
             if not _allow_local_fallback():
                 raise
             _trip_s3_breaker()
             logger.warning("S3 read failed in dev; trying local disk for %s", path)
+    if byte_range:
+        # Local / NCB / HTTP fallbacks ignore Range and return the full object;
+        # callers that need Range must use S3 in production.
+        pass
     if path.startswith(("http://", "https://")):
         with httpx.Client(timeout=60) as client:
-            response = client.get(path)
+            headers = {"Range": byte_range} if byte_range else None
+            response = client.get(path, headers=headers)
         response.raise_for_status()
         return response.content, response.headers.get("content-type", _guess_media(path))
     if _allow_local_fallback():
         local = LOCAL_ROOT / path
         if local.exists():
-            return local.read_bytes(), _guess_media(path)
+            data = local.read_bytes()
+            if byte_range:
+                m = __import__("re").match(r"bytes=(\d*)-(\d*)", byte_range.strip())
+                if m:
+                    start = int(m.group(1)) if m.group(1) else 0
+                    end = int(m.group(2)) if m.group(2) else len(data) - 1
+                    return data[start:end + 1], _guess_media(path)
+            return data, _guess_media(path)
     if _ncb_configured():
         from ncb import cfg
         conf = cfg()
@@ -488,5 +540,5 @@ async def put_object(path: str, data: bytes, content_type: str) -> str:
     return await asyncio.to_thread(_put, path, data, content_type)
 
 
-async def get_object(path: str) -> tuple[bytes, str]:
-    return await asyncio.to_thread(_get, path)
+async def get_object(path: str, *, byte_range: str | None = None) -> tuple[bytes, str]:
+    return await asyncio.to_thread(_get, path, byte_range=byte_range)

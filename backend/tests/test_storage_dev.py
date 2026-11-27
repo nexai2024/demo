@@ -77,7 +77,8 @@ def test_probe_reports_healthy_s3(dev_env, monkeypatch):
     monkeypatch.setattr(storage, "_s3_config",
                         lambda: {"bucket": "b", "endpoint": None, "region": "us-east-1", "prefix": ""})
     monkeypatch.setattr(storage, "_put_s3", lambda path, data, ct: store.update({path: data}) or path)
-    monkeypatch.setattr(storage, "_get_s3", lambda path: (store[path], "text/plain"))
+    monkeypatch.setattr(storage, "_get_s3",
+                        lambda path, byte_range=None: (store[path], "text/plain", {}))
     monkeypatch.setattr(storage, "_get_s3_client", lambda: FakeS3())
     result = storage.probe()
     assert result["ok"] is True and result["served_by"] == "s3" and result["fallback_used"] is False
@@ -110,6 +111,55 @@ def test_config_problems_explain_broken_s3_combos(monkeypatch):
     monkeypatch.setenv("S3_ENDPOINT_URL", "https://acc123.r2.cloudflarestorage.com")
     monkeypatch.delenv("S3_PREFIX", raising=False)
     assert storage.config_problems() == []
+
+
+def test_s3_key_candidates_try_prefixed_then_bare(monkeypatch):
+    monkeypatch.setenv("S3_BUCKET", "b")
+    monkeypatch.setenv("S3_PREFIX", "flowcast")
+    monkeypatch.delenv("S3_ENDPOINT_URL", raising=False)
+    storage.reset_client()
+    assert storage._s3_key("appshowcase/u/x.jpg") == "flowcast/appshowcase/u/x.jpg"
+    assert storage._s3_key_candidates("appshowcase/u/x.jpg") == [
+        "flowcast/appshowcase/u/x.jpg",
+        "appshowcase/u/x.jpg",
+    ]
+    # Prefix already present in the path must not be doubled.
+    monkeypatch.setenv("S3_PREFIX", "appshowcase")
+    storage.reset_client()
+    assert storage._s3_key("appshowcase/u/x.jpg") == "appshowcase/u/x.jpg"
+    assert storage._s3_key_candidates("appshowcase/u/x.jpg") == ["appshowcase/u/x.jpg"]
+
+
+def test_get_s3_falls_back_to_bare_key(monkeypatch):
+    """Objects written before S3_PREFIX was set must still resolve."""
+    store = {}
+
+    class FakeBody:
+        def __init__(self, data):
+            self._data = data
+
+        def read(self):
+            return self._data
+
+    class FakeS3:
+        def get_object(self, Bucket, Key, **kwargs):
+            if Key not in store:
+                err = RuntimeError("missing")
+                err.response = {"Error": {"Code": "NoSuchKey"}}
+                raise err
+            return {"Body": FakeBody(store[Key]), "ContentType": "image/jpeg", "ContentLength": len(store[Key])}
+
+    monkeypatch.setenv("APP_ENV", "production")
+    monkeypatch.setenv("S3_BUCKET", "b")
+    monkeypatch.setenv("S3_PREFIX", "flowcast")
+    monkeypatch.setenv("AWS_REGION", "us-east-1")
+    monkeypatch.delenv("S3_ENDPOINT_URL", raising=False)
+    monkeypatch.setattr(storage, "_S3_DOWN_UNTIL", 0.0)
+    storage.reset_client()
+    monkeypatch.setattr(storage, "_get_s3_client", lambda: FakeS3())
+    store["appshowcase/u/x.jpg"] = b"IMG"
+    data, media = __import__("asyncio").run(storage.get_object("appshowcase/u/x.jpg"))
+    assert data == b"IMG" and media == "image/jpeg"
 
 
 def test_access_point_arn_in_endpoint_is_normalized(monkeypatch):

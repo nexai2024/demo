@@ -95,7 +95,11 @@ def test_video_asset_supports_range_requests(monkeypatch):
 
     payload = bytes(range(256)) * 40  # 10240 bytes
 
-    async def fake_get_object(path):
+    async def fake_get_object(path, byte_range=None):
+        # Force the full-object + in-process slice path so Content-Range
+        # totals stay exact in this unit test.
+        if byte_range is not None:
+            raise RuntimeError("range not supported in test double")
         return payload, "video/mp4"
 
     monkeypatch.setattr(server, "get_object", fake_get_object)

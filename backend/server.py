@@ -86,6 +86,14 @@ async def storage_error_handler(request: Request, exc):
     return JSONResponse(status_code=503, content={"detail": str(exc), "code": "storage_unavailable"})
 
 
+@app.exception_handler(FileNotFoundError)
+async def file_not_found_handler(request: Request, exc):
+    # Missing S3/local objects must be JSON 404s so CORSMiddleware can attach
+    # Access-Control-Allow-Origin. Naked 500s look like CORS failures in the browser.
+    from fastapi.responses import JSONResponse
+    return JSONResponse(status_code=404, content={"detail": "Asset not found", "code": "not_found"})
+
+
 @app.exception_handler(vault.VaultError)
 async def vault_error_handler(request: Request, exc):
     # Return JSON so CORSMiddleware can attach ACAO — raw 500s from unhandled
@@ -1830,7 +1838,10 @@ async def _asset(p: dict, sid: str, kind: str, cache_headers: dict | None = None
     path = step and (step.get(field) or (step.get("screenshot_path") if kind == "thumb" else None))
     if not path:
         raise HTTPException(404, "Asset not found")
-    data, _ = await get_object(path)
+    try:
+        data, _ = await get_object(path)
+    except FileNotFoundError:
+        raise HTTPException(404, "Asset not found")
     media = "audio/mpeg" if kind == "audio" else ("image/webp" if path.endswith(".webp") else "image/jpeg")
     return Response(content=data, media_type=media, headers=cache_headers or {"Cache-Control": "private, no-store"})
 
@@ -1840,7 +1851,10 @@ async def step_motion(pid: str, sid: str, index: int, user: dict = Depends(get_c
     project = await get_project(pid, user)
     step = next((s for s in project["steps"] if s["id"] == sid), None)
     path = _motion_response(step, index)
-    data, _ = await get_object(path)
+    try:
+        data, _ = await get_object(path)
+    except FileNotFoundError:
+        raise HTTPException(404, "Asset not found")
     return Response(content=data, media_type="image/jpeg", headers={"Cache-Control": "private, max-age=86400"})
 
 
@@ -1853,24 +1867,49 @@ async def _video_asset(p: dict, sid: str, cache_headers: dict | None = None,
     path = clips[clip] if isinstance(clip, int) and 0 <= clip < len(clips) else None
     if not path:
         raise HTTPException(404, "Video not found")
-    data, _ = await get_object(path)
+    try:
+        # Prefer a storage-level Range fetch when the client asks for one so
+        # large clips do not OOM the serverless function (naked OOM 500s look
+        # like CORS failures in the browser). Fall back to a full read + slice.
+        range_header = request.headers.get("range") if request is not None else None
+        ranged = None
+        if range_header and re.match(r"bytes=(\d*)-(\d*)", range_header.strip()):
+            try:
+                ranged, _ = await get_object(path, byte_range=range_header.strip())
+            except FileNotFoundError:
+                raise
+            except Exception:
+                ranged = None
+        if ranged is None:
+            data, _ = await get_object(path)
+        else:
+            data = None
+    except FileNotFoundError:
+        raise HTTPException(404, "Video not found")
     headers = {"Accept-Ranges": "bytes", **(cache_headers or {"Cache-Control": "private, no-store"})}
     # Browsers require Range support to seek: without it a seek past the
     # buffered region restarts the element at 0 (the player seeks per step).
-    range_header = request.headers.get("range") if request is not None else None
     if range_header:
         m = re.match(r"bytes=(\d*)-(\d*)", range_header.strip())
         if m:
-            total = len(data)
+            if data is not None:
+                total = len(data)
+                start = int(m.group(1)) if m.group(1) else 0
+                end = int(m.group(2)) if m.group(2) else total - 1
+                if start >= total:
+                    return Response(status_code=416, headers={"Content-Range": f"bytes */{total}"})
+                end = min(end, total - 1)
+                headers["Content-Range"] = f"bytes {start}-{end}/{total}"
+                return Response(content=data[start:end + 1], status_code=206,
+                                media_type="video/mp4", headers=headers)
+            # Storage already returned the byte window; total size unknown → /*.
             start = int(m.group(1)) if m.group(1) else 0
-            end = int(m.group(2)) if m.group(2) else total - 1
-            if start >= total:
-                return Response(status_code=416, headers={"Content-Range": f"bytes */{total}"})
-            end = min(end, total - 1)
-            headers["Content-Range"] = f"bytes {start}-{end}/{total}"
-            return Response(content=data[start:end + 1], status_code=206,
-                            media_type="video/mp4", headers=headers)
-    return Response(content=data, media_type="video/mp4", headers=headers)
+            end = start + len(ranged) - 1
+            if not ranged:
+                return Response(status_code=416, headers={"Content-Range": "bytes */*"})
+            headers["Content-Range"] = f"bytes {start}-{end}/*"
+            return Response(content=ranged, status_code=206, media_type="video/mp4", headers=headers)
+    return Response(content=data if data is not None else ranged, media_type="video/mp4", headers=headers)
 
 
 @api.get("/projects/{pid}/steps/{sid}/video")
@@ -1893,7 +1932,10 @@ async def thumbnail(pid: str, user: dict = Depends(get_current_user)):
     p = await get_project(pid, user)
     if not p.get("thumbnail_path"):
         raise HTTPException(404, "No thumbnail")
-    data, _ = await get_object(p["thumbnail_path"])
+    try:
+        data, _ = await get_object(p["thumbnail_path"])
+    except FileNotFoundError:
+        raise HTTPException(404, "No thumbnail")
     return Response(content=data, media_type="image/jpeg", headers={"Cache-Control": "private, max-age=86400"})
 
 
@@ -1903,7 +1945,10 @@ async def download_export(pid: str, eid: str, user: dict = Depends(get_current_u
     exp = next((e for e in p.get("exports", []) if e["id"] == eid), None)
     if not exp:
         raise HTTPException(404, "Export not found")
-    data, _ = await get_object(exp["path"])
+    try:
+        data, _ = await get_object(exp["path"])
+    except FileNotFoundError:
+        raise HTTPException(404, "Export not found")
     media = "image/gif" if exp["format"] == "gif" else "video/mp4"
     safe = "".join(c if c.isalnum() else "-" for c in p["name"]).strip("-")[:40] or "demo"
     return Response(content=data, media_type=media,
@@ -2106,7 +2151,10 @@ async def public_motion(share_id: str, sid: str, index: int, request: Request):
     project = _require_published(raw)
     step = next((s for s in project["steps"] if s["id"] == sid), None)
     path = _motion_response(step, index)
-    data, _ = await get_object(path)
+    try:
+        data, _ = await get_object(path)
+    except FileNotFoundError:
+        raise HTTPException(404, "Asset not found")
     return Response(content=data, media_type="image/jpeg", headers=_share_cache_headers(raw))
 
 
