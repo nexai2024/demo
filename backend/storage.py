@@ -486,20 +486,38 @@ def _trip_s3_breaker() -> None:
 
 
 def _put(path: str, data: bytes, content_type: str) -> str:
-    if _s3_config() and time.monotonic() >= _S3_DOWN_UNTIL:
-        try:
-            return _put_s3(path, data, content_type)
-        except StorageError:
-            if not _allow_local_fallback():
-                raise
-            # Dev must keep working while an S3/R2 config is being set up;
-            # production still fails loudly. /api/ready keeps reporting
-            # the broken bucket, so this never masks it silently.
-            _trip_s3_breaker()
-            logger.warning("S3 upload failed in dev; falling back to local disk for %s", path)
+    """Persist ``path`` to durable storage.
+
+    When ``S3_BUCKET`` is set, uploads MUST go to S3/R2 (or local disk in
+    development). Never fall through to NCB — that returned a Mongo path while
+    writing nowhere the API can read, which made every capture look successful
+    then vanish on the next project load.
+    """
+    s3 = _s3_config()
+    if s3:
+        # Production always hits S3 (ignore a stale dev circuit-breaker left on
+        # a long-lived Fluid isolate). Dev may skip S3 while the breaker is open.
+        use_s3 = _is_production() or time.monotonic() >= _S3_DOWN_UNTIL
+        if use_s3:
+            try:
+                out = _put_s3(path, data, content_type)
+                logger.info("storage put s3 ok path=%s bytes=%s bucket=%s", path, len(data), s3.get("bucket"))
+                return out
+            except StorageError:
+                if not _allow_local_fallback():
+                    raise
+                _trip_s3_breaker()
+                logger.warning("S3 upload failed in dev; falling back to local disk for %s", path)
+        if _allow_local_fallback():
+            target = LOCAL_ROOT / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(data)
+            return path
+        raise StorageError(
+            f"Failed to upload '{path}' to S3 bucket '{s3.get('bucket')}'; "
+            "refusing NCB fallback while S3_BUCKET is set")
     if _allow_local_fallback():
-        # Dev: local disk IS the store. Trying the remote first made every
-        # file pay several failed uploads (plus backoff) before landing here.
+        # Dev without S3: local disk IS the store.
         target = LOCAL_ROOT / path
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(data)
@@ -510,15 +528,30 @@ def _put(path: str, data: bytes, content_type: str) -> str:
 
 
 def _get(path: str, *, byte_range: str | None = None) -> tuple[bytes, str]:
-    if _s3_config() and time.monotonic() >= _S3_DOWN_UNTIL:
-        try:
-            body, ctype, _meta = _get_s3(path, byte_range=byte_range)
-            return body, ctype
-        except (StorageError, FileNotFoundError):
-            if not _allow_local_fallback():
-                raise
-            _trip_s3_breaker()
-            logger.warning("S3 read failed in dev; trying local disk for %s", path)
+    s3 = _s3_config()
+    if s3:
+        use_s3 = _is_production() or time.monotonic() >= _S3_DOWN_UNTIL
+        if use_s3:
+            try:
+                body, ctype, _meta = _get_s3(path, byte_range=byte_range)
+                return body, ctype
+            except (StorageError, FileNotFoundError):
+                if not _allow_local_fallback():
+                    raise
+                _trip_s3_breaker()
+                logger.warning("S3 read failed in dev; trying local disk for %s", path)
+        if _allow_local_fallback():
+            local = LOCAL_ROOT / path
+            if local.exists():
+                data = local.read_bytes()
+                if byte_range:
+                    m = __import__("re").match(r"bytes=(\d*)-(\d*)", byte_range.strip())
+                    if m:
+                        start = int(m.group(1)) if m.group(1) else 0
+                        end = int(m.group(2)) if m.group(2) else len(data) - 1
+                        return data[start:end + 1], _guess_media(path)
+                return data, _guess_media(path)
+        raise FileNotFoundError(path)
     if byte_range:
         # Local / NCB / HTTP fallbacks ignore Range and return the full object;
         # callers that need Range must use S3 in production.
@@ -575,11 +608,13 @@ async def get_object(path: str, *, byte_range: str | None = None) -> tuple[bytes
 def _object_exists(path: str) -> bool:
     """True if any candidate key for ``path`` is present in durable storage.
 
-    Ambiguous errors (403 / network) return True so we never wipe Mongo paths
-    when Head is denied but the object may still exist for GetObject.
+    Ambiguous errors (403 / network) return True so we never treat media as
+    missing when Head is denied but the object may still exist for GetObject.
     """
-    if _s3_config() and time.monotonic() >= _S3_DOWN_UNTIL:
-        conf = _s3_config()
+    s3 = _s3_config()
+    use_s3 = bool(s3) and (_is_production() or time.monotonic() >= _S3_DOWN_UNTIL)
+    if use_s3:
+        conf = s3
         client = _get_s3_client()
         saw_definite_miss = False
         for key in _s3_key_candidates(path):
@@ -593,7 +628,7 @@ def _object_exists(path: str) -> bool:
                     saw_definite_miss = True
                     continue
                 logger.warning("S3 head failed for %s (%s): %s", path, key, exc)
-                return True  # fail open — do not scrub paths on auth/network blips
+                return True  # fail open — do not flag missing on auth/network blips
         return not saw_definite_miss
     if _allow_local_fallback() and (LOCAL_ROOT / path.lstrip("/")).exists():
         return True

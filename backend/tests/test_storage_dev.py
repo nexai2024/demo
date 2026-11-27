@@ -52,6 +52,34 @@ def test_broken_s3_falls_back_to_local_in_dev_only(dev_env, monkeypatch):
         asyncio.run(storage.put_object("appshowcase/u/p/s3.jpg", b"IMG", "image/jpeg"))
 
 
+def test_production_never_falls_through_to_ncb_when_s3_configured(dev_env, monkeypatch):
+    """Stale S3 breaker + NCB must not accept media while S3_BUCKET is set.
+
+    That path returned Mongo screenshot_path values that never existed in R2.
+    """
+    calls = {"s3": 0, "ncb": 0}
+
+    def s3_ok(path, data, ct):
+        calls["s3"] += 1
+        return path
+
+    def ncb_boom(*a, **k):
+        calls["ncb"] += 1
+        raise AssertionError("NCB must not receive uploads when S3_BUCKET is set")
+
+    monkeypatch.setenv("APP_ENV", "production")
+    monkeypatch.setenv("NCB_INSTANCE", "inst_123")
+    monkeypatch.setenv("NCB_SECRET_KEY", "secret")
+    # Simulate a Fluid isolate that tripped the breaker while still on APP_ENV=development.
+    monkeypatch.setattr(storage, "_S3_DOWN_UNTIL", storage.time.monotonic() + 300)
+    monkeypatch.setattr(storage, "_s3_config", lambda: {"bucket": "demo-app-dir", "prefix": ""})
+    monkeypatch.setattr(storage, "_put_s3", s3_ok)
+    monkeypatch.setattr(storage, "_put_ncb", ncb_boom)
+    path = asyncio.run(storage.put_object("appshowcase/u/p/s1.jpg", b"IMG", "image/jpeg"))
+    assert path == "appshowcase/u/p/s1.jpg"
+    assert calls["s3"] == 1 and calls["ncb"] == 0
+
+
 def test_probe_reports_broken_s3_with_local_fallback(dev_env, monkeypatch):
     def broken(*a, **k):
         raise storage.StorageError("Could not connect to the endpoint URL")

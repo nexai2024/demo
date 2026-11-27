@@ -341,31 +341,17 @@ async def get_project(pid: str, user: dict) -> dict:
     p["credential_expired"] = flags["credential_expired"]
     p["storage_expired"] = flags["storage_expired"]
     p["login"] = vault.owner_login_view(raw_login, pid)
-    # Detect orphan media paths (Mongo has screenshot_path but object storage does not).
-    # Clear them so the UI stops requesting dead URLs and prompts a re-record.
+    # Report orphan media (Mongo path, object missing) but NEVER clear paths or
+    # reset status here. A prior scrub raced with live recordings and wiped
+    # every capture to "pending" while the run was still logging success.
     media_missing = 0
     steps = list(p.get("steps") or [])
-    cleared_steps = False
     for step in steps:
         path = step.get("screenshot_path")
-        if not path:
-            continue
-        if await object_exists(path):
-            continue
-        media_missing += 1
-        step["screenshot_path"] = None
-        step["thumb_path"] = None
-        step["motion_paths"] = []
-        if step.get("status") == "done":
-            step["status"] = "pending"
-        cleared_steps = True
-    if cleared_steps:
-        fields = {"steps": steps}
-        thumb = p.get("thumbnail_path")
-        if thumb and not await object_exists(thumb):
-            fields["thumbnail_path"] = None
-        await touch(pid, fields)
-        logger.warning("cleared %s missing screenshot path(s) on project %s", media_missing, pid)
+        if path and not await object_exists(path):
+            media_missing += 1
+    if media_missing:
+        logger.warning("media missing for %s step(s) on project %s (paths kept)", media_missing, pid)
     p["media_missing"] = media_missing
     p["steps"] = vault.mask_steps(steps)
     published = p.pop("published", None) or {}
