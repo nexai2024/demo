@@ -134,13 +134,32 @@ def _s3_key(path: str) -> str:
     return f"{prefix}/{clean}" if prefix else clean
 
 
+def _previous_prefixes() -> list[str]:
+    """Retired S3_PREFIX values still accepted on read (comma-separated env)."""
+    return [
+        p.strip().strip("/")
+        for p in os.environ.get("S3_PREFIX_PREVIOUS", "").split(",")
+        if p.strip()
+    ]
+
+
 def _s3_key_candidates(path: str) -> list[str]:
-    """Keys to try on read: prefixed first, then bare (legacy / cleared PREFIX)."""
-    primary = _s3_key(path)
+    """Keys to try on read: current prefix, bare path, then S3_PREFIX_PREVIOUS.
+
+    Clearing S3_PREFIX after objects were written under e.g. ``flowcast/`` would
+    otherwise 404 every screenshot. Set ``S3_PREFIX_PREVIOUS=flowcast`` so those
+    keys still resolve while new uploads go to the unprefixed layout.
+    """
     bare = path.lstrip("/")
     out: list[str] = []
-    for key in (primary, bare):
+    for key in (_s3_key(path), bare):
         if key and key not in out:
+            out.append(key)
+    for prev in _previous_prefixes():
+        if bare == prev or bare.startswith(prev + "/"):
+            continue
+        key = f"{prev}/{bare}"
+        if key not in out:
             out.append(key)
     return out
 

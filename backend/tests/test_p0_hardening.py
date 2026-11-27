@@ -261,6 +261,30 @@ def test_jwt_and_vault_key_rotation(monkeypatch):
         vault.unseal(sealed, "prj_OTHER:login.password")
 
 
+def test_open_login_soft_fails_when_key_rotated_without_previous(monkeypatch):
+    old_vk = "V1aB2cD3eF4gH5iJ6kL7mN8oP9qR0sT1"
+    new_vk = "W9zY8xW7vU6tS5rQ4pO3nM2lK1jI0hG9"
+    fresh = __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat()
+    monkeypatch.setenv("VAULT_MASTER_KEY", old_vk)
+    monkeypatch.delenv("VAULT_MASTER_KEY_PREVIOUS", raising=False)
+    sealed = vault.seal_login({
+        "username": "alice",
+        "password": "my-password-123",
+        "credentials_saved_at": fresh,
+        "storage_state": {"cookies": [{"name": "sid", "value": "cookie-secret"}]},
+        "storage_saved_at": fresh,
+    }, "prj_1")
+    monkeypatch.setenv("VAULT_MASTER_KEY", new_vk)
+    opened = vault.open_login(sealed, "prj_1")
+    assert "password" not in opened and opened.get("credential_unreadable") is True
+    assert "storage_state" not in opened and opened.get("storage_unreadable") is True
+    assert opened.get("username") == "alice"
+    cleaned, changed = vault.drop_unreadable_login(sealed, "prj_1")
+    assert changed is True
+    assert "password" not in cleaned and "storage_state" not in cleaned
+    assert cleaned.get("username") == "alice"
+
+
 def test_credential_and_storage_expiry_and_redaction(monkeypatch):
     monkeypatch.setenv("VAULT_MASTER_KEY", "V1aB2cD3eF4gH5iJ6kL7mN8oP9qR0sT1")
     old_ts = (datetime.now(timezone.utc) - timedelta(days=45)).isoformat()

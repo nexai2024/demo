@@ -318,6 +318,14 @@ async def get_project(pid: str, user: dict) -> dict:
         raise HTTPException(404, "Project not found")
     p["has_share_password"] = bool(p.pop("share_password_hash", None))
     raw_login = dict(p.get("login") or {})
+    # Drop sealed blobs orphaned by a vault key rotation so Live/UI aren't stuck
+    # reporting a session that can never be opened.
+    cleaned_login, scrubbed = vault.drop_unreadable_login(raw_login, pid)
+    if scrubbed:
+        await touch(pid, {"login": cleaned_login})
+        raw_login = cleaned_login
+        p["login"] = cleaned_login
+        logger.warning("scrubbed unreadable vault fields on project %s (key rotation?)", pid)
     flags = vault.login_flags(raw_login)
     p["has_login"] = bool(flags["has_password"] or raw_login.get("username") or raw_login.get("recipe"))
     p["has_storage"] = flags["has_storage"]
@@ -1559,19 +1567,28 @@ def _live_ready() -> None:
         raise HTTPException(400, "Browserless is not connected yet. Add your Browserless API key in Settings.")
 
 
-async def _live_project(pid: str, user: dict) -> tuple[dict, str]:
+async def _live_project(pid: str, user: dict) -> tuple[dict, str, list[str]]:
     p = await get_project(pid, user)
     raw = await db.projects.find_one({"id": pid}, {"_id": 0}) or {}
-    login = vault.open_login(raw.get("login") or {}, pid)
+    notes: list[str] = []
+    opened = vault.open_login(raw.get("login") or {}, pid)
+    if opened.get("storage_unreadable") or opened.get("credential_unreadable"):
+        cleaned, scrubbed = vault.drop_unreadable_login(raw.get("login") or {}, pid)
+        if scrubbed:
+            await touch(pid, {"login": cleaned})
+        if opened.get("storage_unreadable"):
+            notes.append("Saved signed-in session could not be decrypted (vault key changed). Sign in again in Live, then Save signed-in session.")
+        if opened.get("credential_unreadable"):
+            notes.append("Saved login password could not be decrypted (vault key changed). Re-enter it in Login setup.")
     opened_steps = [{**s, "text": vault.open_step_text(s, pid)} if s.get("sensitive") else dict(s) for s in raw.get("steps") or p["steps"]]
-    project = {**raw, "steps": opened_steps, "login": login}
+    project = {**raw, "steps": opened_steps, "login": opened}
     start = _validate_customer_url(environment_base(project) or p["target_url"], "target URL")
-    return project, start
+    return project, start, notes
 
 
 @api.post("/projects/{pid}/live/start")
 async def live_start(pid: str, body: LiveStartIn, user: dict = Depends(get_current_user)):
-    project, start = await _live_project(pid, user)
+    project, start, notes = await _live_project(pid, user)
     _live_ready()
     if body.after > len(project["steps"]):
         raise HTTPException(400, "There are not that many steps to replay")
@@ -1587,11 +1604,14 @@ async def live_start(pid: str, body: LiveStartIn, user: dict = Depends(get_curre
         )
     except Exception as exc:
         raise HTTPException(424, f"Could not open the live browser: {str(exc)[:700]}")
+    warning = found.get("warning") or ""
+    if notes:
+        warning = " ".join(notes + ([warning] if warning else []))
     return {
         "url": found["url"],
         "after": body.after,
         "has_storage": bool(storage),
-        "warning": found.get("warning") or "",
+        "warning": warning,
     }
 
 

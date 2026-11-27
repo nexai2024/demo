@@ -116,6 +116,7 @@ def test_config_problems_explain_broken_s3_combos(monkeypatch):
 def test_s3_key_candidates_try_prefixed_then_bare(monkeypatch):
     monkeypatch.setenv("S3_BUCKET", "b")
     monkeypatch.setenv("S3_PREFIX", "flowcast")
+    monkeypatch.delenv("S3_PREFIX_PREVIOUS", raising=False)
     monkeypatch.delenv("S3_ENDPOINT_URL", raising=False)
     storage.reset_client()
     assert storage._s3_key("appshowcase/u/x.jpg") == "flowcast/appshowcase/u/x.jpg"
@@ -128,6 +129,16 @@ def test_s3_key_candidates_try_prefixed_then_bare(monkeypatch):
     storage.reset_client()
     assert storage._s3_key("appshowcase/u/x.jpg") == "appshowcase/u/x.jpg"
     assert storage._s3_key_candidates("appshowcase/u/x.jpg") == ["appshowcase/u/x.jpg"]
+
+    # Cleared PREFIX + PREVIOUS restores reads of objects written under flowcast/.
+    monkeypatch.delenv("S3_PREFIX", raising=False)
+    monkeypatch.setenv("S3_PREFIX_PREVIOUS", "flowcast")
+    storage.reset_client()
+    assert storage._s3_key("appshowcase/u/x.jpg") == "appshowcase/u/x.jpg"
+    assert storage._s3_key_candidates("appshowcase/u/x.jpg") == [
+        "appshowcase/u/x.jpg",
+        "flowcast/appshowcase/u/x.jpg",
+    ]
 
 
 def test_get_s3_falls_back_to_bare_key(monkeypatch):

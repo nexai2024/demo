@@ -147,26 +147,93 @@ def seal_login(login: dict | None, pid: str) -> dict:
     return out
 
 
+def _try_unseal(token, context: str):
+    """Return (value, ok). ok is False when the ciphertext cannot be opened with the current keyring."""
+    try:
+        return unseal(token, context), True
+    except VaultError as exc:
+        logger.warning("vault unseal failed for %s: %s", context, exc)
+        return None, False
+
+
 def open_login(login: dict | None, pid: str) -> dict:
-    """Plaintext login for the browser. Expired credentials and browser state are dropped, not used."""
+    """Plaintext login for the browser. Expired / unreadable secrets are dropped, not used.
+
+    Unreadable sealed blobs (key rotated without VAULT_MASTER_KEY_PREVIOUS) are treated like
+    expiry so Live/Record can still start; callers should persist ``drop_unreadable_login``.
+    """
     out = dict(login or {})
     if out.get("password"):
         if _expired(out.get("credentials_saved_at"), credential_ttl_seconds()):
             out.pop("password")
             out["credential_expired"] = True
         else:
-            out["password"] = unseal(out["password"], f"{pid}:login.password")
+            value, ok = _try_unseal(out["password"], f"{pid}:login.password")
+            if ok:
+                out["password"] = value
+            else:
+                out.pop("password")
+                out["credential_unreadable"] = True
     if out.get("storage_state"):
         if _expired(out.get("storage_saved_at"), storage_ttl_seconds()):
             out.pop("storage_state")
             out["storage_expired"] = True
         else:
-            out["storage_state"] = unseal(out["storage_state"], f"{pid}:login.storage_state")
+            value, ok = _try_unseal(out["storage_state"], f"{pid}:login.storage_state")
+            if ok:
+                out["storage_state"] = value
+            else:
+                out.pop("storage_state")
+                out["storage_unreadable"] = True
     if out.get("recipe"):
-        out["recipe"] = [
-            {**s, "text": unseal(s["text"], f"{pid}:login.recipe.{i}")} if s.get("action") == "type" and s.get("text") else s
-            for i, s in enumerate(out["recipe"])]
+        recipe = []
+        for i, s in enumerate(out["recipe"]):
+            if s.get("action") == "type" and s.get("text"):
+                value, ok = _try_unseal(s["text"], f"{pid}:login.recipe.{i}")
+                if ok:
+                    recipe.append({**s, "text": value})
+                else:
+                    recipe.append({**s, "text": ""})
+                    out["recipe_unreadable"] = True
+            else:
+                recipe.append(s)
+        out["recipe"] = recipe
     return out
+
+
+def drop_unreadable_login(login: dict | None, pid: str) -> tuple[dict, bool]:
+    """Return a login dict safe to persist after a key rotation orphaned sealed fields.
+
+    Drops password / storage_state / recipe type text that cannot be opened with the
+    current keyring. Returns ``(cleaned, changed)``.
+    """
+    raw = dict(login or {})
+    changed = False
+    out = dict(raw)
+    if out.get("password") and is_sealed(out["password"]):
+        _, ok = _try_unseal(out["password"], f"{pid}:login.password")
+        if not ok:
+            out.pop("password", None)
+            out.pop("credentials_saved_at", None)
+            changed = True
+    if out.get("storage_state") and is_sealed(out["storage_state"]):
+        _, ok = _try_unseal(out["storage_state"], f"{pid}:login.storage_state")
+        if not ok:
+            out.pop("storage_state", None)
+            out.pop("storage_saved_at", None)
+            changed = True
+    if out.get("recipe"):
+        recipe = []
+        for i, s in enumerate(out["recipe"]):
+            step = dict(s)
+            if step.get("action") == "type" and step.get("text") and is_sealed(step["text"]):
+                _, ok = _try_unseal(step["text"], f"{pid}:login.recipe.{i}")
+                if not ok:
+                    step["text"] = ""
+                    changed = True
+            recipe.append(step)
+        out["recipe"] = recipe
+    return out, changed
 
 
 def owner_login_view(login: dict | None, pid: str) -> dict:
@@ -212,7 +279,8 @@ def open_step_text(step: dict, pid: str) -> str | None:
         return text
     if text == MASK:
         return ""
-    return unseal(text, _step_ctx(pid, step["id"]))
+    value, ok = _try_unseal(text, _step_ctx(pid, step["id"]))
+    return value if ok else ""
 
 
 def redact_steps(steps: list) -> list:
