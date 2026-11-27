@@ -86,6 +86,15 @@ async def storage_error_handler(request: Request, exc):
     return JSONResponse(status_code=503, content={"detail": str(exc), "code": "storage_unavailable"})
 
 
+@app.exception_handler(vault.VaultError)
+async def vault_error_handler(request: Request, exc):
+    # Return JSON so CORSMiddleware can attach ACAO — raw 500s from unhandled
+    # VaultError look like CORS failures in the browser.
+    from fastapi.responses import JSONResponse
+    logger.error("vault error on %s %s: %s", request.method, request.url.path, exc)
+    return JSONResponse(status_code=503, content={"detail": str(exc), "code": "vault_unavailable"})
+
+
 api = APIRouter(prefix="/api")
 TASKS: set = set()
 MONTHLY_LIMIT = int(os.environ.get("MONTHLY_RECORDING_LIMIT", "20"))

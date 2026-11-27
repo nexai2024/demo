@@ -50,21 +50,34 @@ const blobCache = new Map();
 const isPublicMedia = (url) =>
   /\/(public|review)\//.test(url) || url.startsWith("blob:") || url.startsWith("data:");
 
-/** Turn an absolute media URL (/api/projects/...) into an axios path (/projects/...). */
-const toApiPath = (url) => {
+/**
+ * Turn a media URL into an axios-relative path under baseURL=API.
+ *
+ * stepAsset() builds `${API}/projects/...`. When VITE_BACKEND_URL is absolute,
+ * API is `https://host/api` and the path after URL-parsing is `/api/projects/...`.
+ * Matching against the absolute API string fails, axios then joins baseURL+path
+ * into `https://host/api/api/projects/...` (404). Always strip a leading `/api`.
+ */
+export const toApiPath = (url) => {
   if (!url) return url;
+  let path = url;
   if (/^https?:\/\//i.test(url)) {
     try {
       const parsed = new URL(url);
-      const path = `${parsed.pathname}${parsed.search}`;
-      if (path === API || path.startsWith(`${API}/`)) return path.slice(API.length) || "/";
-      return path;
+      path = `${parsed.pathname}${parsed.search}`;
     } catch {
       return url;
     }
   }
-  if (url === API || url.startsWith(`${API}/`)) return url.slice(API.length) || "/";
-  return url;
+  if (path === API || path.startsWith(`${API}/`)) path = path.slice(API.length) || "/";
+  // Absolute API base: pathname is still "/api/..." — strip it for axios.
+  if (path === "/api" || path.startsWith("/api/") || path.startsWith("/api?")) {
+    return path.slice(4) || "/";
+  }
+  if (path === "api" || path.startsWith("api/") || path.startsWith("api?")) {
+    return path.slice(3) || "/";
+  }
+  return path;
 };
 
 export async function resolveAuthUrl(url) {

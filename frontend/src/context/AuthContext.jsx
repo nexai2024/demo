@@ -61,12 +61,14 @@ function ClerkAuthProvider({ children }) {
       setUser(false);
       return;
     }
+    // Use Clerk's cached JWT. skipCache:true on every axios call (preview poll,
+    // thumbs, autosave) hammered /tokens and produced production 429s.
     setAuthTokenGetter(async () => {
-      const token = await getTokenRef.current({ skipCache: true });
+      const token = await getTokenRef.current();
       return token || null;
     });
     try {
-      const token = await getTokenRef.current({ skipCache: true });
+      const token = await getTokenRef.current();
       if (!token) {
         setAuthError("Clerk session token was empty. Try signing out and back in.");
         setUser(null);

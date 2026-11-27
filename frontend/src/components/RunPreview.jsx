@@ -16,6 +16,7 @@ export function RunPreview({ rid, message = "", pageUrl = "" }) {
     if (!rid) return undefined;
     let stop = false;
     let shown = "";
+    let delayMs = 400;
     const frames = async () => {
       while (!stop) {
         try {
@@ -26,6 +27,7 @@ export function RunPreview({ rid, message = "", pageUrl = "" }) {
           });
           if (stop) return;
           if (response.status === 200 && response.data?.size > 0) {
+            delayMs = 400;
             const headerUrl = response.headers?.["x-preview-url"];
             if (headerUrl) setUrl(headerUrl);
             const next = URL.createObjectURL(response.data);
@@ -48,11 +50,15 @@ export function RunPreview({ rid, message = "", pageUrl = "" }) {
             setWaiting(false);
             shown = next;
             if (retire) setTimeout(() => URL.revokeObjectURL(retire), 400);
+          } else {
+            // Back off while the worker has not published a frame yet — avoids
+            // flooding the API (and Clerk getToken) with 404s.
+            delayMs = Math.min(Math.round(delayMs * 1.6), 3000);
           }
         } catch {
-          /* next tick retries */
+          delayMs = Math.min(Math.round(delayMs * 1.6), 3000);
         }
-        await new Promise((resolve) => setTimeout(resolve, 350));
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
       }
     };
     frames();

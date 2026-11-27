@@ -106,10 +106,18 @@ export default function Studio() {
     setSaveState("saving");
     const {
       playwright_source, variable_email, has_login, has_storage, credential_expired, storage_expired,
-      login_password, ...rest
+      login_password, login_recipe, login_url, login_username, ...rest
     } = meta;
+    // Only send login_* when they changed — every autosave used to re-seal the
+    // vault login block (and bump credentials_saved_at) via login_recipe.
     const body = { ...rest, steps: steps.value };
     if (login_password) body.login_password = login_password;
+    const serverLogin = project?.login || {};
+    if (login_url !== (serverLogin.url || "")) body.login_url = login_url;
+    if (login_username !== (serverLogin.username || "")) body.login_username = login_username;
+    if (JSON.stringify(login_recipe || []) !== JSON.stringify(serverLogin.recipe || [])) {
+      body.login_recipe = login_recipe || [];
+    }
     try {
       const { data } = await api.put(`/projects/${pid}`, body);
       // Sync flags from the server and clear the typed password so the field
@@ -128,7 +136,7 @@ export default function Studio() {
       recordActivity({ level: "error", source: "save", message: errMsg(e) });
       throw e;
     }
-  }, [meta, snapshot, pid, steps.value]);
+  }, [meta, snapshot, pid, steps.value, project?.login]);
 
   useEffect(() => {
     if (!dirty || running) return;

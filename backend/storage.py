@@ -176,11 +176,42 @@ def config_problems() -> list[str]:
     return problems_pre + ["STORAGE: S3_BUCKET is not set; durable shared object storage is required in production"]
 
 
+def _s3_reachable(conf: dict) -> None:
+    """Confirm the configured bucket/access point can store objects.
+
+    Prefer ``HeadBucket``, but Access Point policies often allow Put/Get while
+    denying ListBucket — in that case a tiny probe object is enough proof.
+    """
+    client = _get_s3_client()
+    bucket = conf["bucket"]
+    try:
+        client.head_bucket(Bucket=bucket)
+        return
+    except Exception as head_exc:
+        probe_key = _s3_key(f"appshowcase/_probe/init-{os.getpid()}.txt")
+        try:
+            client.put_object(Bucket=bucket, Key=probe_key, Body=b"ok", ContentType="text/plain")
+            client.get_object(Bucket=bucket, Key=probe_key)
+            try:
+                client.delete_object(Bucket=bucket, Key=probe_key)
+            except Exception:
+                pass
+            logger.info("S3 HeadBucket denied for %s; object probe succeeded", bucket)
+            return
+        except Exception as probe_exc:
+            raise StorageError(
+                f"Configured S3 bucket '{bucket}' is not accessible: {head_exc}. "
+                f"Object probe also failed: {probe_exc}. "
+                "Check AWS_ACCESS_KEY_ID permissions on this bucket/access point, "
+                "or set S3_BUCKET to the plain bucket name (e.g. demo-app-dir) "
+                "instead of an Access Point ARN.") from probe_exc
+
+
 def status() -> dict:
     s3 = _s3_config()
     if s3:
         try:
-            _get_s3_client().head_bucket(Bucket=s3["bucket"])
+            _s3_reachable(s3)
             return {"mode": "s3", "bucket": s3["bucket"], "detail": f"Durable S3/R2 storage ({s3['bucket']})."}
         except Exception as exc:
             return {"mode": "error", "bucket": s3["bucket"], "detail": f"S3 bucket unreachable: {str(exc)[:140]}"}
@@ -281,12 +312,14 @@ def init_storage(force: bool = False) -> str:
     s3 = _s3_config()
     if s3:
         try:
-            _get_s3_client().head_bucket(Bucket=s3["bucket"])
+            _s3_reachable(s3)
             return f"s3://{s3['bucket']}"
         except Exception as exc:
             if _is_production():
+                if isinstance(exc, StorageError):
+                    raise
                 raise StorageError(f"Configured S3 bucket '{s3['bucket']}' is not accessible: {exc}") from exc
-            logger.warning("S3 head_bucket failed in dev: %s", exc)
+            logger.warning("S3 reachability check failed in dev: %s", exc)
             return f"s3://{s3['bucket']}"
     if _is_production():
         if _ncb_configured() and os.environ.get("STORAGE_BACKEND", "").strip().lower() == "ncb":
