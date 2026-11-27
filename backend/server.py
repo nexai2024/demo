@@ -44,7 +44,16 @@ import jobs
 import netpolicy
 from product import (VIEWPORTS, apply_track, environment_base, estimate_seconds, parse_playwright, prepare_step,
                      public_view, publish_diff, speak, substitute, transcript)
-from storage import APP_NAME, StorageError, get_object, init_storage, probe as storage_probe, put_object, status as storage_status
+from storage import (
+    APP_NAME,
+    StorageError,
+    get_object,
+    init_storage,
+    object_exists,
+    probe as storage_probe,
+    put_object,
+    status as storage_status,
+)
 import vault
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
@@ -332,7 +341,33 @@ async def get_project(pid: str, user: dict) -> dict:
     p["credential_expired"] = flags["credential_expired"]
     p["storage_expired"] = flags["storage_expired"]
     p["login"] = vault.owner_login_view(raw_login, pid)
-    p["steps"] = vault.mask_steps(p.get("steps") or [])
+    # Detect orphan media paths (Mongo has screenshot_path but object storage does not).
+    # Clear them so the UI stops requesting dead URLs and prompts a re-record.
+    media_missing = 0
+    steps = list(p.get("steps") or [])
+    cleared_steps = False
+    for step in steps:
+        path = step.get("screenshot_path")
+        if not path:
+            continue
+        if await object_exists(path):
+            continue
+        media_missing += 1
+        step["screenshot_path"] = None
+        step["thumb_path"] = None
+        step["motion_paths"] = []
+        if step.get("status") == "done":
+            step["status"] = "pending"
+        cleared_steps = True
+    if cleared_steps:
+        fields = {"steps": steps}
+        thumb = p.get("thumbnail_path")
+        if thumb and not await object_exists(thumb):
+            fields["thumbnail_path"] = None
+        await touch(pid, fields)
+        logger.warning("cleared %s missing screenshot path(s) on project %s", media_missing, pid)
+    p["media_missing"] = media_missing
+    p["steps"] = vault.mask_steps(steps)
     published = p.pop("published", None) or {}
     p["published_at"] = published.get("published_at")
     p["publish_diff"] = publish_diff(p.get("steps") or [], published.get("steps") or [])
@@ -2208,11 +2243,21 @@ async def ready():
     st = storage_status()
     problems = config_problems()
     fatal = [p for p in problems if p.startswith(FATAL_PREFIXES)]
+    s3 = None
+    try:
+        from storage import _s3_config, _previous_prefixes
+        s3 = _s3_config()
+    except Exception:
+        s3 = None
     checks = {"database": DB_BACKEND, "ai": bool(ai and ai.provider()[2]),
               "browserless": bool(engine and engine.is_configured()),
               "browser_driver_lib": bool(engine and engine._driver_lib_dir()),
               "compositor": "remotion" if compositor.available() else "ffmpeg",
               "storage": st.get("mode"), "storage_ok": st.get("mode") in {"s3", "remote", "local"},
+              "storage_bucket": (s3 or {}).get("bucket"),
+              "storage_prefix": (s3 or {}).get("prefix") or "",
+              "storage_prefix_previous": _previous_prefixes() if s3 else [],
+              "app_env": os.environ.get("APP_ENV", "development"),
               "auth_provider": "clerk" if clerk_service.clerk_enabled() else "legacy",
               "clerk_configured": clerk_service.clerk_enabled(),
               "config_ok": not fatal, "config_problems": problems,

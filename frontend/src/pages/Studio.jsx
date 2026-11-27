@@ -96,6 +96,11 @@ export default function Studio() {
       applyServer(data);
       if (data.steps.length) setTab("timeline");
       if (data.active_run_id) api.get(`/runs/${data.active_run_id}`).then((r) => setRun(r.data)).catch(() => {});
+      if (data.media_missing > 0) {
+        toast.message(
+          `${data.media_missing} screenshot${data.media_missing === 1 ? " was" : "s were"} lost from storage. Re-run Record demo to capture them again.`,
+        );
+      }
     }).catch((e) => toast.error(errMsg(e)));
     api.get("/settings").then((r) => setSettings(r.data)).catch(() => {});
     // eslint-disable-next-line react-hooks/exhaustive-deps

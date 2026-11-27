@@ -384,6 +384,15 @@ def _put_s3(path: str, data: bytes, content_type: str, attempts: int = 3) -> str
     for attempt in range(attempts):
         try:
             client.put_object(Bucket=conf["bucket"], Key=key, Body=data, ContentType=content_type)
+            # Verify the object is actually readable. Silent Put "success" with a
+            # missing object (wrong bucket/creds, ephemeral fallback) is what left
+            # Mongo with screenshot_path values that 404 forever in production.
+            head = client.head_object(Bucket=conf["bucket"], Key=key)
+            size = int(head.get("ContentLength") or 0)
+            if size != len(data):
+                raise StorageError(
+                    f"S3 put verification failed for '{path}': wrote {len(data)} bytes, "
+                    f"head reports {size}")
             return path
         except Exception as exc:
             last = exc
@@ -561,3 +570,35 @@ async def put_object(path: str, data: bytes, content_type: str) -> str:
 
 async def get_object(path: str, *, byte_range: str | None = None) -> tuple[bytes, str]:
     return await asyncio.to_thread(_get, path, byte_range=byte_range)
+
+
+def _object_exists(path: str) -> bool:
+    """True if any candidate key for ``path`` is present in durable storage.
+
+    Ambiguous errors (403 / network) return True so we never wipe Mongo paths
+    when Head is denied but the object may still exist for GetObject.
+    """
+    if _s3_config() and time.monotonic() >= _S3_DOWN_UNTIL:
+        conf = _s3_config()
+        client = _get_s3_client()
+        saw_definite_miss = False
+        for key in _s3_key_candidates(path):
+            try:
+                client.head_object(Bucket=conf["bucket"], Key=key)
+                return True
+            except Exception as exc:
+                code = str(getattr(exc, "response", {}).get("Error", {}).get("Code", "") or "")
+                status = getattr(exc, "response", {}).get("ResponseMetadata", {}).get("HTTPStatusCode")
+                if code in {"NoSuchKey", "404", "NotFound"} or status == 404:
+                    saw_definite_miss = True
+                    continue
+                logger.warning("S3 head failed for %s (%s): %s", path, key, exc)
+                return True  # fail open — do not scrub paths on auth/network blips
+        return not saw_definite_miss
+    if _allow_local_fallback() and (LOCAL_ROOT / path.lstrip("/")).exists():
+        return True
+    return False
+
+
+async def object_exists(path: str) -> bool:
+    return await asyncio.to_thread(_object_exists, path)

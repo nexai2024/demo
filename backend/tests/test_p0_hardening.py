@@ -593,7 +593,15 @@ def test_storage_forbids_local_fallback_in_production_and_retries_s3(monkeypatch
                 err.response = {"Error": {"Code": "NoSuchKey"}}
                 raise err
             body, ct = bucket_store[Key]
-            return {"Body": io.BytesIO(body), "ContentType": ct}
+            return {"Body": io.BytesIO(body), "ContentType": ct, "ContentLength": len(body)}
+
+        def head_object(self, Bucket, Key):
+            if Key not in bucket_store:
+                err = RuntimeError("missing")
+                err.response = {"Error": {"Code": "NoSuchKey"}, "ResponseMetadata": {"HTTPStatusCode": 404}}
+                raise err
+            body, ct = bucket_store[Key]
+            return {"ContentLength": len(body), "ContentType": ct}
 
     monkeypatch.setenv("S3_BUCKET", "prod-shared-bucket")
     monkeypatch.setattr(storage, "_get_s3_client", lambda: FakeS3())
