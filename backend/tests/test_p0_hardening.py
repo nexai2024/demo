@@ -409,6 +409,7 @@ def test_share_access_immutable_releases_and_cache_headers(memdb, monkeypatch):
 def test_durable_jobs_leases_quotas_cancellation_and_restart_recovery(memdb, monkeypatch):
     # This test claims runs in-process, i.e. the embedded-worker topology.
     monkeypatch.setenv("EMBEDDED_WORKER", "true")
+    monkeypatch.setenv("WORKER_CLAIM_SHARED", "true")  # allow claims under APP_ENV=development + Atlas URL in shell env
     proj = {
         "id": "prj_j", "user_id": "u1", "name": "Job Demo", "status": "ready",
         "steps": [{"id": "s1", "screenshot_path": "a.jpg", "caption": "hi"}],
@@ -497,6 +498,7 @@ def _job_proj(pid):
 
 def test_enqueue_fails_fast_when_no_worker(memdb, monkeypatch):
     monkeypatch.setenv("EMBEDDED_WORKER", "false")
+    monkeypatch.delenv("WORKER_CLAIM_SHARED", raising=False)
     proj = _job_proj("prj_nw")
     asyncio.run(memdb.projects.insert_one(proj))
 
@@ -509,6 +511,7 @@ def test_enqueue_fails_fast_when_no_worker(memdb, monkeypatch):
     assert asyncio.run(memdb.runs.find_one({"project_id": "prj_nw"})) is None
 
     # Once a worker heartbeats, enqueue succeeds again
+    monkeypatch.setenv("WORKER_CLAIM_SHARED", "true")
     asyncio.run(jobs.note_worker_presence("wrk_ext"))
     run = asyncio.run(jobs.enqueue_run(proj, "export", 1, "x", {"action": "export"}))
     assert run["status"] == "queued"
@@ -516,6 +519,7 @@ def test_enqueue_fails_fast_when_no_worker(memdb, monkeypatch):
 
 def test_stale_queued_run_auto_clears_and_unblocks(memdb, monkeypatch):
     monkeypatch.setenv("EMBEDDED_WORKER", "true")
+    monkeypatch.setenv("WORKER_CLAIM_SHARED", "true")
     proj = _job_proj("prj_sq")
     asyncio.run(memdb.projects.insert_one(proj))
     run1 = asyncio.run(jobs.enqueue_run(proj, "export", 1, "x", {"action": "export"}))
@@ -534,6 +538,7 @@ def test_stale_queued_run_auto_clears_and_unblocks(memdb, monkeypatch):
 
 def test_stale_running_run_auto_clears_and_unblocks(memdb, monkeypatch):
     monkeypatch.setenv("EMBEDDED_WORKER", "true")
+    monkeypatch.setenv("WORKER_CLAIM_SHARED", "true")
     proj = _job_proj("prj_sr")
     asyncio.run(memdb.projects.insert_one(proj))
     run1 = asyncio.run(jobs.enqueue_run(proj, "export", 1, "x", {"action": "export"}))
@@ -553,6 +558,7 @@ def test_stale_running_run_auto_clears_and_unblocks(memdb, monkeypatch):
 
 def test_recent_running_run_still_blocks(memdb, monkeypatch):
     monkeypatch.setenv("EMBEDDED_WORKER", "true")
+    monkeypatch.setenv("WORKER_CLAIM_SHARED", "true")
     proj = _job_proj("prj_fresh")
     asyncio.run(memdb.projects.insert_one(proj))
     asyncio.run(jobs.enqueue_run(proj, "export", 1, "x", {"action": "export"}))
@@ -560,6 +566,16 @@ def test_recent_running_run_still_blocks(memdb, monkeypatch):
     with pytest.raises(Exception) as exc:
         asyncio.run(jobs.enqueue_run(proj, "export", 1, "y", {"action": "export"}))
     assert getattr(exc.value, "status_code", None) == 409
+
+
+
+def test_dev_worker_refuses_remote_mongo_claims(monkeypatch):
+    monkeypatch.setenv("APP_ENV", "development")
+    monkeypatch.delenv("WORKER_CLAIM_SHARED", raising=False)
+    monkeypatch.setenv("MONGO_URL", "mongodb+srv://user:pass@cluster.mongodb.net/app")
+    assert jobs.worker_may_claim() is False
+    monkeypatch.setenv("APP_ENV", "production")
+    assert jobs.worker_may_claim() is True
 
 
 # ========== 5. P0: Require durable shared media storage ==========

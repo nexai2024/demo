@@ -31,6 +31,30 @@ STALE_SECONDS = int(os.environ.get("JOB_STALE_SECONDS", "300"))
 QUOTA_KINDS = {"record", "rerecord", "autopilot"}
 
 
+def worker_may_claim() -> bool:
+    """Block local/dev processes from stealing production recordings.
+
+    A laptop ``uvicorn`` with ``APP_ENV=development`` and the production
+    ``MONGO_URL`` was claiming Studio jobs, writing screenshots to local disk
+    (or nowhere durable), while api.appshowcase.xyz served empty R2 paths.
+    """
+    env = os.environ.get("APP_ENV", "development").strip().lower()
+    if env in {"production", "prod"}:
+        return True
+    if os.environ.get("WORKER_CLAIM_SHARED", "").strip().lower() in {"1", "true", "yes"}:
+        return True
+    mongo = (os.environ.get("MONGO_URL") or "").lower()
+    if "mongodb+srv://" in mongo or "mongodb.net" in mongo:
+        logger.error(
+            "Refusing job claims: APP_ENV=%s with remote MongoDB (%s). "
+            "Stop this process or set WORKER_CLAIM_SHARED=true only if intentional.",
+            env,
+            INSTANCE_ID,
+        )
+        return False
+    return True
+
+
 def _lease_until(seconds: int | None = None) -> str:
     return (now() + timedelta(seconds=seconds or LEASE_SECONDS)).isoformat()
 
@@ -77,6 +101,8 @@ async def clear_stale_run(pid: str, run: dict) -> bool:
 # ---------- worker presence ----------
 async def note_worker_presence(owner: str = INSTANCE_ID) -> None:
     """Heartbeat so API replicas can tell whether any worker is alive."""
+    if not worker_may_claim():
+        return
     await db.worker_heartbeats.update_one(
         {"id": owner}, {"$set": {"id": owner, "at": now_iso()}}, upsert=True
     )
@@ -326,8 +352,27 @@ async def renew_lease(run_id: str, owner: str = INSTANCE_ID) -> None:
     )
 
 
+async def claim_run(run_id: str, owner: str = INSTANCE_ID) -> dict | None:
+    """Claim one specific queued run (used by the Studio SSE stream on Vercel)."""
+    if not worker_may_claim():
+        return None
+    await note_worker_presence(owner)
+    cutoff = now_iso()
+    res = await db.runs.update_one(
+        {"id": run_id, "status": "queued"},
+        {"$set": {"status": "running", "owner": owner, "heartbeat_at": cutoff,
+                  "lease_expires_at": _lease_until()},
+         "$inc": {"attempt": 1}},
+    )
+    if getattr(res, "modified_count", 0) != 1:
+        return None
+    return await db.runs.find_one({"id": run_id}, {"_id": 0})
+
+
 async def claim_next_run(owner: str = INSTANCE_ID) -> dict | None:
     """Atomically claim one queued run, or reclaim one running run whose lease expired."""
+    if not worker_may_claim():
+        return None
     await note_worker_presence(owner)
     cutoff = now_iso()
     # 1. Try queued runs first (oldest first)

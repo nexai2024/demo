@@ -1380,22 +1380,48 @@ async def read_run(rid: str, user: dict = Depends(get_current_user)):
 
 @api.get("/runs/{rid}/stream")
 async def stream_run(rid: str, request: Request, user: dict = Depends(get_current_user)):
+    """SSE progress for a run.
+
+    On Vercel the Studio keeps this connection open for the whole recording.
+    We claim+execute the queued run on this request so media uploads hit
+    production R2 — a laptop ``uvicorn`` must never be the worker for prod jobs.
+    """
+    owned = await db.runs.find_one({"id": rid, "user_id": user["user_id"]}, {"_id": 0})
+    if not owned:
+        raise HTTPException(404, "Run not found")
+
+    exec_task: asyncio.Task | None = None
+    if owned.get("status") == "queued":
+        claimed = await jobs.claim_run(rid)
+        if claimed:
+            exec_task = asyncio.create_task(execute_run(claimed))
+            logger.info("stream claimed run %s for in-request execution", rid)
+
     async def gen():
         last = None
-        for _ in range(2400):
-            if await request.is_disconnected():
-                break
-            run = await db.runs.find_one({"id": rid, "user_id": user["user_id"]}, {"_id": 0})
-            if not run:
-                yield "event: missing\ndata: {}\n\n"
-                break
-            payload = json.dumps(run, default=str)
-            if payload != last:
-                yield f"data: {payload}\n\n"
-                last = payload
-            if run["status"] not in ("queued", "running"):
-                break
-            await asyncio.sleep(0.5)
+        try:
+            for _ in range(2400):
+                if await request.is_disconnected():
+                    break
+                run = await db.runs.find_one({"id": rid, "user_id": user["user_id"]}, {"_id": 0})
+                if not run:
+                    yield "event: missing\ndata: {}\n\n"
+                    break
+                payload = json.dumps(run, default=str)
+                if payload != last:
+                    yield f"data: {payload}\n\n"
+                    last = payload
+                if run["status"] not in ("queued", "running"):
+                    break
+                await asyncio.sleep(0.5)
+        finally:
+            if exec_task and not exec_task.done() and await request.is_disconnected():
+                with suppress(Exception):
+                    await jobs.request_cancel(rid, user["user_id"])
+            if exec_task is not None:
+                with suppress(Exception, asyncio.CancelledError):
+                    await exec_task
+
     return StreamingResponse(gen(), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 

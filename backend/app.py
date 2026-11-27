@@ -13,12 +13,12 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-# Vercel Functions are request-scoped: a background worker loop started here
-# would be frozen mid-job and its lease reclaimed by a real worker. Default
-# the embedded worker off on Vercel (run `python worker.py` on a long-lived
-# host, or set EMBEDDED_WORKER=true to opt back in). Local runs through
-# `uvicorn server:app` are untouched.
+# On Vercel, Studio's SSE `/runs/{id}/stream` claims and executes the job on
+# that long-lived request (maxDuration 300). The embedded loop is a backup for
+# cron/export when traffic warms an isolate. Local `uvicorn server:app` is
+# untouched; jobs.worker_may_claim() blocks APP_ENV=development from stealing
+# production Mongo jobs.
 if os.environ.get("VERCEL"):
-    os.environ.setdefault("EMBEDDED_WORKER", "false")
+    os.environ.setdefault("EMBEDDED_WORKER", "true")
 
 from server import app  # noqa: E402,F401
